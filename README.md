@@ -143,16 +143,26 @@ cargo run -- admin price set --provider anthropic --model claude-3-5-sonnet \
 ```
 
 In a running deployment the gateway also serves the read-only web console at
-`/console`, along with the key-authenticated JSON it reads: `GET /admin/budgets`
-(current-period spend and limit per budget) and `GET /admin/usage` (recent ledger
-rows). Open `/console`, paste an API key, and you get the live budget meters and
-usage that the demo shows. These endpoints are observe-only; there are no write
-endpoints in the open-source core.
+`/console`, along with the key-authenticated JSON it reads: `GET /console/budgets`
+(current-period spend and limit per budget) and `GET /console/usage` (recent
+ledger rows). Open `/console`, paste an API key, and you get the live budget
+meters and usage that the demo shows. These endpoints are observe-only; there are
+no write endpoints in the open-source core.
+
+Authorization is deliberately flat: any valid key may view the deployment's
+budgets and usage, because Tollgate is single-tenant per deployment (one trust
+boundary). If you need per-tenant scoping, roles, or SSO on these views, that is
+the commercial console's job, not the open-source core.
 
 Every proxied request records the gateway's own added latency (the admission
 path only, excluding the upstream provider call). The console shows the median
 and p95, and each response carries an `x-tollgate-overhead-us` header, so you can
 see exactly how little overhead Tollgate adds.
+
+Budget and price changes apply within the reload interval
+(`TOLLGATE_RELOAD__INTERVAL`, default 15s) without restarting the gateway; set it
+to `0s` to read config only at startup. A changed limit applies to the existing
+spend counter; a brand-new budget starts counting when it is first picked up.
 
 Web and API based management of keys and budgets, with roles, SSO, approval
 workflows, and audit, is part of the commercial console rather than this

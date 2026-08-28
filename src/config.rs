@@ -27,6 +27,18 @@ pub struct Config {
     pub billing: BillingConfig,
     pub security: SecurityConfig,
     pub providers: ProvidersConfig,
+    pub reload: ReloadConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadConfig {
+    /// How often to reload budgets and model prices from Postgres so `admin
+    /// budget set` / `price set` take effect without a restart. Set to `0s` to
+    /// disable (config is then read only at startup). Changed limits apply to
+    /// the existing spend counters; a brand-new budget starts counting from when
+    /// it is picked up (a full period backfill still needs a restart).
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +170,9 @@ impl Default for Config {
                     base_url: "https://api.anthropic.com".to_string(),
                     version: "2023-06-01".to_string(),
                 },
+            },
+            reload: ReloadConfig {
+                interval: Duration::from_secs(15),
             },
         }
     }

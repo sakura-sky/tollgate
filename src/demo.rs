@@ -208,7 +208,7 @@ async fn admin_usage(
         state.unauthenticated.fetch_add(1, Ordering::Relaxed);
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "admin endpoints require a valid API key"})),
+            Json(json!({"error": "the console requires a valid API key"})),
         )
             .into_response();
     }
@@ -230,7 +230,7 @@ async fn admin_budgets(
         state.unauthenticated.fetch_add(1, Ordering::Relaxed);
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "admin endpoints require a valid API key"})),
+            Json(json!({"error": "the console requires a valid API key"})),
         )
             .into_response();
     }
@@ -344,8 +344,8 @@ fn router(state: Arc<DemoState>) -> Router {
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
         .route("/console", get(console))
-        .route("/admin/usage", get(admin_usage))
-        .route("/admin/budgets", get(admin_budgets))
+        .route("/console/usage", get(admin_usage))
+        .route("/console/budgets", get(admin_budgets))
         .route("/v1/{provider}/{*rest}", post(gateway))
         .with_state(state)
 }
@@ -377,9 +377,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
     println!(
         "    curl -s localhost:{port}/v1/mock/generate \\\n        -H 'x-tollgate-key: {plaintext_key}' \\\n        -H 'content-type: application/json' \\\n        -d '{{\"model\":\"demo\",\"prompt\":\"hello tollgate\",\"max_output_tokens\":1000}}'\n"
     );
-    println!("Inspect (admin endpoints require the key):");
-    println!("    curl -s -H 'x-tollgate-key: {plaintext_key}' localhost:{port}/admin/budgets");
-    println!("    curl -s -H 'x-tollgate-key: {plaintext_key}' localhost:{port}/admin/usage");
+    println!("Inspect (the console endpoints require the key):");
+    println!("    curl -s -H 'x-tollgate-key: {plaintext_key}' localhost:{port}/console/budgets");
+    println!("    curl -s -H 'x-tollgate-key: {plaintext_key}' localhost:{port}/console/usage");
     println!("Monitor (for your SRE stack):");
     println!("    curl -s localhost:{port}/healthz     # liveness ping");
     println!("    curl -s localhost:{port}/readyz      # readiness");
@@ -411,7 +411,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/admin/budgets")
+                    .uri("/console/budgets")
                     .body(Body::empty())
                     .unwrap(),
             )

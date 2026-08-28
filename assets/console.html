@@ -251,8 +251,8 @@
 
   function refresh() {
     return Promise.all([
-      fetch("/admin/budgets", { headers: headers() }),
-      fetch("/admin/usage", { headers: headers() })
+      fetch("/console/budgets", { headers: headers() }),
+      fetch("/console/usage", { headers: headers() })
     ]).then(function (rs) {
       if (rs[0].status === 401) { throw new Error("Invalid API key."); }
       return Promise.all([rs[0].json(), rs[1].json()]);

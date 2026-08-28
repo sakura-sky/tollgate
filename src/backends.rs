@@ -408,6 +408,47 @@ pub async fn budget_spent(
     Ok(spent)
 }
 
+/// Seed Redis/Valkey counters for budgets whose current-period counter key does
+/// not yet exist, from the durable ledger. Used on hot-reload so a budget added
+/// at runtime enforces against spend already incurred this period rather than
+/// starting at zero. Existing counters are never touched (no reset, no race with
+/// live traffic, which only ever writes keys that already exist).
+pub async fn seed_missing_counters(
+    pool: &PgPool,
+    conn: &ConnectionManager,
+    budgets: &[Budget],
+) -> Result<usize, sqlx::Error> {
+    let now = Utc::now();
+    let mut seeded = 0usize;
+    for b in budgets {
+        let key = crate::budget::counter_key(&b.scope, b.period, now);
+        let mut c = conn.clone();
+        // On any Redis error, assume the key exists (skip): never overwrite a
+        // live counter, which could reset spend and permit overspend.
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut c)
+            .await
+            .unwrap_or(true);
+        if exists {
+            continue;
+        }
+        let spent = budget_spent(pool, b, now).await?;
+        let mut c2 = conn.clone();
+        let res: redis::RedisResult<()> = redis::pipe()
+            .set(&key, spent)
+            .ignore()
+            .expire(&key, COUNTER_TTL_SECS)
+            .ignore()
+            .query_async(&mut c2)
+            .await;
+        if res.is_ok() {
+            seeded += 1;
+        }
+    }
+    Ok(seeded)
+}
+
 pub async fn reconcile_counters(
     pool: &PgPool,
     conn: &ConnectionManager,

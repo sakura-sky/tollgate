@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -31,8 +32,8 @@ use crate::backends::{
 };
 use crate::budget::{Budget, Scope};
 use crate::config::Config;
-use crate::gateway::{GatewayCore, outcome_response};
-use crate::pricing::format_micros;
+use crate::gateway::{GatewayCore, KeyStore, UsageSink, outcome_response};
+use crate::pricing::{PriceBook, format_micros};
 use crate::provider::{MockProvider, Provider};
 use crate::routes::health;
 
@@ -40,9 +41,40 @@ use crate::routes::health;
 pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
-    pub core: Arc<GatewayCore>,
-    /// Budget config (loaded at startup) for the read-only console endpoints.
-    pub budgets: Arc<Vec<Budget>>,
+    /// The live gateway core. Swapped atomically by the reload task so budget and
+    /// price changes take effect without a restart; requests read a snapshot.
+    pub core: Arc<ArcSwap<GatewayCore>>,
+    /// Current budget config, swapped in lockstep with the core, for the
+    /// read-only console endpoints.
+    pub budgets: Arc<ArcSwap<Vec<Budget>>>,
+}
+
+/// The immutable parts of a [`GatewayCore`], reused every time the core is rebuilt
+/// on config reload. Only budgets and prices change at runtime.
+#[derive(Clone)]
+struct CoreParts {
+    hasher: KeyHasher,
+    dummy_hash: String,
+    keys: Arc<dyn KeyStore>,
+    usage: Arc<dyn UsageSink>,
+    providers: HashMap<String, Arc<dyn Provider>>,
+    admission_exact: bool,
+    redis: ConnectionManager,
+}
+
+impl CoreParts {
+    fn build(&self, budgets: Vec<Budget>, prices: PriceBook) -> GatewayCore {
+        GatewayCore {
+            hasher: self.hasher.clone(),
+            dummy_hash: self.dummy_hash.clone(),
+            keys: self.keys.clone(),
+            budgets: Arc::new(RedisBudgetBackend::new(self.redis.clone(), budgets)),
+            usage: self.usage.clone(),
+            prices: Arc::new(prices),
+            providers: self.providers.clone(),
+            admission_exact: self.admission_exact,
+        }
+    }
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
@@ -126,22 +158,39 @@ pub async fn serve(cfg: Config) -> Result<()> {
         "providers registered"
     );
 
-    let core = Arc::new(GatewayCore {
+    let parts = CoreParts {
         hasher,
         dummy_hash,
         keys: Arc::new(PgKeyStore::new(db.clone())),
-        budgets: Arc::new(RedisBudgetBackend::new(redis.clone(), budgets.clone())),
         usage: Arc::new(PgUsageSink::new(db.clone())),
-        prices: Arc::new(prices),
         providers,
         admission_exact,
-    });
+        redis: redis.clone(),
+    };
+
+    let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
+    let budgets_view = Arc::new(ArcSwap::from_pointee(budgets));
+
+    // Periodically reload budgets and prices from Postgres so `admin budget set`
+    // and `admin price set` take effect without a restart. Only the config
+    // swaps; spend counters are left untouched, so a changed limit applies to the
+    // existing counter and a new budget starts counting when it is picked up.
+    if !cfg.reload.interval.is_zero() {
+        spawn_reload_task(
+            db.clone(),
+            parts.clone(),
+            core.clone(),
+            budgets_view.clone(),
+            cfg.reload.interval,
+        );
+        tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
+    }
 
     let state = AppState {
         db,
         redis,
         core,
-        budgets: Arc::new(budgets),
+        budgets: budgets_view,
     };
     let app = router(state, cfg.http.request_timeout);
 
@@ -157,14 +206,70 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .context("http server error")
 }
 
+/// Background task: reload budgets and prices from Postgres on an interval and
+/// atomically swap them into the live core. On any load error it logs and keeps
+/// the current config rather than dropping enforcement.
+fn spawn_reload_task(
+    db: PgPool,
+    parts: CoreParts,
+    core: Arc<ArcSwap<GatewayCore>>,
+    budgets_view: Arc<ArcSwap<Vec<Budget>>>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // the first tick fires immediately; skip it
+        loop {
+            ticker.tick().await;
+            let budgets = match load_budgets(&db).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "config reload: budgets query failed; keeping current");
+                    continue;
+                }
+            };
+            let prices = match load_prices(&db).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "config reload: prices query failed; keeping current");
+                    continue;
+                }
+            };
+            let (n_b, n_p) = (budgets.len(), prices.len());
+            // Seed counters for any budget new since the last snapshot so a
+            // runtime-added cap enforces against this period's existing spend
+            // instead of starting at zero. On failure, skip this cycle rather
+            // than swap in an under-enforcing budget.
+            if let Err(e) =
+                crate::backends::seed_missing_counters(&db, &parts.redis, &budgets).await
+            {
+                tracing::warn!(error = %e, "config reload: seeding new counters failed; keeping current config");
+                continue;
+            }
+            if n_b == 0 {
+                tracing::warn!(
+                    "config reload: no budgets configured; all traffic will be denied (fail closed)"
+                );
+            } else if !budgets.iter().any(|b| matches!(b.scope, Scope::Global)) {
+                tracing::warn!(
+                    "config reload: no Global budget; the deployment-wide backstop is not enforced"
+                );
+            }
+            core.store(Arc::new(parts.build(budgets.clone(), prices)));
+            budgets_view.store(Arc::new(budgets));
+            tracing::debug!(budgets = n_b, priced_models = n_p, "reloaded config");
+        }
+    });
+}
+
 pub fn router(state: AppState, request_timeout: Duration) -> Router {
     Router::new()
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
         .route("/metrics", get(metrics))
         .route("/console", get(console))
-        .route("/admin/budgets", get(admin_budgets))
-        .route("/admin/usage", get(admin_usage))
+        .route("/console/budgets", get(console_budgets))
+        .route("/console/usage", get(console_usage))
         .route("/v1/{provider}/{*rest}", post(gateway))
         .with_state(state)
         .layer(TimeoutLayer::with_status_code(
@@ -180,7 +285,8 @@ async fn gateway(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let outcome = state.core.evaluate(&provider, &rest, &headers, &body).await;
+    let core = state.core.load_full();
+    let outcome = core.evaluate(&provider, &rest, &headers, &body).await;
     outcome_response(outcome)
 }
 
@@ -202,20 +308,24 @@ fn budget_label(b: &Budget) -> String {
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "admin endpoints require a valid API key"})),
+        Json(json!({"error": "the console requires a valid API key"})),
     )
         .into_response()
 }
 
 /// Read-only budgets view: current-period spend and limit per configured budget,
-/// summed from the durable ledger. Key-authenticated.
-async fn admin_budgets(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.core.authenticate(&headers).await.is_none() {
+/// summed from the durable ledger. Authenticated by any valid key: Tollgate is
+/// single-tenant per deployment, so any key in the deployment may observe its
+/// budgets and usage. Per-tenant scoping is a commercial-console concern.
+async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let core = state.core.load_full();
+    if core.authenticate(&headers).await.is_none() {
         return unauthorized();
     }
+    let budgets = state.budgets.load_full();
     let now = Utc::now();
-    let mut out = Vec::with_capacity(state.budgets.len());
-    for b in state.budgets.iter() {
+    let mut out = Vec::with_capacity(budgets.len());
+    for b in budgets.iter() {
         let spent = match budget_spent(&state.db, b, now).await {
             Ok(s) => s,
             Err(e) => {
@@ -251,10 +361,11 @@ struct UsageRow {
 }
 
 /// Read-only usage view: the 100 most recent ledger rows, oldest-first so the
-/// console can number them chronologically. Key-authenticated. Cost is a plain
-/// decimal string, never raw micros.
-async fn admin_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if state.core.authenticate(&headers).await.is_none() {
+/// console can number them chronologically. Authenticated by any valid key (see
+/// `console_budgets`). Cost is a plain decimal string, never raw micros.
+async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let core = state.core.load_full();
+    if core.authenticate(&headers).await.is_none() {
         return unauthorized();
     }
     let rows = sqlx::query_as::<_, UsageRow>(
