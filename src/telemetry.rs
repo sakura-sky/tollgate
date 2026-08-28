@@ -14,7 +14,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::{Sampler, TracerProvider};
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -23,7 +23,7 @@ use crate::config::TelemetryConfig;
 
 /// Guard returned to `main`; dropping it shuts down the OTel pipeline cleanly.
 pub struct TelemetryGuard {
-    provider: Option<TracerProvider>,
+    provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for TelemetryGuard {
@@ -67,20 +67,21 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
     Ok(guard)
 }
 
-fn build_otlp_provider(endpoint: &str, service_name: &str) -> Result<TracerProvider> {
+fn build_otlp_provider(endpoint: &str, service_name: &str) -> Result<SdkTracerProvider> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
         .context("building OTLP span exporter")?;
 
-    let resource = Resource::new(vec![KeyValue::new(
-        "service.name",
-        service_name.to_string(),
-    )]);
+    let resource = Resource::builder()
+        .with_attribute(KeyValue::new("service.name", service_name.to_string()))
+        .build();
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // The batch exporter runs on its own dedicated thread in this line of OTel,
+    // so it no longer takes a Tokio runtime handle.
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
             1.0,
         ))))

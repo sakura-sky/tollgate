@@ -54,10 +54,11 @@ rand = "0.8"
 hex = "0.4"
 
 # OTel - initialised only when telemetry.otlp_endpoint is set in config.
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.28"
+# 0.32 line: the batch exporter no longer takes a runtime, so no rt-tokio feature.
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
