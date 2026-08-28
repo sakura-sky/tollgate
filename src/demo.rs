@@ -128,6 +128,7 @@ async fn gateway(
             status,
             body,
             cost_micros,
+            overhead_micros,
             key_id,
         } => {
             let key_spent = state
@@ -135,10 +136,12 @@ async fn gateway(
                 .spent(&Scope::ApiKey(key_id), Period::Monthly, Utc::now());
             (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                [("x-tollgate-overhead-us", overhead_micros.to_string())],
                 Json(json!({
                     "response": body,
                     "tollgate": {
                         "cost": format_micros(cost_micros),
+                        "overhead_us": overhead_micros,
                         "key_budget_spent": format_micros(key_spent),
                         "key_budget_limit": format_micros(state.per_key_limit_micros),
                         "key_budget_remaining": format_micros(state.per_key_limit_micros - key_spent),

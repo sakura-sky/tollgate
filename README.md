@@ -149,6 +149,11 @@ rows). Open `/console`, paste an API key, and you get the live budget meters and
 usage that the demo shows. These endpoints are observe-only; there are no write
 endpoints in the open-source core.
 
+Every proxied request records the gateway's own added latency (the admission
+path only, excluding the upstream provider call). The console shows the median
+and p95, and each response carries an `x-tollgate-overhead-us` header, so you can
+see exactly how little overhead Tollgate adds.
+
 Web and API based management of keys and budgets, with roles, SSO, approval
 workflows, and audit, is part of the commercial console rather than this
 open-source core, which is single-operator by design.

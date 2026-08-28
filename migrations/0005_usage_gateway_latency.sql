@@ -9,8 +9,10 @@
 ALTER TABLE usage_events
     ADD COLUMN gateway_micros BIGINT NOT NULL DEFAULT 0 CHECK (gateway_micros >= 0);
 
--- Refresh the analyst view to expose it alongside cost.
-CREATE OR REPLACE VIEW usage_report AS
+-- Refresh the analyst view to expose it alongside cost. Drop and recreate rather
+-- than CREATE OR REPLACE, which cannot insert a column before existing ones.
+DROP VIEW IF EXISTS usage_report;
+CREATE VIEW usage_report AS
 SELECT
     id,
     api_key_id,

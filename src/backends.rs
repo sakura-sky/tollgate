@@ -92,8 +92,9 @@ impl UsageSink for PgUsageSink {
         };
         let res = sqlx::query(
             "INSERT INTO usage_events \
-             (api_key_id, provider, model, input_tokens, output_tokens, cost_micros, decision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (api_key_id, provider, model, input_tokens, output_tokens, cost_micros, \
+              gateway_micros, decision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(api_key_id)
         .bind(event.provider)
@@ -101,6 +102,7 @@ impl UsageSink for PgUsageSink {
         .bind(i64::try_from(event.usage.input_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(event.usage.output_tokens).unwrap_or(i64::MAX))
         .bind(event.cost_micros)
+        .bind(event.overhead_micros)
         .bind(event.decision)
         .execute(&self.pool)
         .await;

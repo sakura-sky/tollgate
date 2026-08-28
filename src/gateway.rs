@@ -238,8 +238,17 @@ impl GatewayCore {
             return Outcome::Unauthenticated;
         };
         let Some(provider) = self.providers.get(provider_id) else {
-            self.record(&key_id, provider_id, "", Usage::default(), 0, "unpriced")
-                .await;
+            self.record(
+                &key_id,
+                provider_id,
+                "",
+                Usage::default(),
+                0,
+                "unpriced",
+                started,
+                provider_micros,
+            )
+            .await;
             return Outcome::Unpriced {
                 provider: provider_id.to_owned(),
                 model: String::new(),
@@ -268,6 +277,8 @@ impl GatewayCore {
                 Usage::default(),
                 0,
                 "unpriced",
+                started,
+                provider_micros,
             )
             .await;
             return Outcome::Unpriced {
@@ -314,6 +325,8 @@ impl GatewayCore {
                     Usage::default(),
                     0,
                     "rejected_budget",
+                    started,
+                    provider_micros,
                 )
                 .await;
                 return Outcome::BudgetDenied(denied);
@@ -327,6 +340,8 @@ impl GatewayCore {
                     Usage::default(),
                     0,
                     "error",
+                    started,
+                    provider_micros,
                 )
                 .await;
                 return Outcome::BackendError(msg);
@@ -348,6 +363,8 @@ impl GatewayCore {
                     Usage::default(),
                     0,
                     "error",
+                    started,
+                    provider_micros,
                 )
                 .await;
                 return Outcome::Upstream(e.to_string());
@@ -382,16 +399,27 @@ impl GatewayCore {
             resp.usage,
             actual,
             decision,
+            started,
+            provider_micros,
         )
         .await;
+        let overhead_micros = i64::try_from(
+            started
+                .elapsed()
+                .as_micros()
+                .saturating_sub(provider_micros),
+        )
+        .unwrap_or(i64::MAX);
         Outcome::Allowed {
             status: resp.status,
             body: resp.body,
             cost_micros: actual,
+            overhead_micros,
             key_id,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record(
         &self,
         key_id: &str,
@@ -400,7 +428,16 @@ impl GatewayCore {
         usage: Usage,
         cost_micros: i64,
         decision: &str,
+        started: std::time::Instant,
+        provider_micros: u128,
     ) {
+        let overhead_micros = i64::try_from(
+            started
+                .elapsed()
+                .as_micros()
+                .saturating_sub(provider_micros),
+        )
+        .unwrap_or(i64::MAX);
         self.usage
             .record(UsageEvent {
                 key_id,
@@ -409,6 +446,7 @@ impl GatewayCore {
                 usage,
                 cost_micros,
                 decision,
+                overhead_micros,
             })
             .await;
     }
@@ -470,6 +508,8 @@ pub struct StoredUsage {
     pub output_tokens: u64,
     #[serde(rename = "cost", serialize_with = "serialize_cost")]
     pub cost_micros: i64,
+    #[serde(rename = "overhead_us")]
+    pub overhead_micros: i64,
     pub decision: String,
 }
 
@@ -511,6 +551,7 @@ impl UsageSink for MemUsageSink {
                 input_tokens: event.usage.input_tokens,
                 output_tokens: event.usage.output_tokens,
                 cost_micros: event.cost_micros,
+                overhead_micros: event.overhead_micros,
                 decision: event.decision.to_owned(),
             });
     }

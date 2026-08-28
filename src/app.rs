@@ -246,6 +246,7 @@ struct UsageRow {
     input_tokens: i64,
     output_tokens: i64,
     cost_micros: i64,
+    gateway_micros: i64,
     decision: String,
 }
 
@@ -257,9 +258,10 @@ async fn admin_usage(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return unauthorized();
     }
     let rows = sqlx::query_as::<_, UsageRow>(
-        "SELECT provider, model, input_tokens, output_tokens, cost_micros, decision \
-         FROM (SELECT provider, model, input_tokens, output_tokens, cost_micros, decision, \
-                      started_at \
+        "SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
+                decision \
+         FROM (SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
+                      decision, started_at \
                FROM usage_events ORDER BY started_at DESC LIMIT 100) recent \
          ORDER BY started_at ASC",
     )
@@ -285,6 +287,7 @@ async fn admin_usage(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
                 "cost": format_micros(r.cost_micros),
+                "overhead_us": r.gateway_micros,
                 "decision": r.decision,
             })
         })
