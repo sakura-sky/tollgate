@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Andrew Stevens
+#
+# Local development dependencies. Run from the repo root:
+#   docker compose -f compose/docker-compose.yaml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tollgate-postgres
+    environment:
+      POSTGRES_USER: tollgate
+      POSTGRES_PASSWORD: tollgate
+      POSTGRES_DB: tollgate
+    ports:
+      - "5432:5432"
+    volumes:
+      - tollgate_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tollgate -d tollgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Valkey is the open-source, BSD-licensed fork of Redis. It is wire-compatible,
+  # so the `redis` crate talks to it unchanged, and Memorystore for Valkey is the
+  # cheaper managed option on GCP (see infra/terraform/valkey.tf). Local dev runs
+  # with AOF on so budget counters survive a container restart; production tunes
+  # persistence at the managed layer.
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: tollgate-valkey
+    command: ["valkey-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - tollgate_valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tollgate_pg_data:
+  tollgate_valkey_data:

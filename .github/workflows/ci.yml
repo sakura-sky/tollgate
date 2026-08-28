@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Andrew Stevens
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the MSRV so CI fails if code uses anything newer than we promise.
+      - name: Install Rust 1.85 (MSRV)
+        run: |
+          rustup toolchain install 1.85 --profile minimal --component rustfmt,clippy
+          rustup default 1.85
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: fsfe/reuse-action@v5

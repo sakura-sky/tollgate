@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Andrew Stevens
+#
+# Cloud Build pipeline for tollgate.
+#
+# Substitutions you'll set on the trigger:
+#   _REGION         e.g. australia-southeast1
+#   _AR_REPO        Artifact Registry repo name, e.g. tollgate
+#
+# The image is tagged with both the short SHA and `latest`. Tag promotion
+# (e.g. attaching `staging` / `prod`) is handled by a separate Cloud Deploy
+# pipeline.
+
+steps:
+  # ---- 1. Cargo fmt --------------------------------------------------------
+  - id: fmt
+    name: rust:1.85-slim-bookworm
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        rustup component add rustfmt
+        cargo fmt --all -- --check
+
+  # ---- 2. Clippy -----------------------------------------------------------
+  - id: clippy
+    name: rust:1.85-slim-bookworm
+    waitFor: ["fmt"]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        rustup component add clippy
+        apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+        cargo clippy --all-targets --locked -- -D warnings
+
+  # ---- 3. Tests ------------------------------------------------------------
+  # Unit and in-process tests run here. Integration tests that need Postgres
+  # or Valkey run against Cloud Build-provided service containers.
+  - id: test
+    name: rust:1.85-slim-bookworm
+    waitFor: ["clippy"]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+        cargo test --locked --all-targets
+
+  # ---- 4. Build container image -------------------------------------------
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["test"]
+    args:
+      - build
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:$SHORT_SHA
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:latest
+      - --build-arg=SQLX_OFFLINE=true
+      - .
+
+  # ---- 5. Push to Artifact Registry ---------------------------------------
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["build-image"]
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+
+timeout: 1800s

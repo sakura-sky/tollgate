@@ -1,0 +1,15 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+docs/
+infra/
+compose/
+*.md
+.env*
+!Cargo.toml
+!Cargo.lock
+!src
+!migrations
+!LICENSE

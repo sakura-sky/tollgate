@@ -1,0 +1,31 @@
+# Rust
+/target/
+Cargo.lock.bak
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.local
+*.tfvars
+!example.tfvars
+!*.example.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+# .terraform.lock.hcl is intentionally committed for reproducible provider versions.
+
+# Build artefacts
+*.log
+coverage/
+*.profraw
+
+# OS
+.DS_Store
+Thumbs.db
