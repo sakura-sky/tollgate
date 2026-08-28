@@ -41,9 +41,9 @@ curl -s localhost:8080/v1/mock/generate \
 
 The first few requests return `200` with a cost breakdown; once the budget is
 exhausted the gateway returns `429` **before the request reaches the provider**.
-Inspect spend with the admin endpoints (which require the key):
-`curl -s -H "x-tollgate-key: <key>" localhost:8080/admin/budgets` and
-`/admin/usage`. The demo binds to loopback only. Or run the whole narrated
+Inspect spend with the console endpoints (which require the key):
+`curl -s -H "x-tollgate-key: <key>" localhost:8080/console/budgets` and
+`/console/usage`. The demo binds to loopback only. Or run the whole narrated
 sequence at once:
 
 ```bash

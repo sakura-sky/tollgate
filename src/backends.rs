@@ -442,8 +442,11 @@ pub async fn seed_missing_counters(
             .ignore()
             .query_async(&mut c2)
             .await;
-        if res.is_ok() {
-            seeded += 1;
+        match res {
+            Ok(()) => seeded += 1,
+            Err(e) => {
+                tracing::warn!(error = %e, key = %key, "failed to seed new budget counter");
+            }
         }
     }
     Ok(seeded)

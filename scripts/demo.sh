@@ -45,11 +45,11 @@ for i in $(seq 1 "${REQUESTS}"); do
 done
 
 echo
-echo "=== /admin/budgets (admin endpoints require the key) ==="
-curl -s -H "x-tollgate-key: ${KEY}" "localhost:${PORT}/admin/budgets"; echo
+echo "=== /console/budgets (the console endpoints require the key) ==="
+curl -s -H "x-tollgate-key: ${KEY}" "localhost:${PORT}/console/budgets"; echo
 echo
-echo "=== /admin/usage ==="
-curl -s -H "x-tollgate-key: ${KEY}" "localhost:${PORT}/admin/usage"; echo
+echo "=== /console/usage ==="
+curl -s -H "x-tollgate-key: ${KEY}" "localhost:${PORT}/console/usage"; echo
 echo
 echo "=== /metrics (Prometheus) ==="
 curl -s "localhost:${PORT}/metrics"; echo
