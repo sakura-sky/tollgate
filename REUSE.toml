@@ -11,8 +11,11 @@ version = 1
 path = [
     "LICENSE",
     "Cargo.lock",
+    "Cargo.toml",
     ".gitignore",
+    ".dockerignore",
     ".env.example",
+    "infra/terraform/.terraform.lock.hcl",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Andrew Stevens"
