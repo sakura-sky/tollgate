@@ -86,6 +86,9 @@ pub struct UsageEvent<'a> {
     pub usage: Usage,
     pub cost_micros: i64,
     pub decision: &'a str,
+    /// Gateway overhead in microseconds: our admission path only, excluding the
+    /// upstream provider call.
+    pub overhead_micros: i64,
 }
 
 /// Records usage events (the spend ledger).
@@ -100,6 +103,7 @@ pub enum Outcome {
         status: u16,
         body: Value,
         cost_micros: i64,
+        overhead_micros: i64,
         key_id: String,
     },
     Unauthenticated,
@@ -124,12 +128,17 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             status,
             body,
             cost_micros,
+            overhead_micros,
             ..
         } => (
             StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            [("x-tollgate-overhead-us", overhead_micros.to_string())],
             Json(json!({
                 "response": body,
-                "tollgate": { "cost": format_micros(cost_micros) }
+                "tollgate": {
+                    "cost": format_micros(cost_micros),
+                    "overhead_us": overhead_micros,
+                }
             })),
         )
             .into_response(),
@@ -221,6 +230,10 @@ impl GatewayCore {
         headers: &HeaderMap,
         body: &str,
     ) -> Outcome {
+        // Measure the gateway's own overhead: total time in this method minus the
+        // time awaiting the provider (pre-flight token count and the forward).
+        let started = std::time::Instant::now();
+        let mut provider_micros: u128 = 0;
         let Some(key_id) = self.authenticate(headers).await else {
             return Outcome::Unauthenticated;
         };
@@ -267,8 +280,12 @@ impl GatewayCore {
         // provider's exact reported usage after the response.
         let input_tokens = if self.admission_exact {
             // Fail closed: if the exact count fails, do NOT fall back to the weak
-            // estimate (that would reopen the under-reservation hole).
-            match provider.count_input_tokens(rest_path, body, &parsed).await {
+            // estimate (that would reopen the under-reservation hole). The count is
+            // a provider round trip, so its time is not our overhead.
+            let c0 = std::time::Instant::now();
+            let counted = provider.count_input_tokens(rest_path, body, &parsed).await;
+            provider_micros += c0.elapsed().as_micros();
+            match counted {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::error!(error = %e.to_string(), "exact token count failed");
@@ -315,8 +332,12 @@ impl GatewayCore {
                 return Outcome::BackendError(msg);
             }
         };
-        // Forward. On error, release the whole reservation.
-        let resp = match provider.forward(rest_path, body, &parsed).await {
+        // Forward. On error, release the whole reservation. The forward is the
+        // upstream call, so its duration is excluded from our overhead.
+        let f0 = std::time::Instant::now();
+        let forwarded = provider.forward(rest_path, body, &parsed).await;
+        provider_micros += f0.elapsed().as_micros();
+        let resp = match forwarded {
             Ok(r) => r,
             Err(e) => {
                 self.budgets.commit(&reservation, 0).await;

@@ -142,6 +142,13 @@ cargo run -- admin price set --provider anthropic --model claude-3-5-sonnet \
   --input-per-1m 3 --output-per-1m 15
 ```
 
+In a running deployment the gateway also serves the read-only web console at
+`/console`, along with the key-authenticated JSON it reads: `GET /admin/budgets`
+(current-period spend and limit per budget) and `GET /admin/usage` (recent ledger
+rows). Open `/console`, paste an API key, and you get the live budget meters and
+usage that the demo shows. These endpoints are observe-only; there are no write
+endpoints in the open-source core.
+
 Web and API based management of keys and budgets, with roles, SSO, approval
 workflows, and audit, is part of the commercial console rather than this
 open-source core, which is single-operator by design.

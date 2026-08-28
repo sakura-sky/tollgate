@@ -99,24 +99,9 @@
     <span>Hard-stop: budget exhausted. The request was refused before reaching the provider (HTTP 429).</span>
   </div>
 
-  <div class="cards">
-    <div class="card">
-      <h3>Per-key budget</h3>
-      <div class="scope" id="key-scope">this API key</div>
-      <div class="amount"><span id="key-spent">-</span> <span class="of">of <span id="key-limit">-</span></span></div>
-      <div class="bar"><span id="key-bar"></span></div>
-      <div class="meta"><span id="key-pct">-</span><span><span id="key-remaining">-</span> remaining</span></div>
-    </div>
-    <div class="card">
-      <h3>Global budget</h3>
-      <div class="scope">all keys, this deployment</div>
-      <div class="amount"><span id="glob-spent">-</span> <span class="of">of <span id="glob-limit">-</span></span></div>
-      <div class="bar"><span id="glob-bar"></span></div>
-      <div class="meta"><span id="glob-pct">-</span><span><span id="glob-remaining">-</span> remaining</span></div>
-    </div>
-  </div>
+  <div class="cards" id="cards"></div>
 
-  <div style="display:flex;gap:10px;margin-bottom:24px" id="controls">
+  <div style="display:none;gap:10px;margin-bottom:24px" id="controls">
     <button id="send" class="primary" disabled>Send test request</button>
     <button id="auto" disabled>Auto-send</button>
     <span class="status" id="lastcost" style="margin:0;align-self:center"></span>
@@ -149,6 +134,7 @@
 
   if (boot.mode === "demo") {
     $("mode").textContent = "demo"; $("mode").className = "badge demo";
+    $("controls").style.display = "flex"; // test-request buttons are demo-only
   }
   if (boot.key) { $("key").value = boot.key; }
 
@@ -164,28 +150,23 @@
     return Math.min(100, (s / l) * 100);
   }
 
-  function paintBar(barEl, pctEl, remEl, spent, limit) {
-    var pct = fmtPct(spent, limit);
-    barEl.style.width = pct + "%";
-    var color = "var(--accent)";
-    if (pct >= 95) color = "var(--red)"; else if (pct >= 70) color = "var(--amber)";
-    barEl.style.background = color;
-    pctEl.textContent = pct.toFixed(1) + "%";
-    var rem = parseFloat(limit) - parseFloat(spent);
-    remEl.textContent = (isFinite(rem) ? rem : 0).toFixed(4);
+  function budgetCard(b) {
+    var pct = fmtPct(b.spent, b.limit);
+    var color = pct >= 95 ? "var(--red)" : (pct >= 70 ? "var(--amber)" : "var(--accent)");
+    var mode = b.hard_stop ? "hard-stop" : "soft cap";
+    return '<div class="card">' +
+      "<h3>" + escapeHtml(b.label) + "</h3>" +
+      '<div class="scope">' + escapeHtml(b.period) + " &middot; " + mode + "</div>" +
+      '<div class="amount">' + escapeHtml(b.spent) + ' <span class="of">of ' + escapeHtml(b.limit) + "</span></div>" +
+      '<div class="bar"><span style="width:' + pct + "%;background:" + color + '"></span></div>' +
+      '<div class="meta"><span>' + pct.toFixed(1) + "%</span><span>" + escapeHtml(b.remaining) + " remaining</span></div>" +
+      "</div>";
   }
 
-  function renderBudgets(b) {
-    if (b.demo_key) {
-      $("key-spent").textContent = b.demo_key.spent;
-      $("key-limit").textContent = b.demo_key.limit;
-      paintBar($("key-bar"), $("key-pct"), $("key-remaining"), b.demo_key.spent, b.demo_key.limit);
-    }
-    if (b.global) {
-      $("glob-spent").textContent = b.global.spent;
-      $("glob-limit").textContent = b.global.limit;
-      paintBar($("glob-bar"), $("glob-pct"), $("glob-remaining"), b.global.spent, b.global.limit);
-    }
+  function renderBudgets(data) {
+    var list = (data && data.budgets) || [];
+    if (!list.length) { $("cards").innerHTML = '<div class="empty">No budgets configured.</div>'; return; }
+    $("cards").innerHTML = list.map(budgetCard).join("");
   }
 
   function renderUsage(u) {

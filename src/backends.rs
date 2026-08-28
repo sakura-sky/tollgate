@@ -351,6 +351,61 @@ fn period_window(period: Period, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime
 ///
 /// # Errors
 /// Returns a Postgres query error. Redis write failures are logged per budget.
+/// Current-period spend for one budget, summed from the durable ledger. Counts
+/// every charged row (`cost_micros > 0`), not just `allowed`, so a billed error
+/// still counts against the budget. Shared by the reconciler and the read-only
+/// admin endpoints so both compute spend identically.
+pub async fn budget_spent(
+    pool: &PgPool,
+    budget: &Budget,
+    now: DateTime<Utc>,
+) -> Result<i64, sqlx::Error> {
+    let (start, end) = period_window(budget.period, now);
+    let base = "SELECT COALESCE(SUM(cost_micros), 0)::bigint FROM usage_events \
+                WHERE cost_micros > 0 AND started_at >= $1 AND started_at < $2";
+    let spent = match &budget.scope {
+        Scope::Global => {
+            sqlx::query_scalar::<_, i64>(base)
+                .bind(start)
+                .bind(end)
+                .fetch_one(pool)
+                .await?
+        }
+        Scope::ApiKey(id) => {
+            let Ok(uid) = uuid::Uuid::parse_str(id) else {
+                return Ok(0);
+            };
+            sqlx::query_scalar::<_, i64>(&format!("{base} AND api_key_id = $3"))
+                .bind(start)
+                .bind(end)
+                .bind(uid)
+                .fetch_one(pool)
+                .await?
+        }
+        Scope::Provider(p) => {
+            sqlx::query_scalar::<_, i64>(&format!("{base} AND provider = $3"))
+                .bind(start)
+                .bind(end)
+                .bind(p)
+                .fetch_one(pool)
+                .await?
+        }
+        Scope::Model(pm) => {
+            let Some((prov, model)) = pm.split_once(':') else {
+                return Ok(0);
+            };
+            sqlx::query_scalar::<_, i64>(&format!("{base} AND provider = $3 AND model = $4"))
+                .bind(start)
+                .bind(end)
+                .bind(prov)
+                .bind(model)
+                .fetch_one(pool)
+                .await?
+        }
+    };
+    Ok(spent)
+}
+
 pub async fn reconcile_counters(
     pool: &PgPool,
     conn: &ConnectionManager,
@@ -359,53 +414,7 @@ pub async fn reconcile_counters(
     let now = Utc::now();
     let mut restored = 0usize;
     for b in budgets {
-        let (start, end) = period_window(b.period, now);
-        // Sum every charged row, not just `allowed`: a non-2xx `error` row still
-        // commits real spend when the provider reported billing, so filtering by
-        // decision would let that spend silently drop out of the rebuilt counter.
-        // `cost_micros > 0` captures exactly the rows that consumed budget.
-        let base = "SELECT COALESCE(SUM(cost_micros), 0)::bigint FROM usage_events \
-                    WHERE cost_micros > 0 AND started_at >= $1 AND started_at < $2";
-        let spent: i64 = match &b.scope {
-            Scope::Global => {
-                sqlx::query_scalar::<_, i64>(base)
-                    .bind(start)
-                    .bind(end)
-                    .fetch_one(pool)
-                    .await?
-            }
-            Scope::ApiKey(id) => {
-                let Ok(uid) = uuid::Uuid::parse_str(id) else {
-                    continue;
-                };
-                sqlx::query_scalar::<_, i64>(&format!("{base} AND api_key_id = $3"))
-                    .bind(start)
-                    .bind(end)
-                    .bind(uid)
-                    .fetch_one(pool)
-                    .await?
-            }
-            Scope::Provider(p) => {
-                sqlx::query_scalar::<_, i64>(&format!("{base} AND provider = $3"))
-                    .bind(start)
-                    .bind(end)
-                    .bind(p)
-                    .fetch_one(pool)
-                    .await?
-            }
-            Scope::Model(pm) => {
-                let Some((prov, model)) = pm.split_once(':') else {
-                    continue;
-                };
-                sqlx::query_scalar::<_, i64>(&format!("{base} AND provider = $3 AND model = $4"))
-                    .bind(start)
-                    .bind(end)
-                    .bind(prov)
-                    .bind(model)
-                    .fetch_one(pool)
-                    .await?
-            }
-        };
+        let spent = budget_spent(pool, b, now).await?;
 
         let key = crate::budget::counter_key(&b.scope, b.period, now);
         let mut c = conn.clone();

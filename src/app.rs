@@ -12,21 +12,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::Utc;
 use redis::aio::ConnectionManager;
+use serde_json::json;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::apikey::KeyHasher;
-use crate::backends::{PgKeyStore, PgUsageSink, RedisBudgetBackend, load_budgets, load_prices};
+use crate::backends::{
+    PgKeyStore, PgUsageSink, RedisBudgetBackend, budget_spent, load_budgets, load_prices,
+};
+use crate::budget::{Budget, Scope};
 use crate::config::Config;
 use crate::gateway::{GatewayCore, outcome_response};
+use crate::pricing::format_micros;
 use crate::provider::{MockProvider, Provider};
 use crate::routes::health;
 
@@ -35,6 +41,8 @@ pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
     pub core: Arc<GatewayCore>,
+    /// Budget config (loaded at startup) for the read-only console endpoints.
+    pub budgets: Arc<Vec<Budget>>,
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
@@ -122,14 +130,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
         hasher,
         dummy_hash,
         keys: Arc::new(PgKeyStore::new(db.clone())),
-        budgets: Arc::new(RedisBudgetBackend::new(redis.clone(), budgets)),
+        budgets: Arc::new(RedisBudgetBackend::new(redis.clone(), budgets.clone())),
         usage: Arc::new(PgUsageSink::new(db.clone())),
         prices: Arc::new(prices),
         providers,
         admission_exact,
     });
 
-    let state = AppState { db, redis, core };
+    let state = AppState {
+        db,
+        redis,
+        core,
+        budgets: Arc::new(budgets),
+    };
     let app = router(state, cfg.http.request_timeout);
 
     let listener = TcpListener::bind(cfg.http.bind)
@@ -149,6 +162,9 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
         .route("/metrics", get(metrics))
+        .route("/console", get(console))
+        .route("/admin/budgets", get(admin_budgets))
+        .route("/admin/usage", get(admin_usage))
         .route("/v1/{provider}/{*rest}", post(gateway))
         .with_state(state)
         .layer(TimeoutLayer::with_status_code(
@@ -166,6 +182,120 @@ async fn gateway(
 ) -> Response {
     let outcome = state.core.evaluate(&provider, &rest, &headers, &body).await;
     outcome_response(outcome)
+}
+
+/// Serve the read-only web console. Production injects no key (unlike the demo);
+/// the viewer supplies their own, which the page sends to the endpoints below.
+async fn console() -> impl IntoResponse {
+    Html(crate::console::render(""))
+}
+
+fn budget_label(b: &Budget) -> String {
+    match &b.scope {
+        Scope::Global => "Global".to_owned(),
+        Scope::ApiKey(id) => format!("Per-key {}", id.get(..8).unwrap_or(id.as_str())),
+        Scope::Provider(p) => format!("Provider: {p}"),
+        Scope::Model(pm) => format!("Model: {pm}"),
+    }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "admin endpoints require a valid API key"})),
+    )
+        .into_response()
+}
+
+/// Read-only budgets view: current-period spend and limit per configured budget,
+/// summed from the durable ledger. Key-authenticated.
+async fn admin_budgets(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if state.core.authenticate(&headers).await.is_none() {
+        return unauthorized();
+    }
+    let now = Utc::now();
+    let mut out = Vec::with_capacity(state.budgets.len());
+    for b in state.budgets.iter() {
+        let spent = match budget_spent(&state.db, b, now).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "console: budget spend query failed");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "budget read failed"})),
+                )
+                    .into_response();
+            }
+        };
+        out.push(json!({
+            "label": budget_label(b),
+            "period": b.period.as_str(),
+            "spent": format_micros(spent),
+            "limit": format_micros(b.limit_micros),
+            "remaining": format_micros(b.limit_micros - spent),
+            "hard_stop": b.hard_stop,
+        }));
+    }
+    Json(json!({ "budgets": out })).into_response()
+}
+
+#[derive(sqlx::FromRow)]
+struct UsageRow {
+    provider: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cost_micros: i64,
+    decision: String,
+}
+
+/// Read-only usage view: the 100 most recent ledger rows, oldest-first so the
+/// console can number them chronologically. Key-authenticated. Cost is a plain
+/// decimal string, never raw micros.
+async fn admin_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if state.core.authenticate(&headers).await.is_none() {
+        return unauthorized();
+    }
+    let rows = sqlx::query_as::<_, UsageRow>(
+        "SELECT provider, model, input_tokens, output_tokens, cost_micros, decision \
+         FROM (SELECT provider, model, input_tokens, output_tokens, cost_micros, decision, \
+                      started_at \
+               FROM usage_events ORDER BY started_at DESC LIMIT 100) recent \
+         ORDER BY started_at ASC",
+    )
+    .fetch_all(&state.db)
+    .await;
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "console: usage query failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "usage read failed"})),
+            )
+                .into_response();
+        }
+    };
+    let events: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "provider": r.provider,
+                "model": r.model,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cost": format_micros(r.cost_micros),
+                "decision": r.decision,
+            })
+        })
+        .collect();
+    let total: i64 = rows.iter().map(|r| r.cost_micros).sum();
+    Json(json!({
+        "events": events,
+        "total_cost": format_micros(total),
+        "count": rows.len(),
+    }))
+    .into_response()
 }
 
 /// Minimal Prometheus endpoint. Per-request counters are added with a metrics

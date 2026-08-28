@@ -238,15 +238,21 @@ async fn admin_budgets(
         Period::Monthly,
         now,
     );
+    let budget = |label: &str, spent: i64, limit: i64| {
+        json!({
+            "label": label,
+            "period": "monthly",
+            "spent": format_micros(spent),
+            "limit": format_micros(limit),
+            "remaining": format_micros(limit - spent),
+            "hard_stop": true,
+        })
+    };
     Json(json!({
-        "global": {
-            "spent": format_micros(global),
-            "limit": format_micros(state.global_limit_micros),
-        },
-        "demo_key": {
-            "spent": format_micros(key),
-            "limit": format_micros(state.per_key_limit_micros),
-        }
+        "budgets": [
+            budget("Per-key (demo)", key, state.per_key_limit_micros),
+            budget("Global", global, state.global_limit_micros),
+        ]
     }))
     .into_response()
 }
