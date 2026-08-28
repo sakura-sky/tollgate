@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="Tollgate social card">
+  <!-- SPDX-License-Identifier: MIT -->
+  <!-- SPDX-FileCopyrightText: 2026 Andrew Stevens -->
+  <!-- 1200x630 Open Graph / social card. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#141b26"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="8" fill="#3fb950"/>
+
+  <g transform="translate(96,150) scale(5.5)" fill="none" stroke="#3fb950" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 20V8l8-4 8 4v12"/>
+    <path d="M4 12h16"/>
+    <path d="M12 4v16"/>
+  </g>
+
+  <text x="240" y="250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="96" font-weight="800" fill="#e6edf3" letter-spacing="-2">Tollgate</text>
+  <text x="242" y="322" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="40" font-weight="500" fill="#8b949e">Open-source LLM spend-control gateway</text>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="28" fill="#c9d1d9">
+    <text x="96" y="470">Per-key and global token budgets, with a hard-stop before overspend.</text>
+    <text x="96" y="516">Tokens-to-cost accounting. Anthropic and Vertex. Rust, on Cloud Run.</text>
+  </g>
+
+  <text x="96" y="586" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="26" fill="#58a6ff">github.com/sakura-sky/tollgate</text>
+  <text x="1104" y="586" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="24" fill="#8b949e">MIT</text>
+</svg>

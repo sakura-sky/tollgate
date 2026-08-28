@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -41,6 +41,9 @@ pub struct DemoState {
     demo_key_id: String,
     per_key_limit_micros: i64,
     global_limit_micros: i64,
+    // Demo only: the preloaded plaintext key, used to seed the console so it
+    // connects on load. The demo binds loopback and already prints this key.
+    demo_plaintext_key: String,
 }
 
 struct Preloaded {
@@ -108,6 +111,7 @@ fn preload() -> Preloaded {
             demo_key_id,
             per_key_limit_micros,
             global_limit_micros,
+            demo_plaintext_key: generated.plaintext.clone(),
         }),
         plaintext_key: generated.plaintext,
     }
@@ -247,6 +251,13 @@ async fn admin_budgets(
     .into_response()
 }
 
+/// The read-only web console. The demo seeds the preloaded key so the page
+/// connects on load; the page itself calls the key-authenticated JSON endpoints.
+async fn console(State(state): State<Arc<DemoState>>) -> impl IntoResponse {
+    let boot = crate::console::demo_boot(&state.demo_plaintext_key);
+    Html(crate::console::render(&boot))
+}
+
 async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok", "mode": "demo"}))
 }
@@ -323,6 +334,7 @@ fn router(state: Arc<DemoState>) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
+        .route("/console", get(console))
         .route("/admin/usage", get(admin_usage))
         .route("/admin/budgets", get(admin_budgets))
         .route("/v1/{provider}/{*rest}", post(gateway))
@@ -345,6 +357,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     println!("\nTollgate demo (in-memory, no Postgres/Redis/creds)");
     println!("Listening on http://{bind}  (loopback only)\n");
+    println!("Open the live console (budgets, spend, hard-stop):");
+    println!("    http://localhost:{port}/console\n");
     println!("Demo API key (send as header  {KEY_HEADER}: <key>):");
     println!("    {plaintext_key}\n");
     println!("Budgets (monthly, hard-stop):");

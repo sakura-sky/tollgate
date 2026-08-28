@@ -16,6 +16,7 @@ path = [
     ".dockerignore",
     ".env.example",
     "infra/terraform/.terraform.lock.hcl",
+    "assets/**",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Andrew Stevens"

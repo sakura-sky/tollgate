@@ -185,15 +185,20 @@ async fn admin_key_issue(cfg: &Config, label: &str) -> Result<()> {
     let hasher = crate::apikey::KeyHasher::new(cfg.security.api_key_pepper.clone().into_bytes());
     let key = hasher.generate();
     let pool = crate::db::build_pool(&cfg.database).await?;
-    sqlx::query("INSERT INTO api_keys (key_hash, prefix, label) VALUES ($1, $2, $3)")
-        .bind(&key.key_hash)
-        .bind(&key.prefix)
-        .bind(label)
-        .execute(&pool)
-        .await
-        .context("inserting api key")?;
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO api_keys (key_hash, prefix, label) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&key.key_hash)
+    .bind(&key.prefix)
+    .bind(label)
+    .fetch_one(&pool)
+    .await
+    .context("inserting api key")?;
     println!("API key issued (store it now; it is not recoverable):");
-    println!("  {}", key.plaintext);
+    println!("  key: {}", key.plaintext);
+    println!("  id:  {id}");
+    println!("\nSet a per-key budget with:");
+    println!("  tollgate admin budget set --scope api_key:{id} --period monthly --limit <amount>");
     Ok(())
 }
 

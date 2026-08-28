@@ -14,6 +14,7 @@ pub mod backends;
 pub mod budget;
 pub mod cli;
 pub mod config;
+pub mod console;
 pub mod db;
 pub mod demo;
 pub mod error;

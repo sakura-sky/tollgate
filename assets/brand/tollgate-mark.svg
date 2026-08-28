@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Tollgate">
+  <!-- SPDX-License-Identifier: MIT -->
+  <!-- SPDX-FileCopyrightText: 2026 Andrew Stevens -->
+  <rect x="2" y="2" width="124" height="124" rx="28" fill="#0d1117" stroke="#2b3240" stroke-width="2"/>
+  <g transform="translate(28,28) scale(3)" fill="none" stroke="#3fb950" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 20V8l8-4 8 4v12"/>
+    <path d="M4 12h16"/>
+    <path d="M12 4v16"/>
+  </g>
+</svg>

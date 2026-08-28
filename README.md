@@ -1,5 +1,10 @@
 # Tollgate
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/tollgate-logo-dark.svg">
+  <img alt="Tollgate" src="assets/brand/tollgate-logo-light.svg" width="300">
+</picture>
+
 [![CI](https://github.com/sakura-sky/tollgate/actions/workflows/ci.yml/badge.svg)](https://github.com/sakura-sky/tollgate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![REUSE compliant](https://img.shields.io/badge/REUSE-compliant-success.svg)](https://reuse.software/)
@@ -45,6 +50,24 @@ sequence at once:
 ./scripts/demo.sh
 ```
 
+### Console (read-only web UI)
+
+The demo also serves a self-contained web console. After `cargo run -- demo`
+starts, open the printed URL:
+
+```
+http://localhost:8080/console
+```
+
+It shows the per-key and global budget meters, live spend, the tokens-to-cost
+breakdown, and recent usage, refreshing every second. Click **Send test request**
+(or **Auto-send**) and watch the per-key meter climb green to amber to red and
+the hard-stop banner appear when the budget is exhausted, while the global
+backstop barely moves. In the demo the console is seeded with the demo key so it
+connects on load; when the gateway serves it in production the viewer supplies
+their own key. The console is deliberately observe-only: it reads the same
+key-authenticated JSON endpoints you would call with curl.
+
 ### Monitoring
 
 The gateway exposes standard operational endpoints for your SRE stack:
@@ -77,6 +100,51 @@ cargo run --bin tollgate -- serve
 curl -s http://localhost:8080/healthz | jq
 curl -s http://localhost:8080/readyz  | jq
 ```
+
+## Managing keys and budgets
+
+Keys and budgets are managed with the `tollgate admin` CLI against your Postgres.
+From a source checkout the binary is not on your `PATH`, so either prefix with
+`cargo run --` or install it once with `cargo install --path .`. The admin
+commands need Postgres running, `TOLLGATE_DATABASE__URL` and a fixed
+`TOLLGATE_SECURITY__API_KEY_PEPPER` (at least 16 bytes) set, and migrations
+applied:
+
+```bash
+docker compose -f compose/docker-compose.yaml up -d
+cp .env.example .env            # set TOLLGATE_SECURITY__API_KEY_PEPPER to a real secret
+set -a; source .env; set +a
+cargo run -- admin migrate
+```
+
+Issue a key (the plaintext is shown once and never stored; the command also
+prints the key's id, which you need for a per-key budget):
+
+```bash
+cargo run -- admin key issue --label "team-alpha"
+```
+
+Set a global backstop and a per-key cap (amounts are in your configured currency;
+budgets hard-stop by default):
+
+```bash
+cargo run -- admin budget set --scope global --period monthly --limit 500
+cargo run -- admin budget set --scope api_key:<id> --period monthly --limit 25
+```
+
+Scopes are `global`, `api_key:<uuid>`, `provider:<name>`, or
+`model:<provider:model>`; periods are `daily`, `weekly`, or `monthly`. Revoke a
+key with `admin key revoke --key <key-or-prefix>`. Set model prices (per 1,000,000
+tokens) so spend can be costed:
+
+```bash
+cargo run -- admin price set --provider anthropic --model claude-3-5-sonnet \
+  --input-per-1m 3 --output-per-1m 15
+```
+
+Web and API based management of keys and budgets, with roles, SSO, approval
+workflows, and audit, is part of the commercial console rather than this
+open-source core, which is single-operator by design.
 
 ## Configuration
 
@@ -122,9 +190,11 @@ src/
   provider.rs     - provider trait + built-in mock
   providers.rs    - Anthropic and Vertex/Gemini pass-through adapters
   backends.rs     - Postgres key/usage stores + Valkey budget backend
+  console.rs      - read-only web console (serves assets/console.html)
   demo.rs         - zero-infra demo mode
   routes/
     health.rs     - /healthz, /readyz
+assets/           - console.html and brand assets
 migrations/       - sqlx migrations
 infra/terraform/  - GCP infrastructure module
 compose/          - local dev dependencies
