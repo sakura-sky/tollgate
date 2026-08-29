@@ -408,6 +408,22 @@ pub async fn budget_spent(
     Ok(spent)
 }
 
+/// Run usage-ledger partition maintenance: create the current and next month
+/// partitions and drop any partition older than `window` (a zero window keeps
+/// everything). Delegates to the `tollgate_usage_maintain` SQL function so the
+/// partition logic lives with the schema.
+pub async fn run_usage_maintenance(
+    pool: &PgPool,
+    window: std::time::Duration,
+) -> Result<(), sqlx::Error> {
+    let secs = i64::try_from(window.as_secs()).unwrap_or(i64::MAX);
+    sqlx::query("SELECT tollgate_usage_maintain($1 * interval '1 second')")
+        .bind(secs)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Seed Redis/Valkey counters for budgets whose current-period counter key does
 /// not yet exist, from the durable ledger. Used on hot-reload so a budget added
 /// at runtime enforces against spend already incurred this period rather than

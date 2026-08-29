@@ -109,6 +109,14 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .context("reconciling budget counters")?;
     tracing::info!(restored, "reconciled budget counters from ledger");
 
+    // Ledger retention: ensure current/next month partitions exist and drop those
+    // older than the window. Run once now (so partitions are present before we
+    // serve), then periodically.
+    if let Err(e) = crate::backends::run_usage_maintenance(&db, cfg.retention.window).await {
+        tracing::warn!(error = %e, "usage ledger maintenance failed at startup");
+    }
+    spawn_maintenance_task(db.clone(), cfg.retention.window);
+
     // Do NOT follow redirects: a cross-host redirect would resend the request,
     // including provider credentials (e.g. Anthropic's x-api-key), to another
     // host. Treat any 3xx as an upstream error instead.
@@ -258,6 +266,22 @@ fn spawn_reload_task(
             core.store(Arc::new(parts.build(budgets.clone(), prices)));
             budgets_view.store(Arc::new(budgets));
             tracing::debug!(budgets = n_b, priced_models = n_p, "reloaded config");
+        }
+    });
+}
+
+/// Background task: run usage-ledger partition maintenance (create-ahead + drop
+/// old partitions) every few hours.
+fn spawn_maintenance_task(db: PgPool, window: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+        ticker.tick().await; // the first tick fires immediately; startup already ran once
+        loop {
+            ticker.tick().await;
+            match crate::backends::run_usage_maintenance(&db, window).await {
+                Ok(()) => tracing::debug!("usage ledger maintenance ran"),
+                Err(e) => tracing::warn!(error = %e, "usage ledger maintenance failed"),
+            }
         }
     });
 }

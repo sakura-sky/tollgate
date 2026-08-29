@@ -28,6 +28,18 @@ pub struct Config {
     pub security: SecurityConfig,
     pub providers: ProvidersConfig,
     pub reload: ReloadConfig,
+    pub retention: RetentionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// How long to keep `usage_events` rows. The ledger is monthly-partitioned;
+    /// partitions whose whole month is older than this window are dropped (the
+    /// table is append-only, so retention is by partition drop, not DELETE). Set
+    /// `0s` to keep everything. Granularity is monthly: the current month is
+    /// always retained.
+    #[serde(with = "humantime_serde")]
+    pub window: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +185,10 @@ impl Default for Config {
             },
             reload: ReloadConfig {
                 interval: Duration::from_secs(15),
+            },
+            retention: RetentionConfig {
+                // 90 days.
+                window: Duration::from_secs(90 * 24 * 60 * 60),
             },
         }
     }

@@ -35,6 +35,34 @@ full reconcile storm and a momentary cold window:
 If you deliberately want a cold cache (for example after changing budget periods),
 restart the gateway and let reconcile rebuild the counters from the ledger.
 
+## Ledger retention
+
+`usage_events` is append-only: a trigger rejects `UPDATE` and `DELETE` for every
+role, including the table owner, so spend history cannot be quietly rewritten.
+That immutability is deliberate, but it means the ledger cannot be trimmed with a
+`DELETE` purge. Retention is therefore done by time partitioning.
+
+The table is `RANGE`-partitioned by `started_at` into monthly partitions. The
+gateway runs a maintenance routine at startup and every few hours that:
+
+- creates the current and next month's partitions ahead of need, so inserts
+  always have a home; and
+- drops any partition whose whole month is older than
+  `TOLLGATE_RETENTION__WINDOW` (default 90 days). Dropping a partition is DDL, so
+  it bypasses the append-only row trigger while the rows that remain stay
+  immutable.
+
+Set `TOLLGATE_RETENTION__WINDOW=0s` to keep everything (create-ahead only, no
+drops). Granularity is monthly, so at least the current month is always retained
+and the effective retention rounds up to a whole month. The budget counters are
+unaffected: they are driven by the current period's rows, which are always well
+within any sane retention window, and Postgres partition pruning on `started_at`
+keeps the spend-sum queries fast as the ledger grows.
+
+For very high volume, reduce the window or switch the partition granularity to
+weekly or daily in `tollgate_usage_maintain` (migration `0006`); the same
+create-ahead and drop-old logic applies.
+
 ## Network and egress posture (baseline)
 
 The default Terraform deploys a private posture, not an open one:
