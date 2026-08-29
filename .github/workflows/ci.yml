@@ -52,12 +52,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - name: Install Rust (stable, for the audit tool)
+        run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
+      # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
+      # this directory, but the audit tool itself should build on current stable.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo +stable install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
