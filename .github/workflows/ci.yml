@@ -20,7 +20,7 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pin to the MSRV so CI fails if code uses anything newer than we promise.
       - name: Install Rust 1.85 (MSRV)
@@ -44,14 +44,14 @@ jobs:
     name: REUSE compliance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: fsfe/reuse-action@v5
 
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust (stable, for the audit tool)
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
