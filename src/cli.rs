@@ -182,6 +182,12 @@ async fn admin_key_issue(cfg: &Config, label: &str) -> Result<()> {
              before issuing keys (the same value must be configured for `serve`)"
         );
     }
+    if cfg.security.api_key_pepper == crate::config::DEV_PLACEHOLDER_PEPPER {
+        bail!(
+            "TOLLGATE_SECURITY__API_KEY_PEPPER is still the .env.example placeholder; \
+             set a real secret before issuing keys"
+        );
+    }
     let hasher = crate::apikey::KeyHasher::new(cfg.security.api_key_pepper.clone().into_bytes());
     let key = hasher.generate();
     let pool = crate::db::build_pool(&cfg.database).await?;

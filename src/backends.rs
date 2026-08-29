@@ -480,8 +480,24 @@ pub async fn reconcile_counters(
 
         let key = crate::budget::counter_key(&b.scope, b.period, now);
         let mut c = conn.clone();
+        // Never LOWER a live counter. A best-effort ledger write can be lost after
+        // the counter was already incremented, leaving Redis ahead of the ledger;
+        // setting the counter down to the ledger sum would then permit overspend
+        // for the rest of the period. Reconcile up to max(current, ledger) so the
+        // counter is only ever raised. Reconcile runs at startup before traffic,
+        // so this get-then-set is race-free.
+        let current: Option<i64> = match redis::cmd("GET").arg(&key).query_async(&mut c).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Do NOT default to 0 on a read error: that could lower a live
+                // counter and permit overspend. Skip this key and retry next boot.
+                tracing::warn!(error = %e, key = %key, "reconcile: counter read failed; skipping");
+                continue;
+            }
+        };
+        let value = spent.max(current.unwrap_or(0));
         let res: redis::RedisResult<()> = redis::pipe()
-            .set(&key, spent)
+            .set(&key, value)
             .ignore()
             .expire(&key, COUNTER_TTL_SECS)
             .ignore()

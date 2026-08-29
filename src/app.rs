@@ -99,6 +99,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
              (the same value for `serve` and `admin key issue`); refusing to start"
         );
     }
+    if cfg.security.api_key_pepper == crate::config::DEV_PLACEHOLDER_PEPPER {
+        anyhow::bail!(
+            "TOLLGATE_SECURITY__API_KEY_PEPPER is still the .env.example placeholder; \
+             set a real secret before starting"
+        );
+    }
     let hasher = KeyHasher::new(cfg.security.api_key_pepper.clone().into_bytes());
     let dummy_hash = hasher.hash("tollgate-fixed-dummy-secret");
 
@@ -340,7 +346,7 @@ fn unauthorized() -> Response {
 /// Read-only budgets view: current-period spend and limit per configured budget,
 /// summed from the durable ledger. Authenticated by any valid key: Tollgate is
 /// single-tenant per deployment, so any key in the deployment may observe its
-/// budgets and usage. Per-tenant scoping is a commercial-console concern.
+/// budgets and usage. Per-tenant scoping is an Enterprise-edition concern.
 async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let core = state.core.load_full();
     if core.authenticate(&headers).await.is_none() {

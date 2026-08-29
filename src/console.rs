@@ -7,8 +7,8 @@
 //! an operator would call with curl.
 //!
 //! The page is intentionally observe-only. Administration at scale (multi-org,
-//! RBAC/SSO, budget approvals, policy, audit export) is the commercial console,
-//! not this.
+//! RBAC/SSO, budget approvals, policy, audit export) is planned for a separate
+//! Enterprise edition, not this open-source core.
 
 /// The console HTML, embedded at compile time.
 const CONSOLE_HTML: &str = include_str!("../assets/console.html");

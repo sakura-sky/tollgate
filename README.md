@@ -9,15 +9,58 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![REUSE compliant](https://img.shields.io/badge/REUSE-compliant-success.svg)](https://reuse.software/)
 
-Tollgate is an open-source AI gateway and spend-control proxy. It sits between an organisation's applications and their LLM providers, enforcing per-key and global token budgets and recording spend before requests reach the model.
-
-This is an early foundation: a runnable axum skeleton with health probes, structured logging, an OTLP-capable telemetry pipeline, a `serve`/`admin` CLI, and database migrations.
+Tollgate is an open-source AI gateway and spend-control proxy. It sits between your applications and their LLM providers (Anthropic and Google Vertex today), prices each request by token, reserves budget before the call, and **hard-stops over-budget requests before they reach the model**. Spend is written to a durable, append-only ledger, and a read-only web console shows live budgets, spend, and the gateway's own added latency.
 
 It draws on the proxy and cost-control patterns popularised by [LiteLLM](https://github.com/BerriAI/litellm), implemented in Rust under MIT.
 
 ## Status
 
-Early development. Not production-ready.
+Beta, pre-1.0. The budget-enforcement core, provider adapters, web console, config hot-reload, and ledger retention are implemented and tested, and the money path is built for correctness: integer micros (no floats), reserve-then-settle, atomic Valkey enforcement reconciled from a Postgres ledger. Interfaces and schema may still change before 1.0.
+
+## How it works
+
+```mermaid
+flowchart LR
+  app["Your apps"] -->|"x-tollgate-key"| gw["Tollgate gateway"]
+  gw <-->|"reserve / settle"| vk[("Valkey<br/>budget counters")]
+  gw -->|"append usage"| pg[("Postgres<br/>ledger + config")]
+  gw -->|"forward"| prov["Anthropic / Vertex"]
+  ops["Operator"] -->|"read-only"| console["/console"]
+  console --> gw
+```
+
+Each request is authenticated, priced by token, and checked against every budget that applies to it (its key, the provider, the model, and the global backstop) before it is forwarded. The worst-case cost is reserved up front; after the provider responds, the reservation is settled to the exact cost. If any hard cap would be exceeded, the request is refused with `429` before it reaches the provider.
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant T as Tollgate
+  participant V as Valkey
+  participant P as Provider
+  C->>T: POST /v1/{provider}/... (x-tollgate-key)
+  T->>T: authenticate (HMAC-SHA256)
+  T->>T: price request (tokens to cost)
+  T->>V: reserve worst-case cost
+  alt would exceed a hard cap
+    V-->>T: denied
+    T-->>C: 429 (never reaches provider)
+  else within budget
+    T->>P: forward
+    P-->>T: response + token usage
+    T->>V: settle to actual cost
+    T-->>C: 200 + cost + x-tollgate-overhead-us
+  end
+```
+
+## Use cases
+
+- **Cap AI spend per team, customer, or key** with a real hard stop, not just an after-the-fact alert.
+- **A global monthly ceiling** as a backstop across every key in a deployment.
+- **One audited choke point** in front of multiple LLM providers, with an append-only spend ledger.
+- **Give finance a live, currency-agnostic view** of token spend by model, key, and provider.
+- **Show, don't claim, low overhead**: the console reports Tollgate's own added latency (typically sub-millisecond to low-millisecond) per request.
+
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the components, data model, and enforcement invariants in detail.
 
 ## Demo (zero infrastructure)
 
@@ -74,7 +117,7 @@ The gateway exposes standard operational endpoints for your SRE stack:
 
 - `GET /healthz` - liveness ping
 - `GET /readyz` - readiness
-- `GET /metrics` - Prometheus text format. Currently exposes `tollgate_up`; per-decision request counters and budget spend/limit gauges are on the roadmap. Postgres is the system of record for spend in the meantime
+- `GET /metrics` - Prometheus text format. Currently exposes `tollgate_up` only; richer per-decision counters and budget gauges are not in this release. Postgres is the system of record for spend, and the console reads it live
 
 Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set.
 
@@ -151,8 +194,8 @@ no write endpoints in the open-source core.
 
 Authorization is deliberately flat: any valid key may view the deployment's
 budgets and usage, because Tollgate is single-tenant per deployment (one trust
-boundary). If you need per-tenant scoping, roles, or SSO on these views, that is
-the commercial console's job, not the open-source core.
+boundary). Per-tenant scoping, roles, and SSO on these views are planned for the
+Tollgate Enterprise edition (see below), not the open-source core.
 
 Every proxied request records the gateway's own added latency (the admission
 path only, excluding the upstream provider call). The console shows the median
@@ -164,9 +207,27 @@ Budget and price changes apply within the reload interval
 to `0s` to read config only at startup. A changed limit applies to the existing
 spend counter; a brand-new budget starts counting when it is first picked up.
 
-Web and API based management of keys and budgets, with roles, SSO, approval
-workflows, and audit, is part of the commercial console rather than this
-open-source core, which is single-operator by design.
+### Admission modes and the hard-stop guarantee
+
+Before forwarding, Tollgate reserves the worst-case cost of a request. Output is
+capped by the request's `max_tokens` / `maxOutputTokens`, so the output side is
+always bounded. Input tokens are counted one of two ways, set by
+`TOLLGATE_PROVIDERS__ADMISSION`:
+
+- `fast` (default): estimate input tokens from the request body. No extra call,
+  lowest latency. The estimate is a bounded best effort, so for token-dense input
+  a reservation can be slightly low and settle a hair over the cap.
+- `exact`: make a pre-flight token-count call to the provider. One extra call per
+  request, and the hard cap is enforced strictly.
+
+Either way the request is settled to the provider's exact reported usage after
+the response, so the ledger is always accurate; the difference is only how tight
+the pre-forward reservation is. Choose `exact` when you need the cap to be
+strict to the token.
+
+## Enterprise edition
+
+The open-source core is single-operator and single-tenant by design: CLI-managed keys and budgets, a read-only console, and one trust boundary per deployment. A Tollgate Enterprise edition with additional capabilities will follow, aimed at teams running Tollgate across many tenants and operators, including web and API management of keys and budgets, role-based access control and SSO, budget-change approval workflows, multi-org scoping, richer analytics, and audit export. If that is of interest, open a [GitHub Discussion](https://github.com/sakura-sky/tollgate/discussions) or contact Sakura Sky. (Please keep the `SECURITY.md` inbox for vulnerability reports only.)
 
 ## Configuration
 

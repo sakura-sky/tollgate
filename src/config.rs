@@ -18,6 +18,10 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 
+/// The placeholder pepper shipped in `.env.example`. Rejected at startup and at
+/// key issuance so a copied example file cannot silently defeat the pepper.
+pub const DEV_PLACEHOLDER_PEPPER: &str = "dev-only-change-me-please-16+";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub http: HttpConfig,
