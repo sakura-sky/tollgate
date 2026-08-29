@@ -29,7 +29,7 @@ flowchart LR
   console --> gw
 ```
 
-Each request is authenticated, priced by token, and checked against every budget that applies to it (its key, the provider, the model, and the global backstop) before it is forwarded. The worst-case cost is reserved up front; after the provider responds, the reservation is settled to the exact cost. If any hard cap would be exceeded, the request is refused with `429` before it reaches the provider.
+Each request is authenticated, priced by token, and checked against every budget that applies to it (its key, the provider, the model, and the global backstop) before it is forwarded. The worst-case cost is reserved up front; after the provider responds, the reservation is settled to the exact cost. If any hard cap would be exceeded, the request is refused with `402 Payment Required` before it reaches the provider.
 
 ```mermaid
 sequenceDiagram
@@ -43,7 +43,7 @@ sequenceDiagram
   T->>V: reserve worst-case cost
   alt would exceed a hard cap
     V-->>T: denied
-    T-->>C: 429 (never reaches provider)
+    T-->>C: 402 Payment Required (never reaches provider)
   else within budget
     T->>P: forward
     P-->>T: response + token usage
@@ -83,7 +83,7 @@ curl -s localhost:8080/v1/mock/generate \
 ```
 
 The first few requests return `200` with a cost breakdown; once the budget is
-exhausted the gateway returns `429` **before the request reaches the provider**.
+exhausted the gateway returns `402` **before the request reaches the provider**.
 Inspect spend with the console endpoints (which require the key):
 `curl -s -H "x-tollgate-key: <key>" localhost:8080/console/budgets` and
 `/console/usage`. The demo binds to loopback only. Or run the whole narrated
@@ -224,6 +224,15 @@ Either way the request is settled to the provider's exact reported usage after
 the response, so the ledger is always accurate; the difference is only how tight
 the pre-forward reservation is. Choose `exact` when you need the cap to be
 strict to the token.
+
+## Limitations
+
+Known limitations in this release, stated up front:
+
+- **No streaming yet.** Requests must be non-streaming (`stream=false` for Anthropic; the Vertex adapter allows only `:generateContent`). Streaming endpoints are rejected because usage cannot be metered from a partial stream here. Streaming with end-of-stream metering is planned.
+- **Prompt-caching cost is approximate.** Cost is computed from base input and output tokens. Provider cache-read and cache-write token classes are not yet priced separately, so on cache-heavy workloads the recorded cost can diverge from the provider's bill (it can under-count). Standard, non-caching usage is exact.
+- **Observe endpoints are flat-authorized.** Any valid key can view the whole deployment's budgets and usage (single-tenant by design). This concerns only the read-only console and `/console/*` endpoints; budget *enforcement* is still per key. Per-tenant scoping is an Enterprise-edition concern.
+- **Minimal metrics.** `/metrics` exposes only `tollgate_up`; Postgres is the system of record for spend and the console reads it live.
 
 ## Enterprise edition
 

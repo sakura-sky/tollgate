@@ -52,7 +52,7 @@ pub trait KeyStore: Send + Sync {
 }
 
 /// Why a reservation failed: a real budget denial, or a backend (infra) error.
-/// These map to different HTTP statuses (429 vs 503) and the backend error text
+/// These map to different HTTP statuses (402 vs 503) and the backend error text
 /// is never shown to the client.
 pub enum ReserveError {
     Denied(BudgetDenied),
@@ -152,8 +152,11 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             Json(json!({"error": format!("invalid request body: {m}")})),
         )
             .into_response(),
+        // Unknown/unpriced provider or model: the caller targeted something we
+        // can't route or price. 400, not 402 (which we reserve for budget).
         Outcome::Unpriced { provider, model } => (
-            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::BAD_REQUEST,
+            [("x-tollgate-reason", "unpriced")],
             Json(json!({
                 "error": "no price configured for this provider/model - request refused (fail closed)",
                 "provider": provider,
@@ -161,8 +164,12 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             })),
         )
             .into_response(),
+        // Budget exhausted: 402 Payment Required. It is the "out of budget,
+        // retrying will not help" signal, and unlike 429 it is not auto-retried
+        // by provider SDKs (429 is reserved for real rate limiting).
         Outcome::BudgetDenied(d) => (
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::PAYMENT_REQUIRED,
+            [("x-tollgate-reason", "budget_exceeded")],
             Json(json!({
                 "error": "budget exceeded - request refused before reaching the provider",
                 "detail": d.to_string(),

@@ -198,7 +198,7 @@ impl BudgetBackend for RedisBudgetBackend {
         }
 
         let mut conn = self.conn.clone();
-        // A cache failure is a BACKEND error (503), not a budget denial (429),
+        // A cache failure is a BACKEND error (503), not a budget denial (402),
         // and its detail is never shown to the client.
         let result: Vec<i64> = invocation
             .invoke_async(&mut conn)

@@ -35,7 +35,7 @@ If you contribute substantial work and want your name in headers on files you au
 ## Tests
 
 - New behaviour needs tests. Integration tests against a real Postgres/Redis (via the compose file) are preferred over mocks for anything touching persistence.
-- Don't reduce coverage of the budget hot path. That's the wedge feature; correctness there is the whole point.
+- Don't reduce coverage of the budget hot path. Enforcement correctness is the core guarantee of the project.
 
 ## What we'll review
 

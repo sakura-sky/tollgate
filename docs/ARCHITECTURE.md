@@ -54,7 +54,7 @@ sequenceDiagram
   participant P as Provider
   C->>T: POST /v1/{provider}/{path}
   T->>T: parse key, HMAC-SHA256 verify (constant time)
-  Note over T: unknown provider/model -> 402 (fail closed)
+  Note over T: unknown provider/model -> 400 (fail closed)
   T->>T: price by token (integer micros)
   opt admission = exact
     T->>P: pre-flight count_tokens
@@ -62,7 +62,7 @@ sequenceDiagram
   T->>V: reserve worst-case cost (atomic check + incr)
   alt would exceed a hard cap
     T->>DB: record decision = rejected_budget
-    T-->>C: 429 (never reaches provider)
+    T-->>C: 402 Payment Required (never reaches provider)
   else within budget
     T->>P: forward request
     P-->>T: response + usage
@@ -122,8 +122,11 @@ immutability. `audit_log` is likewise append-only.
 - **Integer micros, never floats.** All money is `1e-6` of the deployment's
   configured currency unit; cost math uses `i128` intermediates and rounds once.
 - **Reserve then settle.** The worst-case cost is reserved before the forward and
-  settled to the provider's exact reported usage after, so the ledger is exact and
-  a hard cap cannot be blown by an unknown output length.
+  settled to the provider's reported usage after, so a hard cap cannot be blown by
+  an unknown output length. Cost is exact for the standard input and output token
+  classes; provider prompt-caching token classes (cache-read and cache-write) are
+  not yet priced separately, so cost is approximate on cache-heavy workloads (see
+  the README "Limitations").
 - **Atomic enforcement.** The Valkey reserve is a single Lua check-and-increment;
   the settle is a single Lua apply. A cache failure fails closed (503), not a
   budget bypass.

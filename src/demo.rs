@@ -164,7 +164,8 @@ async fn gateway(
         )
             .into_response(),
         Outcome::Unpriced { provider, model } => (
-            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::BAD_REQUEST,
+            [("x-tollgate-reason", "unpriced")],
             Json(json!({
                 "error": "no price configured for this provider/model - request refused (fail closed)",
                 "provider": provider,
@@ -173,7 +174,8 @@ async fn gateway(
         )
             .into_response(),
         Outcome::BudgetDenied(d) => (
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::PAYMENT_REQUIRED,
+            [("x-tollgate-reason", "budget_exceeded")],
             Json(json!({
                 "error": "budget exceeded - request refused before reaching the provider",
                 "detail": d.to_string(),
@@ -373,7 +375,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     println!("Budgets (monthly, hard-stop):");
     println!("    global : {global}");
     println!("    per-key: {per_key}   (about 3 default requests before hard-stop)\n");
-    println!("Send a request (repeat it; the 4th is rejected with HTTP 429):");
+    println!("Send a request (repeat it; the 4th is rejected with HTTP 402):");
     println!(
         "    curl -s localhost:{port}/v1/mock/generate \\\n        -H 'x-tollgate-key: {plaintext_key}' \\\n        -H 'content-type: application/json' \\\n        -d '{{\"model\":\"demo\",\"prompt\":\"hello tollgate\",\"max_output_tokens\":1000}}'\n"
     );
