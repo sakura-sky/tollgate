@@ -70,6 +70,24 @@ pub struct ProvidersConfig {
     pub enable_mock: bool,
     pub vertex: VertexConfig,
     pub anthropic: AnthropicConfig,
+    pub openai: OpenAiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiConfig {
+    /// Serve the OpenAI-compatible `/v1/chat/completions` endpoint (accepts the
+    /// Tollgate key via `Authorization: Bearer`), so OpenAI clients, LiteLLM, and
+    /// ADK agents can route through Tollgate with only a base URL + key change.
+    pub enabled: bool,
+    /// Upstream kind: `vertex` (front Vertex's own OpenAI-compatible endpoint for
+    /// Gemini, using the Vertex project/location and Workload Identity) or
+    /// `custom` (front any OpenAI-compatible base with a static API key).
+    pub upstream: String,
+    /// Custom upstream base URL, up to but excluding `/chat/completions` (used
+    /// when `upstream = custom`).
+    pub base_url: String,
+    /// Custom upstream bearer API key (used when `upstream = custom`).
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +203,12 @@ impl Default for Config {
                     api_key: String::new(),
                     base_url: "https://api.anthropic.com".to_string(),
                     version: "2023-06-01".to_string(),
+                },
+                openai: OpenAiConfig {
+                    enabled: false,
+                    upstream: "vertex".to_string(),
+                    base_url: String::new(),
+                    api_key: String::new(),
                 },
             },
             reload: ReloadConfig {

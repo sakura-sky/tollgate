@@ -62,15 +62,28 @@ fn value_has_media_ref(v: &Value) -> bool {
         Value::Object(map) => {
             for (k, val) in map {
                 let key = k.to_ascii_lowercase();
-                // External-reference keys across Anthropic and Gemini shapes.
+                // External-reference keys across Anthropic, Gemini, and OpenAI
+                // shapes (OpenAI vision/audio use image_url / input_audio).
                 if matches!(
                     key.as_str(),
-                    "fileuri" | "file_uri" | "file_id" | "filedata" | "file_data"
+                    "fileuri"
+                        | "file_uri"
+                        | "file_id"
+                        | "filedata"
+                        | "file_data"
+                        | "image_url"
+                        | "input_audio"
                 ) {
                     return true;
                 }
-                // A source/part typed as a URL reference.
-                if key == "type" && val.as_str().is_some_and(|s| s.eq_ignore_ascii_case("url")) {
+                // A source/part typed as a URL or OpenAI media reference.
+                if key == "type"
+                    && val.as_str().is_some_and(|s| {
+                        s.eq_ignore_ascii_case("url")
+                            || s.eq_ignore_ascii_case("image_url")
+                            || s.eq_ignore_ascii_case("input_audio")
+                    })
+                {
                     return true;
                 }
                 if value_has_media_ref(val) {
@@ -447,9 +460,255 @@ impl Provider for VertexProvider {
     }
 }
 
+/// Default worst-case output reservation when the request omits `max_tokens`.
+const OPENAI_DEFAULT_MAX_OUTPUT: u64 = 4096;
+
+/// The effective worst-case output for an OpenAI request: the first POSITIVE
+/// integer cap (`max_completion_tokens`, then `max_tokens`), else the default.
+/// A present-but-null/zero/non-integer cap is treated as "no cap" (default), so
+/// a client cannot send `null` to run the upstream unbounded past the reservation.
+/// `parse_request` reserves this value and `forward` normalizes the outbound body
+/// to a single `max_tokens` equal to it, keeping reserved == enforced.
+fn openai_effective_max(v: &Value) -> u64 {
+    v.get("max_completion_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| v.get("max_tokens").and_then(serde_json::Value::as_u64))
+        .filter(|&n| n > 0)
+        .unwrap_or(OPENAI_DEFAULT_MAX_OUTPUT)
+}
+
+fn parse_openai_usage(v: &Value) -> Usage {
+    let u = v.get("usage");
+    let get = |k: &str| {
+        u.and_then(|u| u.get(k))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    Usage::new(get("prompt_tokens"), get("completion_tokens"))
+}
+
+/// OpenAI-compatible upstream adapter. Fronts any Chat Completions endpoint that
+/// speaks the OpenAI protocol: Vertex's OpenAI endpoint for Gemini, or a custom
+/// OpenAI-compatible base. Auth is a bearer token (a GCP Workload Identity token
+/// for Vertex, or a static API key for a custom upstream).
+pub struct OpenAiProvider {
+    http: reqwest::Client,
+    /// Base URL up to but excluding `/chat/completions`.
+    base_url: String,
+    tokens: TokenSource,
+    /// Prefix applied to the model in the forwarded body (e.g. `google/` for
+    /// Vertex), unless the model already contains a `/`.
+    model_prefix: Option<String>,
+}
+
+impl OpenAiProvider {
+    /// Front Vertex's OpenAI-compatible endpoint for Gemini. `static_token` may be
+    /// empty to use the metadata server (Workload Identity).
+    #[must_use]
+    pub fn vertex(
+        http: reqwest::Client,
+        project: &str,
+        location: &str,
+        static_token: String,
+    ) -> Self {
+        let base_url = format!(
+            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
+        );
+        Self {
+            tokens: TokenSource::new(static_token),
+            http,
+            base_url,
+            model_prefix: Some("google/".to_owned()),
+        }
+    }
+
+    /// Front any custom OpenAI-compatible endpoint. `api_key` is sent as the
+    /// bearer token; `base_url` is everything up to `/chat/completions`.
+    #[must_use]
+    pub fn custom(http: reqwest::Client, base_url: String, api_key: String) -> Self {
+        Self {
+            tokens: TokenSource::new(api_key),
+            http,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            model_prefix: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
+    fn id(&self) -> &str {
+        "openai"
+    }
+
+    fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
+        if rest_path != "chat/completions" {
+            return Err(ProviderError::BadRequest(
+                "only chat/completions is supported".to_owned(),
+            ));
+        }
+        let v: Value =
+            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        // The buffered path needs a non-streaming response; streaming is metered
+        // from the terminal chunk on a separate path.
+        if v.get("stream").and_then(Value::as_bool) == Some(true) {
+            return Err(ProviderError::BadRequest(
+                "streaming is not yet supported on this endpoint (set stream=false)".to_owned(),
+            ));
+        }
+        // External media (OpenAI image_url / input_audio, or file refs) has token
+        // cost unbounded by body size, so the fast estimate would under-reserve.
+        // Reject until multimodal metering is added.
+        if references_external_media(body) {
+            return Err(ProviderError::BadRequest(
+                "external media (image_url / input_audio / file references) is not yet \
+                 supported on this endpoint; text only"
+                    .to_owned(),
+            ));
+        }
+        let model = v
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| ProviderError::BadRequest("missing model".to_owned()))?
+            .to_owned();
+        let max_output_tokens = openai_effective_max(&v);
+        Ok(ParsedRequest {
+            model,
+            estimated_input_tokens: estimate_input_tokens(body),
+            max_output_tokens,
+        })
+    }
+
+    async fn forward(
+        &self,
+        _rest_path: &str,
+        body: &str,
+        _parsed: &ParsedRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        // Rewrite only the model for the upstream (e.g. gemini-2.5-flash ->
+        // google/gemini-2.5-flash); leave the rest of the OpenAI body verbatim.
+        let mut payload: Value =
+            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        if let Some(prefix) = &self.model_prefix {
+            if let Some(m) = payload.get("model").and_then(Value::as_str) {
+                if !m.contains('/') {
+                    payload["model"] = Value::String(format!("{prefix}{m}"));
+                }
+            }
+        }
+        // Normalise the output cap to a single `max_tokens` equal to what we
+        // reserved, dropping any duplicate/null/zero cap, so the upstream can
+        // never run unbounded past the reservation and overshoot a hard cap.
+        let cap = openai_effective_max(&payload);
+        if let Value::Object(map) = &mut payload {
+            map.remove("max_completion_tokens");
+            map.insert("max_tokens".to_owned(), Value::from(cap));
+        }
+
+        let token = self.tokens.token(&self.http).await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let usage = parse_openai_usage(&json);
+        Ok(ProviderResponse {
+            status,
+            body: json,
+            usage,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn openai_test_provider() -> OpenAiProvider {
+        OpenAiProvider::custom(
+            reqwest::Client::new(),
+            "https://example.test/v1".to_owned(),
+            "k".to_owned(),
+        )
+    }
+
+    #[test]
+    fn openai_parse_reads_model_and_max_tokens() {
+        let p = openai_test_provider();
+        let parsed = p
+            .parse_request(
+                "chat/completions",
+                r#"{"model":"gemini-2.5-flash","max_tokens":256,"messages":[]}"#,
+            )
+            .unwrap();
+        assert_eq!(parsed.model, "gemini-2.5-flash");
+        assert_eq!(parsed.max_output_tokens, 256);
+        assert!(parsed.estimated_input_tokens >= 1);
+    }
+
+    #[test]
+    fn openai_rejects_streaming_bad_path_and_missing_model() {
+        let p = openai_test_provider();
+        assert!(
+            p.parse_request("chat/completions", r#"{"model":"m","stream":true}"#)
+                .is_err()
+        );
+        assert!(p.parse_request("responses", r#"{"model":"m"}"#).is_err());
+        assert!(p.parse_request("chat/completions", "{}").is_err());
+    }
+
+    #[test]
+    fn openai_rejects_external_media() {
+        let p = openai_test_provider();
+        let body = r#"{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}"#;
+        assert!(references_external_media(body));
+        assert!(p.parse_request("chat/completions", body).is_err());
+    }
+
+    #[test]
+    fn openai_effective_max_handles_null_zero_and_valid() {
+        use serde_json::json;
+        assert_eq!(openai_effective_max(&json!({})), OPENAI_DEFAULT_MAX_OUTPUT);
+        // Present-but-null / zero must fall back to the default (not "unbounded").
+        assert_eq!(
+            openai_effective_max(&json!({"max_tokens": null})),
+            OPENAI_DEFAULT_MAX_OUTPUT
+        );
+        assert_eq!(
+            openai_effective_max(&json!({"max_tokens": 0})),
+            OPENAI_DEFAULT_MAX_OUTPUT
+        );
+        assert_eq!(openai_effective_max(&json!({"max_tokens": 512})), 512);
+        // max_completion_tokens wins over max_tokens.
+        assert_eq!(
+            openai_effective_max(&json!({"max_completion_tokens": 256, "max_tokens": 999})),
+            256
+        );
+    }
+
+    #[test]
+    fn openai_usage_and_default_output() {
+        let u = parse_openai_usage(
+            &serde_json::json!({"usage":{"prompt_tokens":12,"completion_tokens":7}}),
+        );
+        assert_eq!(u.input_tokens, 12);
+        assert_eq!(u.output_tokens, 7);
+
+        let parsed = openai_test_provider()
+            .parse_request("chat/completions", r#"{"model":"m","messages":[]}"#)
+            .unwrap();
+        assert_eq!(parsed.max_output_tokens, OPENAI_DEFAULT_MAX_OUTPUT);
+    }
 
     #[test]
     fn media_guard_catches_evasions() {

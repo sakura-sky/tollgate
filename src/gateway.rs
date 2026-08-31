@@ -212,11 +212,32 @@ pub struct GatewayCore {
     pub admission_exact: bool,
 }
 
+/// Extract the presented Tollgate key from either the `x-tollgate-key` header or
+/// an `Authorization: Bearer <key>` header (what OpenAI-style clients, including
+/// ADK/LiteLLM, send by default).
+fn presented_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(KEY_HEADER).and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_owned());
+        }
+    }
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let bearer = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))?
+        .trim();
+    (!bearer.is_empty()).then(|| bearer.to_owned())
+}
+
 impl GatewayCore {
     /// Resolve the caller's key id from the request headers, or `None`.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Option<String> {
-        let presented = headers.get(KEY_HEADER)?.to_str().ok()?;
-        let (prefix, secret) = apikey::parse(presented).ok()?;
+        let presented = presented_key(headers)?;
+        let (prefix, secret) = apikey::parse(&presented).ok()?;
         match self.keys.lookup(&prefix).await {
             Some(k) if self.hasher.verify(&secret, &k.key_hash) => Some(k.id),
             Some(_) => None,
@@ -573,6 +594,31 @@ pub fn spent(budgets: &Budgets, scope: &Scope, period: Period) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presented_key_reads_both_header_forms() {
+        let mut h = HeaderMap::new();
+        h.insert(KEY_HEADER, "tgk_a_b".parse().unwrap());
+        assert_eq!(presented_key(&h).as_deref(), Some("tgk_a_b"));
+
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer tgk_c_d".parse().unwrap(),
+        );
+        assert_eq!(presented_key(&h2).as_deref(), Some("tgk_c_d"));
+
+        // x-tollgate-key wins when both are present.
+        let mut h3 = HeaderMap::new();
+        h3.insert(KEY_HEADER, "tgk_x_y".parse().unwrap());
+        h3.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer tgk_c_d".parse().unwrap(),
+        );
+        assert_eq!(presented_key(&h3).as_deref(), Some("tgk_x_y"));
+
+        assert!(presented_key(&HeaderMap::new()).is_none());
+    }
     use crate::apikey::KeyHasher;
     use crate::budget::{Budget, Period, Scope};
     use crate::pricing::ModelPrice;

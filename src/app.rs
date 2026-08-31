@@ -158,6 +158,46 @@ pub async fn serve(cfg: Config) -> Result<()> {
             )),
         );
     }
+    if cfg.providers.openai.enabled {
+        let oc = &cfg.providers.openai;
+        let provider: Arc<dyn Provider> = match oc.upstream.as_str() {
+            "vertex" => {
+                if cfg.providers.vertex.project.is_empty()
+                    || cfg.providers.vertex.location.is_empty()
+                {
+                    anyhow::bail!(
+                        "OpenAI endpoint with upstream=vertex requires \
+                         TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
+                    );
+                }
+                Arc::new(crate::providers::OpenAiProvider::vertex(
+                    http.clone(),
+                    &cfg.providers.vertex.project,
+                    &cfg.providers.vertex.location,
+                    cfg.providers.vertex.access_token.clone(),
+                ))
+            }
+            "custom" => {
+                // An empty key would make the adapter fall back to the GCP
+                // metadata token and send it to the custom host: refuse.
+                if oc.base_url.is_empty() || oc.api_key.is_empty() {
+                    anyhow::bail!(
+                        "OpenAI endpoint with upstream=custom requires \
+                         TOLLGATE_PROVIDERS__OPENAI__BASE_URL and __API_KEY"
+                    );
+                }
+                Arc::new(crate::providers::OpenAiProvider::custom(
+                    http.clone(),
+                    oc.base_url.clone(),
+                    oc.api_key.clone(),
+                ))
+            }
+            other => anyhow::bail!(
+                "TOLLGATE_PROVIDERS__OPENAI__UPSTREAM must be 'vertex' or 'custom' (got {other:?})"
+            ),
+        };
+        providers.insert("openai".to_owned(), provider);
+    }
     let admission = cfg.providers.admission.to_ascii_lowercase();
     if admission != "fast" && admission != "exact" {
         anyhow::bail!(
@@ -300,6 +340,7 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
         .route("/console", get(console))
         .route("/console/budgets", get(console_budgets))
         .route("/console/usage", get(console_usage))
+        .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/{provider}/{*rest}", post(gateway))
         .with_state(state)
         .layer(TimeoutLayer::with_status_code(
@@ -318,6 +359,84 @@ async fn gateway(
     let core = state.core.load_full();
     let outcome = core.evaluate(&provider, &rest, &headers, &body).await;
     outcome_response(outcome)
+}
+
+/// OpenAI-compatible Chat Completions endpoint. Routes to the `openai` provider
+/// (which fronts Vertex's OpenAI endpoint or a custom upstream) through the same
+/// reserve-then-settle enforcement, and returns the upstream's OpenAI body
+/// verbatim so OpenAI clients, LiteLLM, and ADK agents work unchanged.
+async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    let core = state.core.load_full();
+    let outcome = core
+        .evaluate("openai", "chat/completions", &headers, &body)
+        .await;
+    openai_outcome_response(outcome)
+}
+
+fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Response {
+    (
+        status,
+        [("x-tollgate-reason", reason)],
+        Json(json!({"error": {"message": message, "type": reason}})),
+    )
+        .into_response()
+}
+
+/// Map a gateway [`Outcome`] to an OpenAI-shaped HTTP response. On success the
+/// upstream body is returned verbatim; refusals use OpenAI's `{"error": {...}}`
+/// envelope with an `x-tollgate-reason` header.
+fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Response {
+    use crate::gateway::Outcome;
+    match outcome {
+        Outcome::Allowed {
+            status,
+            body,
+            cost_micros,
+            overhead_micros,
+            ..
+        } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            [
+                ("x-tollgate-cost", format_micros(cost_micros)),
+                ("x-tollgate-overhead-us", overhead_micros.to_string()),
+            ],
+            Json(body),
+        )
+            .into_response(),
+        Outcome::Unauthenticated => openai_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "invalid or missing API key",
+        ),
+        Outcome::BadRequest(m) => openai_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            &format!("invalid request: {m}"),
+        ),
+        Outcome::Unpriced { provider, model } => openai_error(
+            StatusCode::BAD_REQUEST,
+            "unpriced",
+            &format!("no price configured for {provider}/{model}"),
+        ),
+        Outcome::BudgetDenied(d) => openai_error(
+            StatusCode::PAYMENT_REQUIRED,
+            "budget_exceeded",
+            &format!("budget exceeded: {d}"),
+        ),
+        Outcome::BackendError(_) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_error",
+            "gateway temporarily unavailable",
+        ),
+        Outcome::Upstream(m) => {
+            tracing::warn!(detail = %m, "openai upstream error");
+            openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream provider error",
+            )
+        }
+    }
 }
 
 /// Serve the read-only web console. Production injects no key (unlike the demo);
