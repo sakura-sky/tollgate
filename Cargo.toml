@@ -55,7 +55,7 @@ tokio-stream = "0.1"
 # API-key hashing: HMAC-SHA256 (fast, correct for high-entropy keys) + constant-
 # time compare. rand for key generation, hex for encoding.
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 rand = "0.8"
 hex = "0.4"
