@@ -26,6 +26,10 @@ Cargo.lock.bak
 coverage/
 *.profraw
 
+# Local working notes and scratch files. Never part of the distribution.
+/_local/
+*.local.md
+
 # OS
 .DS_Store
 Thumbs.db
