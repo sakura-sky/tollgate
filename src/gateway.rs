@@ -480,6 +480,106 @@ impl GatewayCore {
     }
 }
 
+/// Guarantees a streaming request's budget reservation is settled EXACTLY ONCE.
+/// The relay task calls [`StreamSettlement::settle`] at its single exit point; if
+/// the guard is instead dropped without settling (task panic, cancellation, or
+/// runtime shutdown), `Drop` spawns a best-effort commit of the FULL reserved
+/// amount plus an error ledger row, so a reservation is never left dangling and a
+/// stream is never under-charged.
+pub struct StreamSettlement {
+    budgets: Arc<dyn BudgetBackend>,
+    usage: Arc<dyn UsageSink>,
+    reservation: Option<Reservation>,
+    reserved_micros: i64,
+    key_id: String,
+    provider: String,
+    model: String,
+    overhead_micros: i64,
+}
+
+impl StreamSettlement {
+    #[must_use]
+    pub fn new(
+        core: &GatewayCore,
+        reservation: Reservation,
+        reserved_micros: i64,
+        key_id: String,
+        provider: String,
+        model: String,
+        overhead_micros: i64,
+    ) -> Self {
+        Self {
+            budgets: core.budgets.clone(),
+            usage: core.usage.clone(),
+            reservation: Some(reservation),
+            reserved_micros,
+            key_id,
+            provider,
+            model,
+            overhead_micros,
+        }
+    }
+
+    /// Settle to `actual_micros`, record the usage row, and disarm the guard.
+    /// Idempotent: a second call (or the Drop guard) is a no-op.
+    pub async fn settle(mut self, actual_micros: i64, usage: Usage, decision: &str) {
+        if let Some(r) = self.reservation.take() {
+            self.budgets.commit(&r, actual_micros).await;
+            self.usage
+                .record(UsageEvent {
+                    key_id: &self.key_id,
+                    provider: &self.provider,
+                    model: &self.model,
+                    usage,
+                    cost_micros: actual_micros,
+                    decision,
+                    overhead_micros: self.overhead_micros,
+                })
+                .await;
+        }
+    }
+}
+
+impl Drop for StreamSettlement {
+    fn drop(&mut self) {
+        // Only fires if `settle` was never called (panic/cancel/shutdown). Charge
+        // the FULL reservation (never under-charge) and record an error row.
+        if let Some(r) = self.reservation.take() {
+            // Only spawn if a runtime is present. `tokio::spawn` panics without one,
+            // and a panic in a destructor risks a process abort; during runtime
+            // shutdown the reservation simply stays held in the budget backend
+            // (fail-closed) until its period counter expires.
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                tracing::warn!(
+                    "StreamSettlement dropped without a runtime; reservation left held (fail-closed)"
+                );
+                return;
+            };
+            let budgets = self.budgets.clone();
+            let usage = self.usage.clone();
+            let reserved = self.reserved_micros;
+            let overhead = self.overhead_micros;
+            let key_id = self.key_id.clone();
+            let provider = self.provider.clone();
+            let model = self.model.clone();
+            handle.spawn(async move {
+                budgets.commit(&r, reserved).await;
+                usage
+                    .record(UsageEvent {
+                        key_id: &key_id,
+                        provider: &provider,
+                        model: &model,
+                        usage: Usage::default(),
+                        cost_micros: reserved,
+                        decision: "error",
+                        overhead_micros: overhead,
+                    })
+                    .await;
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // In-memory backends (demo + tests). Production backends live alongside these.
 // ---------------------------------------------------------------------------

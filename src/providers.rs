@@ -492,7 +492,10 @@ fn parse_openai_usage(v: &Value) -> Usage {
 /// OpenAI-compatible base. Auth is a bearer token (a GCP Workload Identity token
 /// for Vertex, or a static API key for a custom upstream).
 pub struct OpenAiProvider {
+    /// Buffered (non-streaming) client; carries the total request timeout.
     http: reqwest::Client,
+    /// Streaming client; NO total timeout (long streams), only connect + idle.
+    stream_http: reqwest::Client,
     /// Base URL up to but excluding `/chat/completions`.
     base_url: String,
     tokens: TokenSource,
@@ -503,10 +506,13 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// Front Vertex's OpenAI-compatible endpoint for Gemini. `static_token` may be
-    /// empty to use the metadata server (Workload Identity).
+    /// empty to use the metadata server (Workload Identity). `stream_http` must
+    /// have no total request timeout (only connect + idle) so long streams are
+    /// not severed mid-body.
     #[must_use]
     pub fn vertex(
         http: reqwest::Client,
+        stream_http: reqwest::Client,
         project: &str,
         location: &str,
         static_token: String,
@@ -517,6 +523,7 @@ impl OpenAiProvider {
         Self {
             tokens: TokenSource::new(static_token),
             http,
+            stream_http,
             base_url,
             model_prefix: Some("google/".to_owned()),
         }
@@ -525,13 +532,183 @@ impl OpenAiProvider {
     /// Front any custom OpenAI-compatible endpoint. `api_key` is sent as the
     /// bearer token; `base_url` is everything up to `/chat/completions`.
     #[must_use]
-    pub fn custom(http: reqwest::Client, base_url: String, api_key: String) -> Self {
+    pub fn custom(
+        http: reqwest::Client,
+        stream_http: reqwest::Client,
+        base_url: String,
+        api_key: String,
+    ) -> Self {
         Self {
             tokens: TokenSource::new(api_key),
             http,
+            stream_http,
             base_url: base_url.trim_end_matches('/').to_owned(),
             model_prefix: None,
         }
+    }
+
+    /// Build the outbound payload: rewrite the model for the upstream, normalise
+    /// the output cap to a single `max_tokens` equal to the reserved worst case,
+    /// and set the streaming flag EXPLICITLY. The client's `stream` /
+    /// `stream_options` are never trusted (a truthy-but-nonboolean value must not
+    /// flip the mode, and a client cannot suppress usage reporting).
+    fn build_payload(&self, body: &str, streaming: bool) -> Result<Value, ProviderError> {
+        let mut payload: Value =
+            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        if let Some(prefix) = &self.model_prefix {
+            if let Some(m) = payload.get("model").and_then(Value::as_str) {
+                if !m.contains('/') {
+                    payload["model"] = Value::String(format!("{prefix}{m}"));
+                }
+            }
+        }
+        let cap = openai_effective_max(&payload);
+        // Choose which output-cap field to send, always pinned to the reserved cap
+        // (so reserved == enforced). On Vertex (model_prefix set) always use
+        // `max_tokens`: the Vertex OpenAI shim honors it, and it may silently ignore
+        // `max_completion_tokens`, which would let generation run past our cap. On a
+        // custom upstream, preserve the client's field so we don't break the o-series
+        // reasoning models on OpenAI's own API, which reject `max_tokens` and require
+        // `max_completion_tokens`.
+        let cap_field = if self.model_prefix.is_some() {
+            "max_tokens"
+        } else if payload.get("max_completion_tokens").is_some() {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        if let Value::Object(map) = &mut payload {
+            map.remove("max_completion_tokens");
+            map.remove("max_tokens");
+            map.insert(cap_field.to_owned(), Value::from(cap));
+            map.insert("stream".to_owned(), Value::Bool(streaming));
+            if streaming {
+                map.insert(
+                    "stream_options".to_owned(),
+                    serde_json::json!({ "include_usage": true }),
+                );
+            } else {
+                map.remove("stream_options");
+            }
+        }
+        Ok(payload)
+    }
+
+    fn parse_common(
+        &self,
+        rest_path: &str,
+        body: &str,
+        allow_stream: bool,
+    ) -> Result<ParsedRequest, ProviderError> {
+        if rest_path != "chat/completions" {
+            return Err(ProviderError::BadRequest(
+                "only chat/completions is supported".to_owned(),
+            ));
+        }
+        let v: Value =
+            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        if !allow_stream && stream_requested(&v) {
+            return Err(ProviderError::BadRequest(
+                "streaming is handled on a separate path".to_owned(),
+            ));
+        }
+        // External media has token cost unbounded by body size; the fast estimate
+        // would under-reserve, so reject until multimodal metering exists.
+        if references_external_media(body) {
+            return Err(ProviderError::BadRequest(
+                "external media (image_url / input_audio / file references) is not yet \
+                 supported on this endpoint; text only"
+                    .to_owned(),
+            ));
+        }
+        // `n` asks the upstream for N independent completions, each up to the
+        // output cap, so total completion tokens scale with N while we only reserve
+        // one cap's worth. Reject anything but a single response (n absent, 0, or 1)
+        // so a request can never overshoot its reservation. A non-integer or >1
+        // value is refused (fail closed).
+        if let Some(n) = v.get("n") {
+            if n.as_u64().is_none_or(|n| n > 1) {
+                return Err(ProviderError::BadRequest(
+                    "n > 1 is not supported (each choice multiplies output cost beyond the \
+                     reserved cap)"
+                        .to_owned(),
+                ));
+            }
+        }
+        let model = v
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| ProviderError::BadRequest("missing model".to_owned()))?
+            .to_owned();
+        Ok(ParsedRequest {
+            model,
+            estimated_input_tokens: estimate_input_tokens(body),
+            max_output_tokens: openai_effective_max(&v),
+        })
+    }
+
+    /// Parse a streaming request (allows `stream`); same model/media/cap rules.
+    ///
+    /// # Errors
+    /// [`ProviderError::BadRequest`] on a malformed body, missing model, or media.
+    pub fn parse_streaming(
+        &self,
+        rest_path: &str,
+        body: &str,
+    ) -> Result<ParsedRequest, ProviderError> {
+        self.parse_common(rest_path, body, true)
+    }
+
+    /// Open a streaming upstream request; the caller reads `bytes_stream()` and
+    /// meters usage from the relayed chunks. Uses the no-total-timeout client.
+    ///
+    /// # Errors
+    /// [`ProviderError::Upstream`] if the upstream call fails.
+    pub async fn forward_stream(&self, body: &str) -> Result<reqwest::Response, ProviderError> {
+        let payload = self.build_payload(body, true)?;
+        let token = self.tokens.token(&self.stream_http).await?;
+        let url = format!("{}/chat/completions", self.base_url);
+        self.stream_http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))
+    }
+}
+
+/// Whether the client asked for streaming, tolerant of non-boolean truthy values
+/// (`true`, non-zero number, `"true"`/`"1"`/`"yes"`) so a lax value can neither
+/// slip past the buffered mode check nor be forwarded verbatim.
+#[must_use]
+pub fn stream_requested(v: &Value) -> bool {
+    match v.get("stream") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => {
+            n.as_i64().is_some_and(|i| i != 0) || n.as_f64().is_some_and(|f| f != 0.0)
+        }
+        Some(Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+        }
+        _ => false,
+    }
+}
+
+/// Parse token usage from a single SSE `data:` line, or `None` when the line has
+/// no non-null `usage` object. `[DONE]`, blank, and keep-alive/comment lines
+/// yield `None`; a per-delta `"usage": null` is correctly treated as "not seen".
+#[must_use]
+pub fn usage_from_sse_data(line: &str) -> Option<Usage> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    match v.get("usage") {
+        Some(u) if !u.is_null() => Some(parse_openai_usage(&v)),
+        _ => None,
     }
 }
 
@@ -542,42 +719,7 @@ impl Provider for OpenAiProvider {
     }
 
     fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
-        if rest_path != "chat/completions" {
-            return Err(ProviderError::BadRequest(
-                "only chat/completions is supported".to_owned(),
-            ));
-        }
-        let v: Value =
-            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
-        // The buffered path needs a non-streaming response; streaming is metered
-        // from the terminal chunk on a separate path.
-        if v.get("stream").and_then(Value::as_bool) == Some(true) {
-            return Err(ProviderError::BadRequest(
-                "streaming is not yet supported on this endpoint (set stream=false)".to_owned(),
-            ));
-        }
-        // External media (OpenAI image_url / input_audio, or file refs) has token
-        // cost unbounded by body size, so the fast estimate would under-reserve.
-        // Reject until multimodal metering is added.
-        if references_external_media(body) {
-            return Err(ProviderError::BadRequest(
-                "external media (image_url / input_audio / file references) is not yet \
-                 supported on this endpoint; text only"
-                    .to_owned(),
-            ));
-        }
-        let model = v
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|m| !m.is_empty())
-            .ok_or_else(|| ProviderError::BadRequest("missing model".to_owned()))?
-            .to_owned();
-        let max_output_tokens = openai_effective_max(&v);
-        Ok(ParsedRequest {
-            model,
-            estimated_input_tokens: estimate_input_tokens(body),
-            max_output_tokens,
-        })
+        self.parse_common(rest_path, body, false)
     }
 
     async fn forward(
@@ -586,26 +728,7 @@ impl Provider for OpenAiProvider {
         body: &str,
         _parsed: &ParsedRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        // Rewrite only the model for the upstream (e.g. gemini-2.5-flash ->
-        // google/gemini-2.5-flash); leave the rest of the OpenAI body verbatim.
-        let mut payload: Value =
-            serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
-        if let Some(prefix) = &self.model_prefix {
-            if let Some(m) = payload.get("model").and_then(Value::as_str) {
-                if !m.contains('/') {
-                    payload["model"] = Value::String(format!("{prefix}{m}"));
-                }
-            }
-        }
-        // Normalise the output cap to a single `max_tokens` equal to what we
-        // reserved, dropping any duplicate/null/zero cap, so the upstream can
-        // never run unbounded past the reservation and overshoot a hard cap.
-        let cap = openai_effective_max(&payload);
-        if let Value::Object(map) = &mut payload {
-            map.remove("max_completion_tokens");
-            map.insert("max_tokens".to_owned(), Value::from(cap));
-        }
-
+        let payload = self.build_payload(body, false)?;
         let token = self.tokens.token(&self.http).await?;
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
@@ -637,9 +760,127 @@ mod tests {
     fn openai_test_provider() -> OpenAiProvider {
         OpenAiProvider::custom(
             reqwest::Client::new(),
+            reqwest::Client::new(),
             "https://example.test/v1".to_owned(),
             "k".to_owned(),
         )
+    }
+
+    #[test]
+    fn stream_requested_is_truthy_tolerant() {
+        use serde_json::json;
+        assert!(stream_requested(&json!({"stream": true})));
+        assert!(stream_requested(&json!({"stream": 1})));
+        assert!(stream_requested(&json!({"stream": "true"})));
+        assert!(!stream_requested(&json!({"stream": false})));
+        assert!(!stream_requested(&json!({"stream": 0})));
+        assert!(!stream_requested(&json!({})));
+    }
+
+    #[test]
+    fn openai_rejects_multi_choice_n() {
+        let p = openai_test_provider();
+        // n > 1 multiplies output cost beyond the reserved cap: refuse (both paths).
+        let body = r#"{"model":"m","n":4,"messages":[]}"#;
+        assert!(p.parse_request("chat/completions", body).is_err());
+        assert!(p.parse_streaming("chat/completions", body).is_err());
+        // Non-integer / string n is also refused (fail closed).
+        assert!(
+            p.parse_request("chat/completions", r#"{"model":"m","n":"2"}"#)
+                .is_err()
+        );
+        assert!(
+            p.parse_request("chat/completions", r#"{"model":"m","n":1.5}"#)
+                .is_err()
+        );
+        // n absent, 0, or 1 is fine (single response).
+        assert!(
+            p.parse_request("chat/completions", r#"{"model":"m","n":1,"messages":[]}"#)
+                .is_ok()
+        );
+        assert!(
+            p.parse_request("chat/completions", r#"{"model":"m","messages":[]}"#)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn build_payload_preserves_cap_field_and_pins_value() {
+        let p = openai_test_provider();
+        // A client using max_completion_tokens (o-series style) keeps that field,
+        // pinned to the effective cap; max_tokens is not introduced.
+        let out = p
+            .build_payload(r#"{"model":"m","max_completion_tokens":128}"#, false)
+            .unwrap();
+        assert_eq!(
+            out.get("max_completion_tokens").and_then(Value::as_u64),
+            Some(128)
+        );
+        assert!(out.get("max_tokens").is_none());
+        // A client using max_tokens keeps max_tokens (Vertex shim style).
+        let out = p
+            .build_payload(r#"{"model":"m","max_tokens":256}"#, true)
+            .unwrap();
+        assert_eq!(out.get("max_tokens").and_then(Value::as_u64), Some(256));
+        assert!(out.get("max_completion_tokens").is_none());
+        // Streaming forces stream=true + include_usage regardless of client input.
+        assert_eq!(out.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            out.pointer("/stream_options/include_usage")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_payload_vertex_always_uses_max_tokens() {
+        let p = OpenAiProvider::vertex(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            "proj",
+            "us-central1",
+            "tok".to_owned(),
+        );
+        // On Vertex the cap goes to max_tokens even if the client sent
+        // max_completion_tokens (the shim may ignore the latter and run uncapped).
+        let out = p
+            .build_payload(
+                r#"{"model":"gemini-2.5-flash","max_completion_tokens":100}"#,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out.get("max_tokens").and_then(Value::as_u64), Some(100));
+        assert!(out.get("max_completion_tokens").is_none());
+        // Model rewritten with the google/ prefix.
+        assert_eq!(
+            out.get("model").and_then(Value::as_str),
+            Some("google/gemini-2.5-flash")
+        );
+    }
+
+    #[test]
+    fn parse_streaming_allows_stream_flag() {
+        let p = openai_test_provider();
+        // Buffered parse rejects a streaming request; streaming parse accepts it.
+        let body = r#"{"model":"m","stream":true,"messages":[]}"#;
+        assert!(p.parse_request("chat/completions", body).is_err());
+        assert!(p.parse_streaming("chat/completions", body).is_ok());
+    }
+
+    #[test]
+    fn usage_from_sse_data_parses_only_real_usage() {
+        // Terminal chunk with usage.
+        let u = usage_from_sse_data(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(u.input_tokens, 9);
+        assert_eq!(u.output_tokens, 3);
+        // Per-delta null usage is not "seen".
+        assert!(usage_from_sse_data(r#"data: {"choices":[{"delta":{}}],"usage":null}"#).is_none());
+        assert!(usage_from_sse_data("data: [DONE]").is_none());
+        assert!(usage_from_sse_data(": keep-alive").is_none());
+        assert!(usage_from_sse_data("event: message").is_none());
     }
 
     #[test]

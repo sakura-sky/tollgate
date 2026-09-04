@@ -9,20 +9,25 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::Utc;
+use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
@@ -30,12 +35,23 @@ use crate::apikey::KeyHasher;
 use crate::backends::{
     PgKeyStore, PgUsageSink, RedisBudgetBackend, budget_spent, load_budgets, load_prices,
 };
-use crate::budget::{Budget, Scope};
+use crate::budget::{Budget, RequestCtx, Scope};
 use crate::config::Config;
-use crate::gateway::{GatewayCore, KeyStore, UsageSink, outcome_response};
-use crate::pricing::{PriceBook, format_micros};
-use crate::provider::{MockProvider, Provider};
+use crate::gateway::{
+    GatewayCore, KeyStore, ReserveError, StreamSettlement, UsageSink, outcome_response,
+};
+use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
+use crate::provider::{MockProvider, Provider, ProviderError};
+use crate::providers::{OpenAiProvider, stream_requested, usage_from_sse_data};
 use crate::routes::health;
+
+/// Cap the SSE line-reassembly buffer so an upstream that never emits a newline
+/// cannot grow it without bound.
+const MAX_SSE_LINE_BUFFER: usize = 1024 * 1024;
+/// Idle timeout: abort a stream if no upstream chunk arrives within this window.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard cap on total stream duration.
+const STREAM_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -47,6 +63,10 @@ pub struct AppState {
     /// Current budget config, swapped in lockstep with the core, for the
     /// read-only console endpoints.
     pub budgets: Arc<ArcSwap<Vec<Budget>>>,
+    /// Typed handle to the OpenAI upstream adapter for the streaming path (the
+    /// buffered path uses it via the provider map). None when disabled. Upstream
+    /// config is static, so this is built once and not hot-reloaded.
+    pub openai: Option<Arc<OpenAiProvider>>,
 }
 
 /// The immutable parts of a [`GatewayCore`], reused every time the core is rebuilt
@@ -132,6 +152,16 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .build()
         .context("building HTTP client")?;
 
+    // Streaming client for the OpenAI SSE relay: NO total request timeout (a total
+    // deadline would sever long streams mid-body), only a connect timeout.
+    // Redirects stay disabled (credential protection). Per-read idle timeout and a
+    // max stream duration are enforced by the relay task.
+    let stream_http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building streaming HTTP client")?;
+
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     if cfg.providers.enable_mock {
         providers.insert("mock".to_owned(), Arc::new(MockProvider));
@@ -158,9 +188,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
             )),
         );
     }
+    let mut openai_handle: Option<Arc<crate::providers::OpenAiProvider>> = None;
     if cfg.providers.openai.enabled {
         let oc = &cfg.providers.openai;
-        let provider: Arc<dyn Provider> = match oc.upstream.as_str() {
+        let p = match oc.upstream.as_str() {
             "vertex" => {
                 if cfg.providers.vertex.project.is_empty()
                     || cfg.providers.vertex.location.is_empty()
@@ -170,12 +201,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
                          TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
                     );
                 }
-                Arc::new(crate::providers::OpenAiProvider::vertex(
+                crate::providers::OpenAiProvider::vertex(
                     http.clone(),
+                    stream_http.clone(),
                     &cfg.providers.vertex.project,
                     &cfg.providers.vertex.location,
                     cfg.providers.vertex.access_token.clone(),
-                ))
+                )
             }
             "custom" => {
                 // An empty key would make the adapter fall back to the GCP
@@ -186,17 +218,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
                          TOLLGATE_PROVIDERS__OPENAI__BASE_URL and __API_KEY"
                     );
                 }
-                Arc::new(crate::providers::OpenAiProvider::custom(
+                crate::providers::OpenAiProvider::custom(
                     http.clone(),
+                    stream_http.clone(),
                     oc.base_url.clone(),
                     oc.api_key.clone(),
-                ))
+                )
             }
             other => anyhow::bail!(
                 "TOLLGATE_PROVIDERS__OPENAI__UPSTREAM must be 'vertex' or 'custom' (got {other:?})"
             ),
         };
-        providers.insert("openai".to_owned(), provider);
+        let arc = Arc::new(p);
+        providers.insert("openai".to_owned(), arc.clone() as Arc<dyn Provider>);
+        openai_handle = Some(arc);
     }
     let admission = cfg.providers.admission.to_ascii_lowercase();
     if admission != "fast" && admission != "exact" {
@@ -245,6 +280,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         redis,
         core,
         budgets: budgets_view,
+        openai: openai_handle,
     };
     let app = router(state, cfg.http.request_timeout);
 
@@ -365,12 +401,296 @@ async fn gateway(
 /// (which fronts Vertex's OpenAI endpoint or a custom upstream) through the same
 /// reserve-then-settle enforcement, and returns the upstream's OpenAI body
 /// verbatim so OpenAI clients, LiteLLM, and ADK agents work unchanged.
+///
+/// Streaming (`stream: true`) is dispatched to [`openai_chat_stream`], which
+/// relays the upstream SSE and meters usage from the terminal chunk. Buffered
+/// requests run the shared [`GatewayCore::evaluate`] flow unchanged.
 async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    // Peek whether the client asked for streaming. A body that does not parse is
+    // treated as non-streaming so the buffered path returns a proper OpenAI error
+    // envelope (rather than opening an event-stream for a malformed request).
+    let wants_stream = serde_json::from_str::<Value>(&body)
+        .map(|v| stream_requested(&v))
+        .unwrap_or(false);
+    if wants_stream {
+        return openai_chat_stream(state, headers, body).await;
+    }
     let core = state.core.load_full();
     let outcome = core
         .evaluate("openai", "chat/completions", &headers, &body)
         .await;
     openai_outcome_response(outcome)
+}
+
+/// Streaming path for `/v1/chat/completions`. Authenticates, prices, and reserves
+/// the worst case up front (fast admission), opens the upstream SSE stream, then
+/// spawns [`relay_stream`] to pass chunks through to the client while metering
+/// usage from the terminal chunk. Settlement is owned by a [`StreamSettlement`]
+/// guard that charges the observed cost on a clean finish and the FULL reservation
+/// on any abnormal end (client/upstream disconnect, idle/duration timeout, panic),
+/// so a stream is never under-charged.
+async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
+    let started = Instant::now();
+    let core = state.core.load_full();
+    let Some(provider) = state.openai.clone() else {
+        // The endpoint is registered even when the openai upstream is disabled;
+        // without a handle there is nothing to stream to.
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_error",
+            "openai upstream is not configured",
+        );
+    };
+
+    // Exact admission reserves against a real pre-flight token count, but the
+    // OpenAI adapter has no exact counter (it would silently fall back to the fast
+    // estimate, under-reserving on token-dense input). Rather than downgrade
+    // silently, refuse streaming under exact admission (fail closed). The buffered
+    // path stays available; fast admission is the supported streaming mode.
+    if core.admission_exact {
+        return openai_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported",
+            "streaming is not supported under exact admission; use fast admission or the \
+             non-streaming endpoint",
+        );
+    }
+
+    let Some(key_id) = core.authenticate(&headers).await else {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "invalid or missing API key",
+        );
+    };
+
+    let parsed = match provider.parse_streaming("chat/completions", &body) {
+        Ok(p) => p,
+        Err(ProviderError::BadRequest(m)) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &format!("invalid request: {m}"),
+            );
+        }
+        Err(ProviderError::Upstream(_)) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream provider error",
+            );
+        }
+    };
+
+    let Some(price) = core.prices.lookup("openai", &parsed.model).cloned() else {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "unpriced",
+            &format!("no price configured for openai/{}", parsed.model),
+        );
+    };
+
+    // Reserve the worst case (estimated input + capped output), floored to 1 micro
+    // so nothing meters as zero. build_payload pins the outbound max_tokens to the
+    // same cap, so the upstream cannot generate past what we reserved.
+    let reserve_micros = price
+        .cost_micros(Usage::new(
+            parsed.estimated_input_tokens,
+            parsed.max_output_tokens,
+        ))
+        .max(1);
+    let reservation = {
+        let ctx = RequestCtx {
+            key_id: &key_id,
+            provider: "openai",
+            model: &parsed.model,
+        };
+        match core.budgets.reserve(&ctx, reserve_micros).await {
+            Ok(r) => r,
+            Err(ReserveError::Denied(d)) => {
+                return openai_error(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "budget_exceeded",
+                    &format!("budget exceeded: {d}"),
+                );
+            }
+            Err(ReserveError::Backend(m)) => {
+                tracing::error!(error = %m, "budget backend error on stream reserve");
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "backend_error",
+                    "gateway temporarily unavailable",
+                );
+            }
+        }
+    };
+
+    // Overhead = admission path only (everything before the upstream call), matching
+    // the buffered path's definition. Build the settlement guard now: from here on,
+    // every exit settles the reservation exactly once (Drop covers panic/cancel).
+    let overhead_micros = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let guard = StreamSettlement::new(
+        &core,
+        reservation,
+        reserve_micros,
+        key_id,
+        "openai".to_owned(),
+        parsed.model,
+        overhead_micros,
+    );
+
+    // Open the upstream stream. A connection failure means the provider never
+    // billed, so settle to zero (parity with the buffered forward-error path).
+    let upstream = match provider.forward_stream(&body).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(detail = %e.to_string(), "openai stream upstream error");
+            guard.settle(0, Usage::default(), "error").await;
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream provider error",
+            );
+        }
+    };
+
+    // A non-2xx upstream is an error page, not an SSE stream: do not relay it.
+    // Charge zero (not billed) and pass the status through with a generic body so
+    // no upstream detail (GCP project/region/host) leaks to the client.
+    // reqwest and axum both re-export `http::StatusCode`, so the upstream status
+    // passes straight through (generic body only: no upstream detail leaks).
+    let up_status = upstream.status();
+    if !up_status.is_success() {
+        guard.settle(0, Usage::default(), "error").await;
+        return openai_error(up_status, "upstream_error", "upstream provider error");
+    }
+
+    // Relay: bounded channel gives natural backpressure (a slow client throttles
+    // upstream reads). The spawned task owns the guard and settles at its single
+    // exit point.
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    tokio::spawn(relay_stream(upstream, tx, guard, price, reserve_micros));
+
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+/// Relay upstream SSE chunks to the client while metering usage. Runs to a single
+/// exit point that settles the [`StreamSettlement`] guard: observed cost on a
+/// clean finish with a terminal usage chunk, otherwise the FULL reservation (never
+/// under-charge). Enforces an idle timeout, a max total duration, and a bounded
+/// line-reassembly buffer so a hostile or hung upstream cannot grief the gateway.
+async fn relay_stream(
+    upstream: reqwest::Response,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    guard: StreamSettlement,
+    price: ModelPrice,
+    reserve_micros: i64,
+) {
+    let mut stream = upstream.bytes_stream();
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut seen_usage: Option<Usage> = None;
+    let mut clean = false;
+    let deadline = tokio::time::Instant::now() + STREAM_MAX_DURATION;
+
+    loop {
+        let wait_until = (tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT).min(deadline);
+        match tokio::time::timeout_at(wait_until, stream.next()).await {
+            // Idle timeout or max-duration hit: abnormal end.
+            Err(_) => {
+                tracing::warn!("openai stream aborted: idle timeout or max duration exceeded");
+                break;
+            }
+            // Upstream finished normally.
+            Ok(None) => {
+                clean = true;
+                break;
+            }
+            // Upstream stream error: abnormal end.
+            Ok(Some(Err(e))) => {
+                tracing::warn!(detail = %e.to_string(), "openai stream upstream error mid-body");
+                break;
+            }
+            Ok(Some(Ok(chunk))) => {
+                // Scan for the terminal usage chunk (borrow before moving the bytes).
+                if let Some(u) = scan_sse_for_usage(&mut line_buf, &chunk) {
+                    seen_usage = Some(u);
+                }
+                // Relay downstream, bounded by the SAME idle/duration deadline as
+                // the upstream read: a client that stops reading fills the bounded
+                // channel and would otherwise park this task (and hold the
+                // reservation and upstream connection) indefinitely. On send error
+                // (client gone) or timeout, end abnormally and charge the full
+                // reservation.
+                match tokio::time::timeout_at(wait_until, tx.send(Ok(chunk))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        tracing::debug!("openai stream client disconnected");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "openai stream aborted: client too slow to drain (idle/max duration)"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if clean && seen_usage.is_none() {
+        tracing::warn!("openai stream ended cleanly without a usage chunk; charging reservation");
+    }
+    let (actual, usage, decision) = stream_settlement(clean, seen_usage, &price, reserve_micros);
+    guard.settle(actual, usage, decision).await;
+}
+
+/// Append a chunk to the SSE line-reassembly buffer and return the usage from the
+/// most recent complete `data:` line that carried one (usage can arrive split
+/// across chunk boundaries). Complete lines are drained; a partial line longer
+/// than [`MAX_SSE_LINE_BUFFER`] is dropped so a newline-starved upstream cannot
+/// grow the buffer without bound (worst case: the usage chunk is missed and the
+/// caller settles the full reservation).
+fn scan_sse_for_usage(line_buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Usage> {
+    line_buf.extend_from_slice(chunk);
+    let mut found = None;
+    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = line_buf.drain(..=pos).collect();
+        if let Ok(s) = std::str::from_utf8(&line) {
+            if let Some(u) = usage_from_sse_data(s.trim_end()) {
+                found = Some(u);
+            }
+        }
+    }
+    if line_buf.len() > MAX_SSE_LINE_BUFFER {
+        line_buf.clear();
+    }
+    found
+}
+
+/// Decide how to settle a finished stream. A clean finish with a metered terminal
+/// chunk charges the observed cost (floored to 1 micro). A clean finish with no
+/// usage chunk, or ANY abnormal end (disconnect, upstream error, idle/duration
+/// timeout), charges the FULL reservation so a stream is never under-charged.
+fn stream_settlement(
+    clean: bool,
+    seen: Option<Usage>,
+    price: &ModelPrice,
+    reserve_micros: i64,
+) -> (i64, Usage, &'static str) {
+    match (clean, seen) {
+        (true, Some(usage)) => (price.cost_micros(usage).max(1), usage, "allowed"),
+        (true, None) => (reserve_micros, Usage::default(), "allowed"),
+        (false, usage) => (reserve_micros, usage.unwrap_or_default(), "error"),
+    }
 }
 
 fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Response {
@@ -609,4 +929,64 @@ async fn shutdown_signal(grace: Duration) {
 
     // Allow in-flight requests a window to drain.
     tokio::time::sleep(grace).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_sse_detects_usage_split_across_chunk_boundaries() {
+        let mut buf = Vec::new();
+        // The terminal usage line arrives split across two upstream chunks with no
+        // newline in the first: no usage yet, buffer holds the partial.
+        assert!(
+            scan_sse_for_usage(
+                &mut buf,
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens"
+            )
+            .is_none()
+        );
+        let u = scan_sse_for_usage(&mut buf, b"\":5,\"completion_tokens\":2}}\n").unwrap();
+        assert_eq!(u.input_tokens, 5);
+        assert_eq!(u.output_tokens, 2);
+        assert!(buf.is_empty(), "completed line should be drained");
+    }
+
+    #[test]
+    fn scan_sse_ignores_deltas_done_and_bounds_the_buffer() {
+        let mut buf = Vec::new();
+        assert!(scan_sse_for_usage(&mut buf, b"data: {\"choices\":[{\"delta\":{}}]}\n").is_none());
+        assert!(scan_sse_for_usage(&mut buf, b"data: [DONE]\n").is_none());
+        assert!(buf.is_empty());
+        // A single line larger than the cap with no newline is dropped, so a
+        // newline-starved upstream cannot grow the buffer without bound.
+        let big = vec![b'x'; MAX_SSE_LINE_BUFFER + 10];
+        assert!(scan_sse_for_usage(&mut buf, &big).is_none());
+        assert!(buf.is_empty(), "oversized partial line must be dropped");
+    }
+
+    #[test]
+    fn stream_settlement_never_undercharges() {
+        // $1 per million tokens on both legs => 1 micro/token.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let reserve = 999;
+
+        // Clean finish with usage: charge the observed cost (15 tokens => 15 micros).
+        let (actual, _u, decision) =
+            stream_settlement(true, Some(Usage::new(10, 5)), &price, reserve);
+        assert_eq!(actual, 15);
+        assert_eq!(decision, "allowed");
+
+        // Clean finish, no usage chunk: charge the full reservation, not zero.
+        let (actual, _u, decision) = stream_settlement(true, None, &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "allowed");
+
+        // Abnormal end (even with partial usage seen): charge the full reservation.
+        let (actual, _u, decision) =
+            stream_settlement(false, Some(Usage::new(10, 5)), &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "error");
+    }
 }

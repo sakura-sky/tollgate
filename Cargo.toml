@@ -44,7 +44,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP client for provider adapters (Vertex, Anthropic) and the GCP metadata server.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` enables response body streaming for the OpenAI SSE relay.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Streaming relay for the OpenAI-compatible endpoint (SSE pass-through + metering).
+bytes = "1"
+futures-util = "0.3"
+tokio-stream = "0.1"
 
 # API-key hashing: HMAC-SHA256 (fast, correct for high-entropy keys) + constant-
 # time compare. rand for key generation, hex for encoding.
