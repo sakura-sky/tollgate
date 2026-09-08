@@ -21,7 +21,9 @@
 //! a database leak alone cannot verify keys. argon2id is reserved for the future
 //! console's human-password login.
 
-use hmac::{Hmac, Mac};
+// KeyInit provides `new_from_slice`. In hmac 0.12 it came in via `Mac`; the
+// 0.13 line (digest 0.11) requires importing it explicitly.
+use hmac::{Hmac, KeyInit, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;

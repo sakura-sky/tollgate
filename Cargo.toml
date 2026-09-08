@@ -37,7 +37,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "request-id", "timeout", "set-header", "util"] }
+tower-http = { version = "0.7", features = ["trace", "request-id", "timeout", "set-header", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -54,7 +54,7 @@ tokio-stream = "0.1"
 
 # API-key hashing: HMAC-SHA256 (fast, correct for high-entropy keys) + constant-
 # time compare. rand for key generation, hex for encoding.
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"
 rand = "0.8"
