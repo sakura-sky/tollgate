@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use sqlx::Row;
 
 use crate::config::Config;
 
@@ -105,7 +106,50 @@ pub enum PriceCommand {
         /// Output price per 1,000,000 tokens (currency units).
         #[arg(long)]
         output_per_1m: f64,
+        /// Cache-READ price per 1,000,000 tokens. Omit to CARRY FORWARD the
+        /// current value; the common case is bumping a base rate without meaning
+        /// to touch cache rates. Use --clear-cache-read to unset it.
+        #[arg(long)]
+        cache_read_per_1m: Option<f64>,
+        /// Cache-WRITE price per 1,000,000 tokens. Omit to carry forward.
+        #[arg(long)]
+        cache_write_per_1m: Option<f64>,
+        /// Unset the cache-read price, restoring the conservative fallback.
+        #[arg(long, conflicts_with = "cache_read_per_1m")]
+        clear_cache_read: bool,
+        /// Unset the cache-write price, restoring the conservative fallback.
+        #[arg(long, conflicts_with = "cache_write_per_1m")]
+        clear_cache_write: bool,
     },
+}
+
+/// What to do with one cache rate on a re-price.
+enum RateChange {
+    /// Keep whatever the superseded row had. The default, because the common
+    /// operation is bumping a base rate, and silently resetting a cache rate
+    /// there would swap a real rate for the fallback: a large, invisible
+    /// over-charge on exactly the cache-heavy workloads that configured it.
+    Carry,
+    Set(i64),
+    Clear,
+}
+
+impl RateChange {
+    fn resolve(value: Option<f64>, clear: bool, carried: Option<i64>) -> Result<Option<i64>> {
+        Ok(match Self::from_flags(value, clear)? {
+            Self::Carry => carried,
+            Self::Set(v) => Some(v),
+            Self::Clear => None,
+        })
+    }
+
+    fn from_flags(value: Option<f64>, clear: bool) -> Result<Self> {
+        match (value, clear) {
+            (Some(v), _) => Ok(Self::Set(to_micros(v)?)),
+            (None, true) => Ok(Self::Clear),
+            (None, false) => Ok(Self::Carry),
+        }
+    }
 }
 
 pub async fn dispatch(cli: Cli) -> Result<()> {
@@ -133,7 +177,24 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             model,
             input_per_1m,
             output_per_1m,
-        })) => admin_price_set(&cfg, &provider, &model, input_per_1m, output_per_1m).await,
+            cache_read_per_1m,
+            cache_write_per_1m,
+            clear_cache_read,
+            clear_cache_write,
+        })) => {
+            admin_price_set(
+                &cfg,
+                &provider,
+                &model,
+                input_per_1m,
+                output_per_1m,
+                cache_read_per_1m,
+                cache_write_per_1m,
+                clear_cache_read,
+                clear_cache_write,
+            )
+            .await
+        }
     }
 }
 
@@ -287,44 +348,82 @@ async fn admin_budget_set(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn admin_price_set(
     cfg: &Config,
     provider: &str,
     model: &str,
     input_per_1m: f64,
     output_per_1m: f64,
+    cache_read_per_1m: Option<f64>,
+    cache_write_per_1m: Option<f64>,
+    clear_cache_read: bool,
+    clear_cache_write: bool,
 ) -> Result<()> {
     let input = to_micros(input_per_1m)?;
     let output = to_micros(output_per_1m)?;
     let pool = crate::db::build_pool(&cfg.database).await?;
     // Close the current row and insert the new one atomically.
     let mut tx = pool.begin().await.context("begin transaction")?;
-    sqlx::query(
+    // Close and READ the superseded row in ONE statement. A separate SELECT then
+    // UPDATE loses updates under READ COMMITTED: two concurrent re-prices would
+    // both read the same old row, and the second would close the first's
+    // brand-new row and carry values from the stale one, silently discarding it.
+    // The partial unique index does not catch that, because the second
+    // transaction closed the first's row before inserting.
+    let carried = sqlx::query(
         "UPDATE model_prices SET effective_to = NOW() \
-         WHERE provider = $1 AND model = $2 AND effective_to IS NULL",
+         WHERE provider = $1 AND model = $2 AND effective_to IS NULL \
+         RETURNING cache_read_per_1m_micros, cache_write_per_1m_micros",
     )
     .bind(provider)
     .bind(model)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .context("closing current price")?;
+    // No row means this is the first price for the model: nothing to carry.
+    let (carried_read, carried_write) = carried.map_or((None, None), |row| {
+        (
+            row.get::<Option<i64>, _>("cache_read_per_1m_micros"),
+            row.get::<Option<i64>, _>("cache_write_per_1m_micros"),
+        )
+    });
+    let cache_read = RateChange::resolve(cache_read_per_1m, clear_cache_read, carried_read)?;
+    let cache_write = RateChange::resolve(cache_write_per_1m, clear_cache_write, carried_write)?;
     sqlx::query(
         "INSERT INTO model_prices \
-         (provider, model, input_per_1m_micros, output_per_1m_micros, source) \
-         VALUES ($1, $2, $3, $4, 'admin price set')",
+         (provider, model, input_per_1m_micros, output_per_1m_micros, \
+          cache_read_per_1m_micros, cache_write_per_1m_micros, source) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'admin price set')",
     )
     .bind(provider)
     .bind(model)
     .bind(input)
     .bind(output)
+    .bind(cache_read)
+    .bind(cache_write)
     .execute(&mut *tx)
     .await
     .context("inserting price")?;
     tx.commit().await.context("commit transaction")?;
+    let show = |v: Option<i64>| {
+        v.map_or_else(
+            || "unset (conservative fallback applies)".to_owned(),
+            crate::pricing::format_micros,
+        )
+    };
     println!(
-        "price set: {provider}/{model} input {} output {} per 1M tokens",
+        "price set: {provider}/{model} per 1M tokens\n  input       {}\n  output      {}\n  cache read  {}\n  cache write {}",
         crate::pricing::format_micros(input),
-        crate::pricing::format_micros(output)
+        crate::pricing::format_micros(output),
+        show(cache_read),
+        show(cache_write),
     );
+    if cache_read.is_none() || cache_write.is_none() {
+        println!(
+            "note: an unset cache rate is charged at a conservative multiple of the \
+             input rate, which OVER-charges cache reads (often by around 10x)."
+        );
+    }
     Ok(())
 }

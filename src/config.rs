@@ -118,6 +118,36 @@ pub struct BillingConfig {
     /// ISO 4217 currency code for all amounts (display only; the money path is
     /// currency-agnostic integer micros). Single currency per deployment.
     pub currency: String,
+    /// Multiple of a model's input rate used to price cache-READ tokens when the
+    /// operator has not set a rate, in integer PER-MILLE (1000 = 1.0x). Integer
+    /// so no float touches the money path. Must be at least 1000: a lower value
+    /// would guess DOWNWARD on a rate nobody supplied, which under-charges
+    /// silently. Real read rates are well below the input rate, so the default
+    /// deliberately over-charges until a real rate is configured.
+    #[serde(default = "default_cache_read_permille")]
+    pub cache_read_fallback_permille: u32,
+    /// As above for cache-WRITE tokens. The default covers the most expensive
+    /// real write rate observed (2x the input rate for a long-TTL entry).
+    #[serde(default = "default_cache_write_permille")]
+    pub cache_write_fallback_permille: u32,
+}
+
+fn default_cache_read_permille() -> u32 {
+    1_000
+}
+fn default_cache_write_permille() -> u32 {
+    2_000
+}
+
+impl BillingConfig {
+    /// The cache-rate fallback these settings describe.
+    #[must_use]
+    pub fn cache_rate_fallback(&self) -> crate::pricing::CacheRateFallback {
+        crate::pricing::CacheRateFallback {
+            read_permille: self.cache_read_fallback_permille,
+            write_permille: self.cache_write_fallback_permille,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +215,8 @@ impl Default for Config {
             },
             billing: BillingConfig {
                 currency: "USD".to_string(),
+                cache_read_fallback_permille: default_cache_read_permille(),
+                cache_write_fallback_permille: default_cache_write_permille(),
             },
             security: SecurityConfig {
                 api_key_pepper: String::new(),

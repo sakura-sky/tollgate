@@ -83,6 +83,33 @@ pub trait Provider: Send + Sync {
     ) -> Result<u64, ProviderError> {
         Ok(parsed.estimated_input_tokens)
     }
+
+    /// Whether this adapter can ever report `cache_write_tokens > 0`.
+    ///
+    /// This gates the worst-case reservation. A cache write can cost more than
+    /// fresh input (up to 2x), so where writes are possible the reservation has
+    /// to assume the whole prompt might be written, or a request could settle
+    /// above what it reserved and overshoot a hard cap.
+    ///
+    /// It must stay false where writes are impossible. Because an unpriced write
+    /// class always resolves to a fallback above the input rate, reserving at
+    /// the write rate unconditionally would inflate EVERY reservation on EVERY
+    /// model, including adapters that never report writes, and start refusing
+    /// traffic that previously fit under the same budget.
+    fn can_report_cache_write(&self) -> bool {
+        false
+    }
+
+    /// The prompt-side worst case this adapter can produce, used to size the
+    /// reservation. Defaults to the cheapest assumption; adapters that can bill
+    /// a prompt token on more than one leg MUST say so, or a request will settle
+    /// above what it was admitted for.
+    fn prompt_reserve_profile(&self) -> crate::pricing::PromptReserveProfile {
+        crate::pricing::PromptReserveProfile {
+            can_cache_write: self.can_report_cache_write(),
+            may_double_bill_prompt: false,
+        }
+    }
 }
 
 /// A credential-free mock provider for the demo. Input tokens are estimated from

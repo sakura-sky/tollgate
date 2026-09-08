@@ -50,23 +50,58 @@ use serde::{Deserialize, Serialize};
 /// unit. Dividing `tokens × price_per_1M` by this yields micros.
 const TOKENS_PER_MILLION: i128 = 1_000_000;
 
-/// The USD price for one `(provider, model)`, in micros per 1,000,000 tokens.
+/// The price for one `(provider, model)`, in micros per 1,000,000 tokens.
+///
+/// The two cache rates are EFFECTIVE rates: resolved once when the price book is
+/// built, either from the operator's configured value or from a conservative
+/// fallback multiple of the input rate. Resolving here rather than per request
+/// keeps the hot path to integer multiplication, and means a reservation and its
+/// settlement always use the same snapshot even across a hot reload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelPrice {
     pub provider: String,
     pub model: String,
-    /// USD micros per 1M input tokens.
+    /// Micros per 1M fresh input tokens.
     pub input_per_1m_micros: i64,
-    /// USD micros per 1M output tokens.
+    /// Micros per 1M output tokens.
     pub output_per_1m_micros: i64,
+    /// Micros per 1M cache-read tokens, already resolved.
+    pub cache_read_per_1m_micros: i64,
+    /// Micros per 1M cache-write tokens, already resolved.
+    pub cache_write_per_1m_micros: i64,
+    /// True when either cache rate came from the fallback rather than from the
+    /// operator. Surfaced so a deployment can see it is being over-charged on
+    /// purpose instead of discovering it in a variance review.
+    pub cache_rates_are_fallback: bool,
 }
 
-/// Token usage for a single request, normalised across providers by
-/// `Provider::parse_usage`.
+/// Token usage for a single request, normalised across providers by the
+/// adapters into four DISJOINT classes.
+///
+/// Disjoint is the whole point. Providers disagree about whether cached tokens
+/// are counted inside the prompt total or alongside it: Anthropic reports them
+/// alongside, Gemini and OpenAI report them inside. Each adapter converts to
+/// this one representation at the edge, so nothing downstream has to know a
+/// provider's convention and no class can be double-counted or dropped.
+///
+/// `input_tokens` therefore means FRESH prompt tokens only, excluding anything
+/// served from or written to a cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// Fresh prompt tokens. Cache classes are NOT included here.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from a provider-side cache. Cheaper than fresh
+    /// input, typically about a tenth of the rate.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written into a provider-side cache. Can cost MORE than
+    /// fresh input (1.25x to 2x on Anthropic, by TTL).
+    pub cache_write_tokens: u64,
+    /// Set when the upstream's own numbers contradicted each other, so these
+    /// counts are a guess rather than a measurement. Callers must charge the
+    /// reservation instead of costing them: see [`Usage::is_untrustworthy`].
+    #[serde(default)]
+    pub suspect: bool,
 }
 
 /// Ceiling on the tokens one leg of a single request can plausibly consume.
@@ -78,12 +113,51 @@ pub struct Usage {
 pub const MAX_PLAUSIBLE_TOKENS_PER_LEG: u64 = 50_000_000;
 
 impl Usage {
+    /// Usage with no cache activity. Kept two-argument so every existing call
+    /// site and adapter that predates cache classes still compiles unchanged.
     #[must_use]
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
         Self {
             input_tokens,
             output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            suspect: false,
         }
+    }
+
+    /// Mark these counts as derived from a self-contradictory response.
+    #[must_use]
+    pub fn into_suspect(mut self) -> Self {
+        self.suspect = true;
+        self
+    }
+
+    /// Usage including prompt-cache classes. `input_tokens` must already EXCLUDE
+    /// both cache classes: callers normalise at the adapter, not here.
+    #[must_use]
+    pub fn with_cache(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            suspect: false,
+        }
+    }
+
+    /// Every prompt-side token the provider billed for, across all classes.
+    /// Restores the pre-cache-split meaning of "input tokens" for reporting.
+    #[must_use]
+    pub fn total_prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
     }
 
     /// True when a leg exceeds [`MAX_PLAUSIBLE_TOKENS_PER_LEG`].
@@ -102,6 +176,104 @@ impl Usage {
     pub fn is_implausible(&self) -> bool {
         self.input_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
             || self.output_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
+            || self.cache_read_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
+            || self.cache_write_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
+    }
+
+    /// True when these counts must NOT be costed: either implausible, or derived
+    /// from a response whose own numbers contradicted each other.
+    ///
+    /// Both cases are metering failures rather than expensive requests. Costing
+    /// a contradictory report means picking one reading of it, and the readings
+    /// differ by the size of the cache: guessing cheap under-charges, guessing
+    /// expensive settles above a reservation that was computed from the honest
+    /// numbers. Charging the reservation is the only answer that breaks neither
+    /// invariant.
+    #[must_use]
+    pub fn is_untrustworthy(&self) -> bool {
+        self.suspect || self.is_implausible()
+    }
+}
+
+/// What a provider's worst case looks like on the prompt side, used to size a
+/// reservation before the response reveals how the prompt actually split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PromptReserveProfile {
+    /// This adapter can report `cache_write_tokens > 0`, so the prompt might be
+    /// billed at the write rate, which can exceed the input rate.
+    pub can_cache_write: bool,
+    /// This adapter may bill a single prompt token on TWO legs: it counts the
+    /// full prompt as fresh AND the cached count on top, because the upstream's
+    /// convention is unverified and billing both is the only reading that cannot
+    /// under-charge. The reservation has to cover the sum, or a cache hit
+    /// settles above what was admitted.
+    pub may_double_bill_prompt: bool,
+}
+
+/// Fallback multiples applied to a model's base input rate when the operator has
+/// not priced a cache class, expressed in integer PER-MILLE so no float ever
+/// touches the money path.
+///
+/// These are not shipped prices. Tollgate ships no price list; they are safety
+/// backstops on the operator's own rate, chosen so that an unpriced class is
+/// over-charged rather than under-charged:
+///
+/// - Reads default to 1000 per-mille (1.0x). Real read rates are 0.1x to 0.25x,
+///   so this over-charges. Safe.
+/// - Writes default to 2000 per-mille (2.0x), which covers the most expensive
+///   real write rate seen (Anthropic long-TTL at 2x) and therefore also the
+///   cheaper ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheRateFallback {
+    pub read_permille: u32,
+    pub write_permille: u32,
+}
+
+impl Default for CacheRateFallback {
+    fn default() -> Self {
+        Self {
+            read_permille: 1_000,
+            write_permille: 2_000,
+        }
+    }
+}
+
+/// Smallest fallback multiple that is not a silent discount. A multiple below
+/// 1.0x would price an UNPRICED class below the operator's own input rate, which
+/// is guessing downward on a number nobody has supplied: the same fail-open the
+/// nullable rate columns exist to avoid.
+pub const MIN_FALLBACK_PERMILLE: u32 = 1_000;
+
+impl CacheRateFallback {
+    /// Reject a configuration that would make an unpriced class cheap or free.
+    ///
+    /// # Errors
+    /// Returns a message naming the offending field when either multiple is
+    /// below [`MIN_FALLBACK_PERMILLE`].
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("cache_read_fallback_permille", self.read_permille),
+            ("cache_write_fallback_permille", self.write_permille),
+        ] {
+            if v < MIN_FALLBACK_PERMILLE {
+                return Err(format!(
+                    "{name} is {v}, below the minimum {MIN_FALLBACK_PERMILLE} (1.0x). \
+                     A fallback under 1.0x would price an UNPRICED cache class below the \
+                     model's own input rate, which under-charges silently. Set a real rate \
+                     with `admin price set` instead of discounting the fallback."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a multiple to a base rate, rounding UP, saturating at [`i64::MAX`].
+    /// Rounding up keeps the fallback on the over-charging side of exact.
+    #[must_use]
+    fn apply(base: i64, permille: u32) -> i64 {
+        let scaled = i128::from(base) * i128::from(permille);
+        let rounded = scaled.div_euclid(1_000) + i128::from(scaled.rem_euclid(1_000) != 0);
+        i64::try_from(rounded).unwrap_or(i64::MAX)
     }
 }
 
@@ -131,24 +303,112 @@ impl ModelPrice {
         // release builds, so it is a real `.max(0)` - not a `debug_assert!`,
         // which is stripped in release. The DB also CHECKs >= 0; this is the
         // in-memory backstop for a PriceBook built from an external manifest.
+        let input = input_per_1m_micros.max(0);
+        let fb = CacheRateFallback::default();
         Self {
             provider: provider.into(),
             model: model.into(),
-            input_per_1m_micros: input_per_1m_micros.max(0),
+            input_per_1m_micros: input,
             output_per_1m_micros: output_per_1m_micros.max(0),
+            cache_read_per_1m_micros: CacheRateFallback::apply(input, fb.read_permille),
+            cache_write_per_1m_micros: CacheRateFallback::apply(input, fb.write_permille),
+            cache_rates_are_fallback: true,
         }
     }
 
-    /// Cost of `usage` at this price, in USD micros.
+    /// Attach operator-configured cache rates. `None` for a class leaves the
+    /// conservative fallback in place, so an unpriced class is never free.
+    #[must_use]
+    pub fn with_cache_rates(
+        mut self,
+        cache_read: Option<i64>,
+        cache_write: Option<i64>,
+        fallback: CacheRateFallback,
+    ) -> Self {
+        self.cache_read_per_1m_micros = cache_read.map_or_else(
+            || CacheRateFallback::apply(self.input_per_1m_micros, fallback.read_permille),
+            |v| v.max(0),
+        );
+        self.cache_write_per_1m_micros = cache_write.map_or_else(
+            || CacheRateFallback::apply(self.input_per_1m_micros, fallback.write_permille),
+            |v| v.max(0),
+        );
+        self.cache_rates_are_fallback = cache_read.is_none() || cache_write.is_none();
+        self
+    }
+
+    /// Cost of `usage` at this price, in micros.
     #[must_use]
     pub fn cost_micros(&self, usage: Usage) -> i64 {
-        // Sum both legs at full micro-precision, THEN round once. Rounding each
-        // leg independently (as an earlier version did) doubles the rounding
-        // error and can over-count a request's cost.
+        // Sum ALL FOUR legs at full micro-precision, THEN round once. Rounding
+        // each leg independently multiplies the rounding error by the number of
+        // legs and can over-count a request's cost.
         let input = i128::from(usage.input_tokens) * i128::from(self.input_per_1m_micros);
         let output = i128::from(usage.output_tokens) * i128::from(self.output_per_1m_micros);
-        // saturating_add: two near-maximal legs can overflow even i128.
-        round_to_micros(input.saturating_add(output))
+        let read = i128::from(usage.cache_read_tokens) * i128::from(self.cache_read_per_1m_micros);
+        let write =
+            i128::from(usage.cache_write_tokens) * i128::from(self.cache_write_per_1m_micros);
+        // saturating_add: near-maximal legs can overflow even i128.
+        round_to_micros(
+            input
+                .saturating_add(output)
+                .saturating_add(read)
+                .saturating_add(write),
+        )
+    }
+
+    /// The rate to reserve prompt-side tokens at, given whether this request's
+    /// provider can actually report a cache write.
+    ///
+    /// A reservation is made before we know how the prompt will split across the
+    /// three prompt-side classes, so the honest worst case is the most expensive
+    /// applicable prompt rate. Two subtleties:
+    ///
+    /// - The write rate is only included when the adapter can report a cache
+    ///   write. Because an unpriced write class always resolves to a fallback
+    ///   above the input rate, including it unconditionally would inflate EVERY
+    ///   reservation on every model in every deployment, including adapters that
+    ///   structurally never report writes. That is a denial vector, not caution:
+    ///   traffic that fit under a cap before an upgrade would start being
+    ///   refused.
+    /// - The read rate is always included. Nothing stops an operator setting a
+    ///   read rate above the input rate by mistake, and the database only checks
+    ///   it is non-negative. Without this, such a model would settle above its
+    ///   reservation and break the `exact` admission hard cap.
+    #[must_use]
+    pub fn reserve_prompt_rate(&self, profile: PromptReserveProfile) -> i64 {
+        // Where a prompt token can be billed on two legs at once, the worst case
+        // is the SUM of those legs, not the larger of them.
+        if profile.may_double_bill_prompt {
+            let both = self
+                .input_per_1m_micros
+                .saturating_add(self.cache_read_per_1m_micros);
+            return if profile.can_cache_write {
+                both.max(self.cache_write_per_1m_micros)
+            } else {
+                both
+            };
+        }
+        let rate = self.input_per_1m_micros.max(self.cache_read_per_1m_micros);
+        if profile.can_cache_write {
+            rate.max(self.cache_write_per_1m_micros)
+        } else {
+            rate
+        }
+    }
+
+    /// Worst-case cost to reserve for a request, at the rate from
+    /// [`Self::reserve_prompt_rate`].
+    #[must_use]
+    pub fn reserve_micros(
+        &self,
+        prompt_tokens: u64,
+        max_output_tokens: u64,
+        profile: PromptReserveProfile,
+    ) -> i64 {
+        let prompt = i128::from(prompt_tokens) * i128::from(self.reserve_prompt_rate(profile));
+        let output = i128::from(max_output_tokens) * i128::from(self.output_per_1m_micros);
+        round_to_micros(prompt.saturating_add(output))
     }
 }
 
@@ -321,6 +581,141 @@ mod tests {
                 .is_none()
         );
         assert!(book.lookup("openai", "gpt-5").is_none());
+    }
+
+    #[test]
+    fn unpriced_cache_classes_are_never_free() {
+        // The whole reason the rate columns are nullable. A model priced before
+        // cache rates existed must not start metering cache tokens at zero.
+        let p = ModelPrice::new("anthropic", "m", 3_000_000, 15_000_000);
+        assert!(p.cache_rates_are_fallback);
+        assert_eq!(p.cache_read_per_1m_micros, 3_000_000); // 1.0x input
+        assert_eq!(p.cache_write_per_1m_micros, 6_000_000); // 2.0x input
+        // 1M cache-read tokens cost something, not nothing.
+        assert!(p.cost_micros(Usage::with_cache(0, 0, 1_000_000, 0)) > 0);
+    }
+
+    #[test]
+    fn operator_rates_replace_the_fallback_per_class() {
+        let fb = CacheRateFallback::default();
+        // Read priced, write left unpriced: only the write falls back.
+        let p = ModelPrice::new("anthropic", "m", 3_000_000, 15_000_000).with_cache_rates(
+            Some(300_000),
+            None,
+            fb,
+        );
+        assert_eq!(p.cache_read_per_1m_micros, 300_000);
+        assert_eq!(p.cache_write_per_1m_micros, 6_000_000);
+        assert!(p.cache_rates_are_fallback);
+        // Both priced: no fallback in play.
+        let p = p.with_cache_rates(Some(300_000), Some(3_750_000), fb);
+        assert!(!p.cache_rates_are_fallback);
+        assert_eq!(p.cache_write_per_1m_micros, 3_750_000);
+    }
+
+    #[test]
+    fn cost_rounds_once_across_all_four_legs() {
+        // Each leg is half a micro. Rounding legs independently would give 4;
+        // rounding the sum (2.0 micros) gives 2.
+        let p = ModelPrice::new("p", "m", 500_000, 500_000).with_cache_rates(
+            Some(500_000),
+            Some(500_000),
+            CacheRateFallback::default(),
+        );
+        assert_eq!(p.cost_micros(Usage::with_cache(1, 1, 1, 1)), 2);
+    }
+
+    #[test]
+    fn reservation_covers_the_write_rate_only_where_writes_can_be_reported() {
+        // Unpriced write resolves to 2x input. Reserving at that rate on an
+        // adapter that can never report a write would double every reservation
+        // in the deployment and start refusing traffic that used to fit.
+        let p = ModelPrice::new("p", "m", 3_000_000, 15_000_000);
+        assert_eq!(p.reserve_prompt_rate(profile(false, false)), 3_000_000);
+        assert_eq!(p.reserve_prompt_rate(profile(true, false)), 6_000_000);
+    }
+
+    /// Build a reserve profile without spelling the struct out at every call.
+    fn profile(can_cache_write: bool, may_double_bill_prompt: bool) -> PromptReserveProfile {
+        PromptReserveProfile {
+            can_cache_write,
+            may_double_bill_prompt,
+        }
+    }
+
+    #[test]
+    fn reservation_covers_a_prompt_billed_on_two_legs_at_once() {
+        // On an upstream whose cache convention is unverified, the parser bills
+        // the whole prompt AND the cached count, because that is the only
+        // reading that cannot under-charge. The reservation therefore has to
+        // cover the SUM of the two rates, not the larger of them: reserving the
+        // larger would leave every cache hit settling above what was admitted.
+        let p = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        assert_eq!(p.reserve_prompt_rate(profile(false, false)), 1_000_000);
+        assert_eq!(p.reserve_prompt_rate(profile(false, true)), 2_000_000);
+
+        // Worst case end to end: a 1000-token prompt reported as entirely
+        // cached, so the parser bills 1000 fresh plus 1000 cache-read.
+        let reserved = p.reserve_micros(1_000, 0, profile(false, true));
+        let settled = p.cost_micros(Usage::with_cache(1_000, 0, 1_000, 0));
+        assert!(
+            settled <= reserved,
+            "settle {settled} exceeded reserve {reserved}"
+        );
+    }
+
+    #[test]
+    fn reservation_covers_a_read_rate_set_above_the_input_rate() {
+        // Only a >= 0 check guards the read rate in the database, so a
+        // fat-fingered rate above the input rate must still be reserved for,
+        // otherwise settle exceeds reserve and the exact hard cap breaks.
+        let p = ModelPrice::new("p", "m", 1_000_000, 1_000_000).with_cache_rates(
+            Some(9_000_000),
+            None,
+            CacheRateFallback::default(),
+        );
+        assert_eq!(p.reserve_prompt_rate(profile(false, false)), 9_000_000);
+        // A whole prompt served from cache still settles within its reservation.
+        let reserved = p.reserve_micros(1_000, 0, profile(false, false));
+        let settled = p.cost_micros(Usage::with_cache(0, 0, 1_000, 0));
+        assert!(
+            settled <= reserved,
+            "settle {settled} exceeded reserve {reserved}"
+        );
+    }
+
+    #[test]
+    fn fallback_multiples_below_one_are_rejected() {
+        assert!(CacheRateFallback::default().validate().is_ok());
+        let bad = CacheRateFallback {
+            read_permille: 100,
+            write_permille: 2_000,
+        };
+        assert!(bad.validate().unwrap_err().contains("cache_read"));
+        // Zero is the fail-open the nullable columns exist to prevent.
+        let zero = CacheRateFallback {
+            read_permille: 0,
+            write_permille: 0,
+        };
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn fallback_multiple_rounds_up_and_uses_integer_math() {
+        // 1.0x of an odd rate is exact; anything inexact must round UP so the
+        // fallback stays on the over-charging side.
+        assert_eq!(CacheRateFallback::apply(999_999, 1_000), 999_999);
+        assert_eq!(CacheRateFallback::apply(999_999, 2_000), 1_999_998);
+        // 1001 per-mille of 1 micro is 1.001, which must not round down to 1.
+        assert_eq!(CacheRateFallback::apply(1, 1_001), 2);
+        // Saturates rather than wrapping.
+        assert_eq!(CacheRateFallback::apply(i64::MAX, 2_000), i64::MAX);
+    }
+
+    #[test]
+    fn total_prompt_tokens_restores_the_pre_split_series() {
+        let u = Usage::with_cache(5, 22, 200_000, 1_000);
+        assert_eq!(u.total_prompt_tokens(), 201_005);
     }
 
     #[test]

@@ -149,20 +149,28 @@ fn parse_anthropic_usage(v: &Value) -> Usage {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
-    // saturating_add, not `+`: these values come from an upstream response and are
-    // not trusted to be small. In release builds a plain `+` wraps on overflow,
-    // which would meter an enormous request as a tiny one - an under-charge in the
-    // one place we can least afford it.
-    let prompt = get("input_tokens")
-        .saturating_add(get("cache_read_input_tokens"))
-        .saturating_add(get("cache_creation_input_tokens"));
-    Usage::new(prompt, get("output_tokens"))
+    // Anthropic's classes are ALREADY disjoint, which is exactly the shape
+    // `Usage` wants, so they pass straight through with no arithmetic. This is
+    // the one provider that needs no conversion.
+    Usage::with_cache(
+        get("input_tokens"),
+        get("output_tokens"),
+        get("cache_read_input_tokens"),
+        get("cache_creation_input_tokens"),
+    )
 }
 
 #[async_trait]
 impl Provider for AnthropicProvider {
     fn id(&self) -> &str {
         "anthropic"
+    }
+
+    /// Anthropic is the one adapter that reports cache writes: a request marking
+    /// `cache_control` breakpoints returns `cache_creation_input_tokens`, billed
+    /// above the base input rate.
+    fn can_report_cache_write(&self) -> bool {
+        true
     }
 
     fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
@@ -389,9 +397,10 @@ fn extract_vertex_model(rest_path: &str) -> Option<String> {
 /// Thinking tokens bill at the output rate, so they join the output leg. Tool-use
 /// prompt tokens are prompt-side, so they join the input leg.
 ///
-/// `cachedContentTokenCount` is deliberately NOT added: unlike Anthropic's
+/// `cachedContentTokenCount` is INSIDE `promptTokenCount`: unlike Anthropic's
 /// disjoint scheme, Gemini documents `promptTokenCount` as the total effective
-/// prompt size INCLUDING cached content. Adding it would double-count the cache.
+/// prompt size INCLUDING cached content. It is therefore SUBTRACTED out into its
+/// own class rather than added, or the cache would be billed twice.
 fn parse_vertex_usage(v: &Value) -> Usage {
     let m = v.get("usageMetadata");
     let get = |k: &str| {
@@ -401,7 +410,27 @@ fn parse_vertex_usage(v: &Value) -> Usage {
     };
     // saturating_add: upstream-reported values, not trusted to be small. A
     // wrapping sum would under-charge, which is the one direction we never allow.
-    let input = get("promptTokenCount").saturating_add(get("toolUsePromptTokenCount"));
+    // Cached tokens are documented as a subset of promptTokenCount SPECIFICALLY,
+    // not of the prompt side as a whole, so they must be split out of that field
+    // alone. Subtracting from prompt + toolUsePrompt would let a cached count
+    // between the two silently reclassify tool-use tokens as cache reads, which
+    // are cheaper: an under-charge on a broken response.
+    let prompt = get("promptTokenCount");
+    let tool_use = get("toolUsePromptTokenCount");
+    let prompt_total = prompt.saturating_add(tool_use);
+    let cached = get("cachedContentTokenCount");
+    let contradictory = cached > prompt;
+    let (input, cache_read) = if contradictory {
+        tracing::warn!(
+            cached,
+            prompt,
+            "vertex reports more cached tokens than prompt tokens; usage is \
+             self-contradictory, charging the reservation instead of costing it"
+        );
+        (prompt_total, cached)
+    } else {
+        ((prompt - cached).saturating_add(tool_use), cached)
+    };
     let mut output = get("candidatesTokenCount").saturating_add(get("thoughtsTokenCount"));
 
     // Residual reconciliation. The four classes above are documented to sum to
@@ -413,20 +442,30 @@ fn parse_vertex_usage(v: &Value) -> Usage {
     // Bill the residual on the OUTPUT leg, which is the more expensive of the
     // two, so an unrecognised class becomes a logged over-charge instead of a
     // silent under-charge. Zero on every response whose classes we already know.
+    //
+    // Reconcile against the FULL prompt, not the post-split `input`. Cached
+    // tokens live inside totalTokenCount, so measuring against `input` alone
+    // would report the cache itself as an unknown class and bill it a second
+    // time at the output rate.
     let total = get("totalTokenCount");
-    let residual = total.saturating_sub(input.saturating_add(output));
+    let counted = prompt_total.max(cached).saturating_add(output);
+    let residual = total.saturating_sub(counted);
     if residual > 0 {
         tracing::warn!(
             residual,
             total,
-            counted_input = input,
-            counted_output = output,
+            counted,
             "vertex usageMetadata reports more tokens than the known classes account for; \
              billing the remainder at the output rate (a new token class may have shipped)"
         );
         output = output.saturating_add(residual);
     }
-    Usage::new(input, output)
+    let usage = Usage::with_cache(input, output, cache_read, 0);
+    if contradictory {
+        usage.into_suspect()
+    } else {
+        usage
+    }
 }
 
 #[async_trait]
@@ -552,6 +591,26 @@ fn openai_effective_max(v: &Value) -> u64 {
         .unwrap_or(OPENAI_DEFAULT_MAX_OUTPUT)
 }
 
+/// Whether an OpenAI-protocol upstream's `cached_tokens` sits INSIDE
+/// `prompt_tokens` or alongside it.
+///
+/// This cannot be inferred from a payload: the two readings are numerically
+/// indistinguishable, and getting it wrong in the subtracting direction
+/// under-charges by roughly half on a cached request, steered by the caller's
+/// own prompt structure. So it travels with the upstream, not with the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheSemantics {
+    /// Verified that `cached_tokens` is a SUBSET of `prompt_tokens`, so the
+    /// cached count is split out of the prompt. True of OpenAI itself and,
+    /// confirmed against live responses, of Vertex's OpenAI-compatible shim.
+    Inclusive,
+    /// An upstream whose convention has not been verified, which includes any
+    /// operator-configured custom base URL. Both classes are billed in full:
+    /// exact if the upstream reports them disjointly, an over-charge if it
+    /// reports them inclusively, and never an under-charge either way.
+    Unverified,
+}
+
 /// Normalise an OpenAI-protocol usage object into [`Usage`].
 ///
 /// The output leg is NOT simply `completion_tokens`. The same field name means
@@ -571,7 +630,10 @@ fn openai_effective_max(v: &Value) -> u64 {
 /// on an including one, which is the only direction we are allowed to be wrong
 /// in. The final `max` against `completion_tokens` guards a self-contradictory
 /// response whose total is smaller than its parts.
-fn parse_openai_usage(v: &Value) -> Usage {
+///
+/// That residual is computed BEFORE the cache split, which is safe on a verified
+/// upstream but ambiguous on an unverified one: see the `ambiguous` check below.
+fn parse_openai_usage(v: &Value, semantics: CacheSemantics) -> Usage {
     let u = v.get("usage");
     let get = |k: &str| {
         u.and_then(|u| u.get(k))
@@ -591,7 +653,70 @@ fn parse_openai_usage(v: &Value) -> Usage {
     } else {
         completion.saturating_add(reasoning)
     };
-    Usage::new(prompt, completion.max(candidate))
+    let output = completion.max(candidate);
+
+    // Prompt-side split. `cached_tokens` is subtracted out only where the
+    // upstream's convention is known; otherwise both classes are billed whole.
+    let cached = u
+        .and_then(|u| u.get("prompt_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let contradictory = matches!(semantics, CacheSemantics::Inclusive) && cached > prompt;
+    if contradictory {
+        tracing::warn!(
+            cached,
+            prompt,
+            "upstream reports more cached tokens than prompt tokens; usage is \
+             self-contradictory, charging the reservation instead of costing it"
+        );
+    }
+
+    // Ambiguous composition on an unverified upstream.
+    //
+    // The output leg above was derived as `total - prompt` BEFORE the cache
+    // split, because that residual is what recovers reasoning tokens on an
+    // upstream that excludes them from `completion_tokens`. But on an upstream
+    // that reports cached tokens DISJOINTLY and counts them in `total` (the
+    // coherent additive shape, and exactly the convention Unverified exists to
+    // tolerate), that same residual swallows the cached count and bills it at
+    // the OUTPUT rate, on top of billing it again as a cache read.
+    //
+    // Two readings, no way to tell them apart from the payload, and one of them
+    // settles above a reservation that was sized for the prompt legs alone.
+    // That is a metering failure, not an expensive request, so it takes the same
+    // route as any other untrustworthy usage: charge the reservation.
+    let residual_output = total.saturating_sub(prompt);
+    let ambiguous = matches!(semantics, CacheSemantics::Unverified)
+        && cached > 0
+        && total > 0
+        && residual_output > completion.saturating_add(reasoning);
+    if ambiguous {
+        tracing::warn!(
+            cached,
+            prompt,
+            completion,
+            total,
+            "unverified upstream reports cached tokens AND a total larger than its \
+             own output fields account for; composition is ambiguous, charging the \
+             reservation instead of costing it"
+        );
+    }
+    let fresh = match semantics {
+        CacheSemantics::Inclusive if !contradictory => prompt - cached,
+        // Contradictory, or an upstream whose convention we have not verified:
+        // both classes stand in full. Under Unverified that is exact if the
+        // upstream reports them disjointly and an over-charge if it does not.
+        // The reservation covers both PROMPT legs; where the output leg is also
+        // ambiguous the usage is marked suspect above and never costed at all.
+        _ => prompt,
+    };
+    let usage = Usage::with_cache(fresh, output, cached, 0);
+    if contradictory || ambiguous {
+        usage.into_suspect()
+    } else {
+        usage
+    }
 }
 
 /// OpenAI-compatible upstream adapter. Fronts any Chat Completions endpoint that
@@ -612,6 +737,24 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// How this upstream reports cached prompt tokens.
+    ///
+    /// Vertex's shim (the only upstream with a model prefix) was verified
+    /// against live responses to report them INSIDE `prompt_tokens`. A custom
+    /// base URL is whatever the operator pointed it at, so it stays unverified
+    /// and both classes are billed in full rather than risking an under-charge.
+    ///
+    /// The streaming relay must be given this same value, or a caller could pick
+    /// the cheaper path by setting `stream`.
+    #[must_use]
+    pub fn cache_semantics(&self) -> CacheSemantics {
+        if self.model_prefix.is_some() {
+            CacheSemantics::Inclusive
+        } else {
+            CacheSemantics::Unverified
+        }
+    }
+
     /// Front Vertex's OpenAI-compatible endpoint for Gemini. `static_token` may be
     /// empty to use the metadata server (Workload Identity). `stream_http` must
     /// have no total request timeout (only connect + idle) so long streams are
@@ -806,15 +949,18 @@ pub fn stream_requested(v: &Value) -> bool {
 /// Parse token usage from a single SSE `data:` line, or `None` when the line has
 /// no non-null `usage` object. `[DONE]`, blank, and keep-alive/comment lines
 /// yield `None`; a per-delta `"usage": null` is correctly treated as "not seen".
+/// `semantics` MUST be the same value the buffered path uses for this upstream.
+/// The client chooses which path runs by setting `stream`, so if the two ever
+/// disagree a caller can simply pick the cheaper one.
 #[must_use]
-pub fn usage_from_sse_data(line: &str) -> Option<Usage> {
+pub fn usage_from_sse_data(line: &str, semantics: CacheSemantics) -> Option<Usage> {
     let data = line.strip_prefix("data:")?.trim();
     if data.is_empty() || data == "[DONE]" {
         return None;
     }
     let v: Value = serde_json::from_str(data).ok()?;
     match v.get("usage") {
-        Some(u) if !u.is_null() => Some(parse_openai_usage(&v)),
+        Some(u) if !u.is_null() => Some(parse_openai_usage(&v, semantics)),
         _ => None,
     }
 }
@@ -823,6 +969,17 @@ pub fn usage_from_sse_data(line: &str) -> Option<Usage> {
 impl Provider for OpenAiProvider {
     fn id(&self) -> &str {
         "openai"
+    }
+
+    /// On an unverified upstream the parser bills the full prompt AND the cached
+    /// count, since that is the only reading that cannot under-charge. The
+    /// reservation must therefore cover BOTH legs, or every cache hit settles
+    /// above what it was admitted for and walks a hard cap.
+    fn prompt_reserve_profile(&self) -> crate::pricing::PromptReserveProfile {
+        crate::pricing::PromptReserveProfile {
+            can_cache_write: false,
+            may_double_bill_prompt: matches!(self.cache_semantics(), CacheSemantics::Unverified),
+        }
     }
 
     fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
@@ -851,7 +1008,7 @@ impl Provider for OpenAiProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let usage = parse_openai_usage(&json);
+        let usage = parse_openai_usage(&json, self.cache_semantics());
         Ok(ProviderResponse {
             status,
             body: json,
@@ -979,15 +1136,22 @@ mod tests {
         // Terminal chunk with usage.
         let u = usage_from_sse_data(
             r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#,
+            CacheSemantics::Inclusive,
         )
         .unwrap();
         assert_eq!(u.input_tokens, 9);
         assert_eq!(u.output_tokens, 3);
         // Per-delta null usage is not "seen".
-        assert!(usage_from_sse_data(r#"data: {"choices":[{"delta":{}}],"usage":null}"#).is_none());
-        assert!(usage_from_sse_data("data: [DONE]").is_none());
-        assert!(usage_from_sse_data(": keep-alive").is_none());
-        assert!(usage_from_sse_data("event: message").is_none());
+        assert!(
+            usage_from_sse_data(
+                r#"data: {"choices":[{"delta":{}}],"usage":null}"#,
+                CacheSemantics::Inclusive
+            )
+            .is_none()
+        );
+        assert!(usage_from_sse_data("data: [DONE]", CacheSemantics::Inclusive).is_none());
+        assert!(usage_from_sse_data(": keep-alive", CacheSemantics::Inclusive).is_none());
+        assert!(usage_from_sse_data("event: message", CacheSemantics::Inclusive).is_none());
     }
 
     #[test]
@@ -1048,6 +1212,7 @@ mod tests {
     fn openai_usage_and_default_output() {
         let u = parse_openai_usage(
             &serde_json::json!({"usage":{"prompt_tokens":12,"completion_tokens":7}}),
+            CacheSemantics::Inclusive,
         );
         assert_eq!(u.input_tokens, 12);
         assert_eq!(u.output_tokens, 7);
@@ -1145,8 +1310,15 @@ mod tests {
         )
         .unwrap();
         let u = parse_anthropic_usage(&v);
-        assert_eq!(u.input_tokens, 201_005);
+        // Anthropic's classes are already disjoint, so they map straight across
+        // with no arithmetic. input_tokens is FRESH prompt only.
+        assert_eq!(u.input_tokens, 5);
+        assert_eq!(u.cache_read_tokens, 200_000);
+        assert_eq!(u.cache_write_tokens, 1_000);
         assert_eq!(u.output_tokens, 22);
+        // Nothing is lost by the split: every billable prompt token is still
+        // accounted for, just at its own rate.
+        assert_eq!(u.total_prompt_tokens(), 201_005);
     }
 
     #[test]
@@ -1218,7 +1390,15 @@ mod tests {
         )
         .unwrap();
         let u = parse_vertex_usage(&v);
-        assert_eq!(u.input_tokens, 60_008);
+        // Gemini reports cached tokens INSIDE promptTokenCount, so they are
+        // split out rather than added. Billing input_tokens as the full 60_008
+        // AND cache_read as 59_364 would charge the cached prefix twice.
+        assert_eq!(u.input_tokens, 644);
+        assert_eq!(u.cache_read_tokens, 59_364);
+        assert_eq!(u.total_prompt_tokens(), 60_008);
+        // Gemini has no cache-write class on a generateContent call: creation is
+        // a separate cachedContents request that never transits the proxy.
+        assert_eq!(u.cache_write_tokens, 0);
     }
 
     #[test]
@@ -1299,7 +1479,7 @@ mod tests {
                 "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}}"#,
         )
         .unwrap();
-        let u = parse_openai_usage(&v);
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
         assert_eq!(u.input_tokens, 29);
         assert_eq!(u.output_tokens, 560);
     }
@@ -1313,7 +1493,7 @@ mod tests {
                 "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}}"#,
         )
         .unwrap();
-        let u = parse_openai_usage(&v);
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
         assert_eq!(u.output_tokens, 560);
     }
 
@@ -1326,7 +1506,7 @@ mod tests {
                 "completion_tokens_details":{"reasoning_tokens":4},"total_tokens":60012}}"#,
         )
         .unwrap();
-        let u = parse_openai_usage(&v);
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
         assert_eq!(u.input_tokens, 60_008);
         assert_eq!(u.output_tokens, 4);
     }
@@ -1340,7 +1520,10 @@ mod tests {
                 "completion_tokens_details":{"reasoning_tokens":40}}}"#,
         )
         .unwrap();
-        assert_eq!(parse_openai_usage(&v).output_tokens, 140);
+        assert_eq!(
+            parse_openai_usage(&v, CacheSemantics::Inclusive).output_tokens,
+            140
+        );
     }
 
     #[test]
@@ -1351,7 +1534,172 @@ mod tests {
             r#"{"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":10}}"#,
         )
         .unwrap();
-        assert_eq!(parse_openai_usage(&v).output_tokens, 50);
+        assert_eq!(
+            parse_openai_usage(&v, CacheSemantics::Inclusive).output_tokens,
+            50
+        );
+    }
+
+    #[test]
+    fn openai_inclusive_splits_cached_out_of_the_prompt() {
+        // Verified live against the Vertex shim: cached_tokens sits INSIDE
+        // prompt_tokens, so it is split out. Billing both in full here would
+        // double-charge the cached prefix.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":60008,"prompt_tokens_details":{"cached_tokens":59364},
+                "completion_tokens":4,"total_tokens":60012}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
+        assert_eq!(u.input_tokens, 644);
+        assert_eq!(u.cache_read_tokens, 59_364);
+        assert_eq!(u.total_prompt_tokens(), 60_008);
+        assert!(!u.suspect);
+    }
+
+    #[test]
+    fn openai_unverified_bills_both_classes_in_full() {
+        // An operator can point the custom adapter at anything. If that upstream
+        // reports cached tokens ADDITIVELY, subtracting would under-charge by
+        // roughly the cached fraction, steered by the caller's own prompt. So
+        // both classes stand: exact if additive, an over-charge if inclusive.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":10000,"prompt_tokens_details":{"cached_tokens":8000},
+                "completion_tokens":100,"total_tokens":10100}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Unverified);
+        assert_eq!(u.input_tokens, 10_000);
+        assert_eq!(u.cache_read_tokens, 8_000);
+        assert!(!u.suspect);
+    }
+
+    #[test]
+    fn openai_unverified_ambiguous_total_is_marked_suspect() {
+        // The additive shape: cached reported disjointly AND counted in total.
+        // The output leg is derived as total - prompt, so the cached count would
+        // otherwise land there at the OUTPUT rate on top of being billed as a
+        // cache read, settling far above a reservation sized for the prompt.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":8000},
+                "completion_tokens":50,"total_tokens":8150}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Unverified);
+        assert!(
+            u.suspect,
+            "an unverified upstream whose total exceeds its own output fields is \
+             ambiguous and must not be costed"
+        );
+
+        // The ordinary inclusive-looking shape stays costable: total accounts for
+        // prompt and completion exactly, so nothing is hiding in the residual.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":10000,"prompt_tokens_details":{"cached_tokens":8000},
+                "completion_tokens":100,"total_tokens":10100}}"#,
+        )
+        .unwrap();
+        assert!(!parse_openai_usage(&v, CacheSemantics::Unverified).suspect);
+    }
+
+    #[test]
+    fn openai_unverified_settles_within_its_reservation() {
+        // End to end on the worst COSTABLE unverified shape: the whole prompt
+        // reported as cached, plus a full output leg. Nothing may exceed the
+        // reservation the profile asked for.
+        let p = crate::pricing::ModelPrice::new("openai", "m", 3_000_000, 15_000_000)
+            .with_cache_rates(
+                Some(300_000),
+                None,
+                crate::pricing::CacheRateFallback::default(),
+            );
+        let profile = crate::pricing::PromptReserveProfile {
+            can_cache_write: false,
+            may_double_bill_prompt: true,
+        };
+        let reserved = p.reserve_micros(1_000, 500, profile);
+
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":1000},
+                "completion_tokens":500,"total_tokens":1500}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Unverified);
+        assert!(!u.suspect);
+        let settled = p.cost_micros(u);
+        assert!(
+            settled <= reserved,
+            "settle {settled} exceeded reserve {reserved}"
+        );
+    }
+
+    #[test]
+    fn openai_contradictory_cached_count_is_marked_suspect() {
+        // More cached than prompt cannot be true. Neither reading is safe to
+        // charge, so the usage is flagged and the caller bills the reservation.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":9000},
+                "completion_tokens":5,"total_tokens":105}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
+        assert!(u.suspect);
+        assert!(u.is_untrustworthy());
+    }
+
+    #[test]
+    fn cache_semantics_and_write_capability_are_pinned_per_upstream() {
+        // A refactor flipping either of these silently changes what every
+        // request is charged, so pin them explicitly.
+        // Vertex's shim was verified live to report cached tokens inclusively,
+        // so it subtracts and does not need the double-bill reservation.
+        let vertex = OpenAiProvider::vertex(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            "proj",
+            "us-central1",
+            "t".to_owned(),
+        );
+        assert_eq!(vertex.cache_semantics(), CacheSemantics::Inclusive);
+        assert!(!vertex.can_report_cache_write());
+        assert!(!vertex.prompt_reserve_profile().may_double_bill_prompt);
+
+        // A custom base URL is whatever the operator pointed it at, so it stays
+        // unverified and MUST reserve for a prompt billed on two legs.
+        let unverified = openai_test_provider();
+        assert_eq!(unverified.cache_semantics(), CacheSemantics::Unverified);
+        assert!(unverified.prompt_reserve_profile().may_double_bill_prompt);
+    }
+
+    #[test]
+    fn vertex_cached_is_split_from_prompt_not_from_tool_use() {
+        // cachedContentTokenCount is a subset of promptTokenCount alone. If it
+        // were subtracted from prompt + toolUsePrompt, a cached count between
+        // the two would silently reclassify tool-use tokens as cache reads,
+        // which are cheaper: an under-charge on a broken response.
+        let v: Value = serde_json::from_str(
+            r#"{"usageMetadata":{"promptTokenCount":1000,"toolUsePromptTokenCount":500,
+                "cachedContentTokenCount":800,"candidatesTokenCount":10,
+                "totalTokenCount":1510}}"#,
+        )
+        .unwrap();
+        let u = parse_vertex_usage(&v);
+        // 1000 - 800 cached, plus the 500 tool-use tokens, all prompt-rate.
+        assert_eq!(u.input_tokens, 700);
+        assert_eq!(u.cache_read_tokens, 800);
+        assert_eq!(u.output_tokens, 10);
+        assert!(!u.suspect);
+    }
+
+    #[test]
+    fn vertex_cached_exceeding_prompt_is_marked_suspect() {
+        let v: Value = serde_json::from_str(
+            r#"{"usageMetadata":{"promptTokenCount":100,"toolUsePromptTokenCount":500,
+                "cachedContentTokenCount":400,"candidatesTokenCount":10}}"#,
+        )
+        .unwrap();
+        let u = parse_vertex_usage(&v);
+        assert!(u.suspect, "cached > promptTokenCount must not be costed");
     }
 
     #[test]
@@ -1366,14 +1714,20 @@ mod tests {
             r#"{"usage":{"prompt_tokens":29,"completion_tokens":491.0,"total_tokens":589}}"#,
         )
         .unwrap();
-        assert_eq!(parse_openai_usage(&v).output_tokens, 560);
+        assert_eq!(
+            parse_openai_usage(&v, CacheSemantics::Inclusive).output_tokens,
+            560
+        );
 
         // Mistyped total, sound completion: falls back and still charges it.
         let v: Value = serde_json::from_str(
             r#"{"usage":{"prompt_tokens":29,"completion_tokens":491,"total_tokens":"589"}}"#,
         )
         .unwrap();
-        assert_eq!(parse_openai_usage(&v).output_tokens, 491);
+        assert_eq!(
+            parse_openai_usage(&v, CacheSemantics::Inclusive).output_tokens,
+            491
+        );
 
         // Everything mistyped: meters zero. The buffered path then floors to the
         // reserved input cost, and the streaming path charges the reservation
@@ -1383,7 +1737,10 @@ mod tests {
             r#"{"usage":{"prompt_tokens":-29,"completion_tokens":491.5,"total_tokens":"589"}}"#,
         )
         .unwrap();
-        assert_eq!(parse_openai_usage(&v), Usage::default());
+        assert_eq!(
+            parse_openai_usage(&v, CacheSemantics::Inclusive),
+            Usage::default()
+        );
     }
 
     #[test]
@@ -1394,7 +1751,7 @@ mod tests {
         let v: Value =
             serde_json::from_str(r#"{"usage":{"completion_tokens":10,"total_tokens":589}}"#)
                 .unwrap();
-        let u = parse_openai_usage(&v);
+        let u = parse_openai_usage(&v, CacheSemantics::Inclusive);
         assert_eq!(u.input_tokens, 0);
         assert_eq!(u.output_tokens, 589);
     }
@@ -1405,17 +1762,24 @@ mod tests {
         // buffered path meters through parse_openai_usage. If they ever diverge,
         // a caller can pick the cheaper one by setting stream:true. Pin them
         // together on the exact terminal-chunk shape the live shim emits.
+        // The payload MUST carry cached_tokens, or the two semantics produce
+        // identical numbers and the loop below proves nothing.
         let usage = r#"{"prompt_tokens":29,"completion_tokens":491,
+            "prompt_tokens_details":{"cached_tokens":20},
             "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}"#;
 
         let buffered: Value = serde_json::from_str(&format!(r#"{{"usage":{usage}}}"#)).unwrap();
-        let from_buffered = parse_openai_usage(&buffered);
-
         let sse = format!(r#"data: {{"choices":[],"usage":{usage}}}"#);
-        let from_stream = usage_from_sse_data(&sse).expect("terminal chunk carries usage");
 
-        assert_eq!(from_buffered, from_stream);
-        assert_eq!(from_stream.output_tokens, 560);
+        // Parity must hold under EVERY semantics, not just the default one:
+        // the whole point is that the client's choice of path cannot change what
+        // it is charged.
+        for sem in [CacheSemantics::Inclusive, CacheSemantics::Unverified] {
+            let from_buffered = parse_openai_usage(&buffered, sem);
+            let from_stream = usage_from_sse_data(&sse, sem).expect("terminal chunk carries usage");
+            assert_eq!(from_buffered, from_stream, "paths diverged under {sem:?}");
+            assert_eq!(from_stream.output_tokens, 560);
+        }
     }
 
     #[test]

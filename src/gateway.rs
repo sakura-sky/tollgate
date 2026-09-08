@@ -335,8 +335,12 @@ impl GatewayCore {
             parsed.estimated_input_tokens
         };
         // Reserve the worst case, floored to 1 micro so nothing meters as zero.
+        // The prompt leg is reserved at the most expensive rate that could apply
+        // to it, since we cannot know before forwarding how the prompt will split
+        // across fresh, cache-read and cache-write tokens.
+        let reserve_profile = provider.prompt_reserve_profile();
         let reserve = price
-            .cost_micros(Usage::new(input_tokens, parsed.max_output_tokens))
+            .reserve_micros(input_tokens, parsed.max_output_tokens, reserve_profile)
             .max(1);
         let ctx = RequestCtx {
             key_id: &key_id,
@@ -409,14 +413,17 @@ impl GatewayCore {
         // Charge the reservation instead: bounded, already admitted, and it
         // keeps the never-under-charge invariant. The real counts go to the log,
         // and a zeroed Usage goes to the ledger so the numbers stay summable.
-        let (usage_for_ledger, actual, decision) = if resp.usage.is_implausible() {
+        let (usage_for_ledger, actual, decision) = if resp.usage.is_untrustworthy() {
             tracing::error!(
                 provider = provider_id,
                 model = %parsed.model,
                 input_tokens = resp.usage.input_tokens,
                 output_tokens = resp.usage.output_tokens,
+                cache_read_tokens = resp.usage.cache_read_tokens,
+                cache_write_tokens = resp.usage.cache_write_tokens,
+                suspect = resp.usage.suspect,
                 status = resp.status,
-                "upstream reported an implausible token count; charging the reservation"
+                "upstream usage is implausible or self-contradictory; charging the reservation"
             );
             (Usage::default(), reserve, "error")
         } else if is_success {
@@ -425,9 +432,16 @@ impl GatewayCore {
                 // charge the INPUT we reserved (the provider processed it), not
                 // the full worst-case reservation, so it can't grief a shared
                 // budget, but never zero.
+                //
+                // Priced at the same prompt rate the reservation used, not the
+                // plain input rate. On a write-capable adapter the prompt may
+                // have been cache-written at up to 2x, and this is the path that
+                // exists to prevent an under-charge, so it must not create one.
                 (
                     resp.usage,
-                    price.cost_micros(Usage::new(input_tokens, 0)).max(1),
+                    price
+                        .reserve_micros(input_tokens, 0, reserve_profile)
+                        .max(1),
                     "allowed",
                 )
             } else {
@@ -651,8 +665,14 @@ impl BudgetBackend for Budgets {
 pub struct StoredUsage {
     pub provider: String,
     pub model: String,
+    /// FRESH prompt tokens only; cached classes are carried separately.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// Every billable prompt token, so the demo console shows the same series
+    /// the production console does instead of a fresh-only count beside a cost.
+    pub total_prompt_tokens: u64,
     #[serde(rename = "cost", serialize_with = "serialize_cost")]
     pub cost_micros: i64,
     #[serde(rename = "overhead_us")]
@@ -697,6 +717,9 @@ impl UsageSink for MemUsageSink {
                 model: event.model.to_owned(),
                 input_tokens: event.usage.input_tokens,
                 output_tokens: event.usage.output_tokens,
+                cache_read_tokens: event.usage.cache_read_tokens,
+                cache_write_tokens: event.usage.cache_write_tokens,
+                total_prompt_tokens: event.usage.total_prompt_tokens(),
                 cost_micros: event.cost_micros,
                 overhead_micros: event.overhead_micros,
                 decision: event.decision.to_owned(),

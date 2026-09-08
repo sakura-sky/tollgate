@@ -42,7 +42,7 @@ use crate::gateway::{
 };
 use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
 use crate::provider::{MockProvider, Provider, ProviderError};
-use crate::providers::{OpenAiProvider, stream_requested, usage_from_sse_data};
+use crate::providers::{CacheSemantics, OpenAiProvider, stream_requested, usage_from_sse_data};
 use crate::routes::health;
 
 /// Cap the SSE line-reassembly buffer so an upstream that never emits a newline
@@ -97,13 +97,59 @@ impl CoreParts {
     }
 }
 
+/// Refuse to serve against a database that is behind this binary.
+///
+/// Migrations are applied by an explicit `admin migrate`, so a deploy can easily
+/// start a new binary against an old schema. That failure is silent and
+/// dangerous rather than loud: the usage sink is best-effort and logs-and-drops
+/// on error, so every ledger row would vanish while Valkey counters kept
+/// enforcing and everything looked healthy. A later cache flush then rebuilds
+/// those counters from an under-counted ledger and permits overspend.
+///
+/// Fail closed, like every other unknown in this system.
+async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
+    // A brand new database has no migrations table at all, which is simply
+    // "nothing applied" rather than an error worth surfacing differently.
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let missing: Vec<String> = crate::db::MIGRATOR
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .map(|m| format!("{} ({})", m.version, m.description))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "database schema is behind this binary; {} migration(s) not applied: {}. \
+             Run `tollgate admin migrate` before starting. Refusing to serve: the usage \
+             ledger would silently fail to record spend against an older schema.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     let db = crate::db::build_pool(&cfg.database).await?;
+    ensure_schema_current(&db).await?;
     let redis = build_redis(&cfg.redis.url).await?;
+
+    // Fail closed at boot on a fallback multiple that would price an unpriced
+    // cache class below the model's own input rate. That is the same fail-open
+    // the nullable rate columns exist to prevent, just moved into config.
+    let cache_fallback = cfg.billing.cache_rate_fallback();
+    cache_fallback
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
 
     // Load budget config and prices from Postgres into the core.
     let budgets = load_budgets(&db).await.context("loading budgets")?;
-    let prices = load_prices(&db).await.context("loading model prices")?;
+    let prices = load_prices(&db, cache_fallback)
+        .await
+        .context("loading model prices")?;
     tracing::info!(
         budgets = budgets.len(),
         priced_models = prices.len(),
@@ -271,6 +317,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             core.clone(),
             budgets_view.clone(),
             cfg.reload.interval,
+            cache_fallback,
         );
         tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
     }
@@ -305,6 +352,7 @@ fn spawn_reload_task(
     core: Arc<ArcSwap<GatewayCore>>,
     budgets_view: Arc<ArcSwap<Vec<Budget>>>,
     interval: Duration,
+    cache_fallback: crate::pricing::CacheRateFallback,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -318,7 +366,7 @@ fn spawn_reload_task(
                     continue;
                 }
             };
-            let prices = match load_prices(&db).await {
+            let prices = match load_prices(&db, cache_fallback).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "config reload: prices query failed; keeping current");
@@ -493,11 +541,15 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     // Reserve the worst case (estimated input + capped output), floored to 1 micro
     // so nothing meters as zero. build_payload pins the outbound max_tokens to the
     // same cap, so the upstream cannot generate past what we reserved.
+    // Uses the same helper as the buffered path in gateway::evaluate, so the two
+    // reservations cannot drift apart. The OpenAI adapter cannot report cache
+    // writes, so the prompt leg does not carry the write rate here.
     let reserve_micros = price
-        .cost_micros(Usage::new(
+        .reserve_micros(
             parsed.estimated_input_tokens,
             parsed.max_output_tokens,
-        ))
+            provider.prompt_reserve_profile(),
+        )
         .max(1);
     let reservation = {
         let ctx = RequestCtx {
@@ -569,7 +621,16 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     // upstream reads). The spawned task owns the guard and settles at its single
     // exit point.
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    tokio::spawn(relay_stream(upstream, tx, guard, price, reserve_micros));
+    // The SAME semantics the buffered path uses for this upstream. If these ever
+    // diverge, a caller picks the cheaper metering by setting stream:true.
+    tokio::spawn(relay_stream(
+        upstream,
+        tx,
+        guard,
+        price,
+        reserve_micros,
+        provider.cache_semantics(),
+    ));
 
     (
         StatusCode::OK,
@@ -593,6 +654,7 @@ async fn relay_stream(
     guard: StreamSettlement,
     price: ModelPrice,
     reserve_micros: i64,
+    semantics: CacheSemantics,
 ) {
     let mut stream = upstream.bytes_stream();
     let mut line_buf: Vec<u8> = Vec::new();
@@ -620,7 +682,7 @@ async fn relay_stream(
             }
             Ok(Some(Ok(chunk))) => {
                 // Scan for the terminal usage chunk (borrow before moving the bytes).
-                if let Some(u) = scan_sse_for_usage(&mut line_buf, &chunk) {
+                if let Some(u) = scan_sse_for_usage(&mut line_buf, &chunk, semantics) {
                     seen_usage = Some(u);
                 }
                 // Relay downstream, bounded by the SAME idle/duration deadline as
@@ -659,13 +721,19 @@ async fn relay_stream(
 /// than [`MAX_SSE_LINE_BUFFER`] is dropped so a newline-starved upstream cannot
 /// grow the buffer without bound (worst case: the usage chunk is missed and the
 /// caller settles the full reservation).
-fn scan_sse_for_usage(line_buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Usage> {
+///
+/// `semantics` must be the upstream's, matching what the buffered path uses.
+fn scan_sse_for_usage(
+    line_buf: &mut Vec<u8>,
+    chunk: &[u8],
+    semantics: CacheSemantics,
+) -> Option<Usage> {
     line_buf.extend_from_slice(chunk);
     let mut found = None;
     while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = line_buf.drain(..=pos).collect();
         if let Ok(s) = std::str::from_utf8(&line) {
-            if let Some(u) = usage_from_sse_data(s.trim_end()) {
+            if let Some(u) = usage_from_sse_data(s.trim_end(), semantics) {
                 found = Some(u);
             }
         }
@@ -694,11 +762,14 @@ fn stream_settlement(
         // this; the terminal usage chunk is the same untrusted input, and it
         // reaches this function through a client-selected code path, so a caller
         // could otherwise pick the unguarded one by setting stream:true.
-        (_, Some(usage)) if usage.is_implausible() => {
+        (_, Some(usage)) if usage.is_untrustworthy() => {
             tracing::error!(
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
-                "stream reported an implausible token count; charging the reservation"
+                cache_read_tokens = usage.cache_read_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                suspect = usage.suspect,
+                "stream usage is implausible or self-contradictory; charging the reservation"
             );
             (reserve_micros, Usage::default(), "error")
         }
@@ -837,8 +908,12 @@ async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> R
 struct UsageRow {
     provider: String,
     model: String,
+    /// FRESH prompt tokens only. Cached tokens are carried separately, so this
+    /// is not the whole prompt: see `total_prompt_tokens` in the JSON payload.
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     cost_micros: i64,
     gateway_micros: i64,
     decision: String,
@@ -853,10 +928,10 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
         return unauthorized();
     }
     let rows = sqlx::query_as::<_, UsageRow>(
-        "SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
-                decision \
-         FROM (SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
-                      decision, started_at \
+        "SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, \
+                cache_write_tokens, cost_micros, gateway_micros, decision \
+         FROM (SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, \
+                      cache_write_tokens, cost_micros, gateway_micros, decision, started_at \
                FROM usage_events ORDER BY started_at DESC LIMIT 100) recent \
          ORDER BY started_at ASC",
     )
@@ -881,6 +956,14 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
                 "model": r.model,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "cache_write_tokens": r.cache_write_tokens,
+                // input_tokens counts FRESH prompt tokens only, so on a cached
+                // request it can be a tiny number sitting next to a large cost.
+                // This is the figure to divide cost by.
+                "total_prompt_tokens": r.input_tokens
+                    + r.cache_read_tokens
+                    + r.cache_write_tokens,
                 "cost": format_micros(r.cost_micros),
                 "overhead_us": r.gateway_micros,
                 "decision": r.decision,
@@ -958,11 +1041,17 @@ mod tests {
         assert!(
             scan_sse_for_usage(
                 &mut buf,
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens"
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens",
+                CacheSemantics::Inclusive
             )
             .is_none()
         );
-        let u = scan_sse_for_usage(&mut buf, b"\":5,\"completion_tokens\":2}}\n").unwrap();
+        let u = scan_sse_for_usage(
+            &mut buf,
+            b"\":5,\"completion_tokens\":2}}\n",
+            CacheSemantics::Inclusive,
+        )
+        .unwrap();
         assert_eq!(u.input_tokens, 5);
         assert_eq!(u.output_tokens, 2);
         assert!(buf.is_empty(), "completed line should be drained");
@@ -971,13 +1060,16 @@ mod tests {
     #[test]
     fn scan_sse_ignores_deltas_done_and_bounds_the_buffer() {
         let mut buf = Vec::new();
-        assert!(scan_sse_for_usage(&mut buf, b"data: {\"choices\":[{\"delta\":{}}]}\n").is_none());
-        assert!(scan_sse_for_usage(&mut buf, b"data: [DONE]\n").is_none());
+        let sem = CacheSemantics::Inclusive;
+        assert!(
+            scan_sse_for_usage(&mut buf, b"data: {\"choices\":[{\"delta\":{}}]}\n", sem).is_none()
+        );
+        assert!(scan_sse_for_usage(&mut buf, b"data: [DONE]\n", sem).is_none());
         assert!(buf.is_empty());
         // A single line larger than the cap with no newline is dropped, so a
         // newline-starved upstream cannot grow the buffer without bound.
         let big = vec![b'x'; MAX_SSE_LINE_BUFFER + 10];
-        assert!(scan_sse_for_usage(&mut buf, &big).is_none());
+        assert!(scan_sse_for_usage(&mut buf, &big, sem).is_none());
         assert!(buf.is_empty(), "oversized partial line must be dropped");
     }
 

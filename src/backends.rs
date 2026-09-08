@@ -93,8 +93,8 @@ impl UsageSink for PgUsageSink {
         let res = sqlx::query(
             "INSERT INTO usage_events \
              (api_key_id, provider, model, input_tokens, output_tokens, cost_micros, \
-              gateway_micros, decision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+              gateway_micros, decision, cache_read_tokens, cache_write_tokens) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(api_key_id)
         .bind(event.provider)
@@ -104,6 +104,8 @@ impl UsageSink for PgUsageSink {
         .bind(event.cost_micros)
         .bind(event.overhead_micros)
         .bind(event.decision)
+        .bind(i64::try_from(event.usage.cache_read_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(event.usage.cache_write_tokens).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await;
         if let Err(e) = res {
@@ -300,21 +302,51 @@ pub async fn load_budgets(pool: &PgPool) -> Result<Vec<Budget>, sqlx::Error> {
 ///
 /// # Errors
 /// Returns any query error.
-pub async fn load_prices(pool: &PgPool) -> Result<PriceBook, sqlx::Error> {
+pub async fn load_prices(
+    pool: &PgPool,
+    fallback: crate::pricing::CacheRateFallback,
+) -> Result<PriceBook, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT provider, model, input_per_1m_micros, output_per_1m_micros \
+        "SELECT provider, model, input_per_1m_micros, output_per_1m_micros, \
+                cache_read_per_1m_micros, cache_write_per_1m_micros \
          FROM model_prices WHERE effective_to IS NULL",
     )
     .fetch_all(pool)
     .await?;
-    let prices = rows.into_iter().map(|row| {
-        ModelPrice::new(
-            row.get::<String, _>("provider"),
-            row.get::<String, _>("model"),
-            row.get::<i64, _>("input_per_1m_micros"),
-            row.get::<i64, _>("output_per_1m_micros"),
-        )
-    });
+    let prices: Vec<ModelPrice> = rows
+        .into_iter()
+        .map(|row| {
+            // NULL cache rates resolve to a conservative multiple of the input
+            // rate rather than to zero, so a model priced before cache rates
+            // existed can never meter cache tokens as free.
+            ModelPrice::new(
+                row.get::<String, _>("provider"),
+                row.get::<String, _>("model"),
+                row.get::<i64, _>("input_per_1m_micros"),
+                row.get::<i64, _>("output_per_1m_micros"),
+            )
+            .with_cache_rates(
+                row.get::<Option<i64>, _>("cache_read_per_1m_micros"),
+                row.get::<Option<i64>, _>("cache_write_per_1m_micros"),
+                fallback,
+            )
+        })
+        .collect();
+    // One warning per reload naming the models being over-charged on purpose,
+    // so an operator sees it here rather than in a variance review later.
+    let unpriced: Vec<String> = prices
+        .iter()
+        .filter(|p| p.cache_rates_are_fallback)
+        .map(|p| format!("{}/{}", p.provider, p.model))
+        .collect();
+    if !unpriced.is_empty() {
+        tracing::warn!(
+            models = %unpriced.join(", "),
+            "no cache rates configured; charging cache tokens at a conservative \
+             multiple of the input rate, which OVER-charges cache reads. Set real \
+             rates with `admin price set --cache-read-per-1m/--cache-write-per-1m`"
+        );
+    }
     Ok(PriceBook::from_prices(prices))
 }
 
