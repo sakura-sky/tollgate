@@ -69,6 +69,14 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// Ceiling on the tokens one leg of a single request can plausibly consume.
+///
+/// Frontier context windows are on the order of 10M tokens, so 50M is far above
+/// anything a real request can report while still leaving `u64` arithmetic
+/// nowhere near saturation. A response above this is malformed or hostile, not
+/// expensive.
+pub const MAX_PLAUSIBLE_TOKENS_PER_LEG: u64 = 50_000_000;
+
 impl Usage {
     #[must_use]
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
@@ -76,6 +84,24 @@ impl Usage {
             input_tokens,
             output_tokens,
         }
+    }
+
+    /// True when a leg exceeds [`MAX_PLAUSIBLE_TOKENS_PER_LEG`].
+    ///
+    /// Costing an implausible count is not merely wrong, it is corrupting.
+    /// `cost_micros` saturates to `i64::MAX`, the budget backend then adds that
+    /// to a counter that cannot be lowered by any code path (reconcile only
+    /// raises), and the ledger row it writes makes `SUM(cost_micros)` overflow
+    /// `bigint` on every subsequent startup reconciliation. One bad response
+    /// would wedge a deployment until the period rolled over.
+    ///
+    /// Callers MUST treat this as a metering failure and charge the reservation
+    /// rather than the computed cost. This is the guard `round_to_micros`
+    /// documents as the metering layer's responsibility.
+    #[must_use]
+    pub fn is_implausible(&self) -> bool {
+        self.input_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
+            || self.output_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
     }
 }
 
@@ -295,6 +321,30 @@ mod tests {
                 .is_none()
         );
         assert!(book.lookup("openai", "gpt-5").is_none());
+    }
+
+    #[test]
+    fn implausible_usage_is_detected_on_either_leg() {
+        // Real requests, however large, stay well under the ceiling.
+        assert!(!Usage::new(2_000_000, 100_000).is_implausible());
+        assert!(
+            !Usage::new(MAX_PLAUSIBLE_TOKENS_PER_LEG, MAX_PLAUSIBLE_TOKENS_PER_LEG)
+                .is_implausible()
+        );
+        // Either leg alone is enough to condemn the response.
+        assert!(Usage::new(MAX_PLAUSIBLE_TOKENS_PER_LEG + 1, 0).is_implausible());
+        assert!(Usage::new(0, MAX_PLAUSIBLE_TOKENS_PER_LEG + 1).is_implausible());
+        assert!(Usage::new(u64::MAX, u64::MAX).is_implausible());
+    }
+
+    #[test]
+    fn implausible_usage_is_what_would_have_saturated_the_money_path() {
+        // Demonstrates why the guard exists: costing this saturates to i64::MAX,
+        // which the budget counter can never come back down from.
+        let price = ModelPrice::new("p", "m", 3_000_000, 15_000_000);
+        let bad = Usage::new(u64::MAX, u64::MAX);
+        assert!(bad.is_implausible());
+        assert_eq!(price.cost_micros(bad), i64::MAX);
     }
 
     #[test]

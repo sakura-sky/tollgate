@@ -401,30 +401,49 @@ impl GatewayCore {
         // Settle by upstream status.
         let is_success = (200..300).contains(&resp.status);
         let metered = price.cost_micros(resp.usage);
-        let (actual, decision) = if is_success {
+        // An implausible token count is a metering FAILURE, not an expensive
+        // request. Costing it would saturate to i64::MAX, and because the budget
+        // counter can never be lowered (reconcile only raises) that would wedge
+        // the deployment until the period rolled over, while the ledger row it
+        // wrote would overflow SUM(cost_micros) on every later reconciliation.
+        // Charge the reservation instead: bounded, already admitted, and it
+        // keeps the never-under-charge invariant. The real counts go to the log,
+        // and a zeroed Usage goes to the ledger so the numbers stay summable.
+        let (usage_for_ledger, actual, decision) = if resp.usage.is_implausible() {
+            tracing::error!(
+                provider = provider_id,
+                model = %parsed.model,
+                input_tokens = resp.usage.input_tokens,
+                output_tokens = resp.usage.output_tokens,
+                status = resp.status,
+                "upstream reported an implausible token count; charging the reservation"
+            );
+            (Usage::default(), reserve, "error")
+        } else if is_success {
             if metered == 0 {
                 // 2xx with no usage reported (e.g. a safety-blocked response):
                 // charge the INPUT we reserved (the provider processed it), not
                 // the full worst-case reservation, so it can't grief a shared
                 // budget, but never zero.
                 (
+                    resp.usage,
                     price.cost_micros(Usage::new(input_tokens, 0)).max(1),
                     "allowed",
                 )
             } else {
-                (metered, "allowed")
+                (resp.usage, metered, "allowed")
             }
         } else {
             // Non-2xx: charge whatever the provider reported it billed (usually
             // zero), never the reservation; record as an error.
-            (metered, "error")
+            (resp.usage, metered, "error")
         };
         self.budgets.commit(&reservation, actual).await;
         self.record(
             &key_id,
             provider_id,
             &parsed.model,
-            resp.usage,
+            usage_for_ledger,
             actual,
             decision,
             started,
