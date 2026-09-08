@@ -5,7 +5,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches and tags are built too: a release cut from a tag other
+    # than main's tip would otherwise ship without CI ever seeing that tree.
+    branches: [main, 'release/**']
+    tags: ['v*']
   pull_request:
 
 permissions:
