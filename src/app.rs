@@ -687,6 +687,21 @@ fn stream_settlement(
     reserve_micros: i64,
 ) -> (i64, Usage, &'static str) {
     match (clean, seen) {
+        // An implausible count is a metering FAILURE, not an expensive stream.
+        // Costing it saturates to i64::MAX, which the budget counter has no path
+        // back down from, and the ledger row it writes overflows SUM(cost_micros)
+        // on every later startup reconcile. The buffered path already guards
+        // this; the terminal usage chunk is the same untrusted input, and it
+        // reaches this function through a client-selected code path, so a caller
+        // could otherwise pick the unguarded one by setting stream:true.
+        (_, Some(usage)) if usage.is_implausible() => {
+            tracing::error!(
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                "stream reported an implausible token count; charging the reservation"
+            );
+            (reserve_micros, Usage::default(), "error")
+        }
         (true, Some(usage)) => (price.cost_micros(usage).max(1), usage, "allowed"),
         (true, None) => (reserve_micros, Usage::default(), "allowed"),
         (false, usage) => (reserve_micros, usage.unwrap_or_default(), "error"),
@@ -988,5 +1003,31 @@ mod tests {
             stream_settlement(false, Some(Usage::new(10, 5)), &price, reserve);
         assert_eq!(actual, reserve);
         assert_eq!(decision, "error");
+    }
+
+    #[test]
+    fn stream_settlement_rejects_an_implausible_terminal_chunk() {
+        // The buffered path guards this in gateway::evaluate. The streaming path
+        // is selected by the CLIENT (stream:true), so leaving it unguarded would
+        // let a caller pick the code path where a hostile terminal chunk
+        // saturates the cost to i64::MAX and pins a budget counter that nothing
+        // can lower. Charge the reservation and record an error instead.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let reserve = 999;
+        let absurd = Usage::new(1, u64::MAX);
+        assert!(absurd.is_implausible());
+
+        let (actual, usage, decision) = stream_settlement(true, Some(absurd), &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "error");
+        // The ledger must not carry the absurd counts either: a row holding
+        // i64::MAX makes SUM(cost_micros) overflow on later reconciliation.
+        assert_eq!(usage, Usage::default());
+
+        // A clean stream just under the ceiling still settles normally.
+        let ok = Usage::new(1, crate::pricing::MAX_PLAUSIBLE_TOKENS_PER_LEG);
+        assert!(!ok.is_implausible());
+        let (_actual, _u, decision) = stream_settlement(true, Some(ok), &price, reserve);
+        assert_eq!(decision, "allowed");
     }
 }

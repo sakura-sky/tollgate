@@ -552,6 +552,25 @@ fn openai_effective_max(v: &Value) -> u64 {
         .unwrap_or(OPENAI_DEFAULT_MAX_OUTPUT)
 }
 
+/// Normalise an OpenAI-protocol usage object into [`Usage`].
+///
+/// The output leg is NOT simply `completion_tokens`. The same field name means
+/// different things on two upstreams that both speak this protocol: OpenAI's own
+/// API documents `completion_tokens` as INCLUDING reasoning tokens, while
+/// Vertex's OpenAI-compatible shim EXCLUDES them. Verified against live shim
+/// responses, where `491 completion + 69 reasoning = 560 = total - prompt`, and
+/// where a response whose output was entirely reasoning omitted
+/// `completion_tokens` altogether. Reading the field alone therefore
+/// under-charges every reasoning request on the shim, sometimes to zero, and
+/// reasoning bills at the full output rate on both.
+///
+/// `total_tokens` is the one figure both dialects agree on, so the residual
+/// `total - prompt` recovers the true output leg without this parser having to
+/// know which upstream it is talking to. Where `total_tokens` is missing we add
+/// reasoning explicitly instead: exact on an excluding upstream, an over-charge
+/// on an including one, which is the only direction we are allowed to be wrong
+/// in. The final `max` against `completion_tokens` guards a self-contradictory
+/// response whose total is smaller than its parts.
 fn parse_openai_usage(v: &Value) -> Usage {
     let u = v.get("usage");
     let get = |k: &str| {
@@ -559,7 +578,20 @@ fn parse_openai_usage(v: &Value) -> Usage {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
-    Usage::new(get("prompt_tokens"), get("completion_tokens"))
+    let prompt = get("prompt_tokens");
+    let completion = get("completion_tokens");
+    let reasoning = u
+        .and_then(|u| u.get("completion_tokens_details"))
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total = get("total_tokens");
+    let candidate = if total > 0 {
+        total.saturating_sub(prompt)
+    } else {
+        completion.saturating_add(reasoning)
+    };
+    Usage::new(prompt, completion.max(candidate))
 }
 
 /// OpenAI-compatible upstream adapter. Fronts any Chat Completions endpoint that
@@ -1256,6 +1288,134 @@ mod tests {
         let u = parse_vertex_usage(&v);
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
+    }
+
+    #[test]
+    fn openai_output_recovers_reasoning_on_an_excluding_upstream() {
+        // Live Vertex shim shape: completion_tokens EXCLUDES reasoning, so the
+        // field alone under-charges by the reasoning count.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":29,"completion_tokens":491,
+                "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v);
+        assert_eq!(u.input_tokens, 29);
+        assert_eq!(u.output_tokens, 560);
+    }
+
+    #[test]
+    fn openai_output_is_not_double_counted_on_an_including_upstream() {
+        // OpenAI's own shape: completion_tokens ALREADY includes reasoning.
+        // Naively adding reasoning would over-charge by 69.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":29,"completion_tokens":560,
+                "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v);
+        assert_eq!(u.output_tokens, 560);
+    }
+
+    #[test]
+    fn openai_output_when_everything_was_reasoning() {
+        // Observed live: an all-reasoning response omits completion_tokens
+        // entirely. Reading the field alone meters ZERO output.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":60008,
+                "completion_tokens_details":{"reasoning_tokens":4},"total_tokens":60012}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v);
+        assert_eq!(u.input_tokens, 60_008);
+        assert_eq!(u.output_tokens, 4);
+    }
+
+    #[test]
+    fn openai_without_total_falls_back_to_adding_reasoning() {
+        // No total to reconcile against, so add reasoning explicitly: exact on an
+        // excluding upstream, an over-charge on an including one.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":100,
+                "completion_tokens_details":{"reasoning_tokens":40}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_openai_usage(&v).output_tokens, 140);
+    }
+
+    #[test]
+    fn openai_contradictory_total_never_lowers_the_output_leg() {
+        // total < prompt + completion is self-contradictory; the reported
+        // completion must still be charged in full.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":10}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_openai_usage(&v).output_tokens, 50);
+    }
+
+    #[test]
+    fn openai_mistyped_usage_fields_meter_zero_by_design() {
+        // serde_json's as_u64 rejects floats, strings and negatives, so any
+        // present-but-mistyped field reads as absent. Some OpenAI-compatible
+        // shims have shipped float usage fields, so pin this deliberately rather
+        // than letting it be an accident.
+        //
+        // Mistyped completion, sound total: the residual rescues it.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":29,"completion_tokens":491.0,"total_tokens":589}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_openai_usage(&v).output_tokens, 560);
+
+        // Mistyped total, sound completion: falls back and still charges it.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":29,"completion_tokens":491,"total_tokens":"589"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_openai_usage(&v).output_tokens, 491);
+
+        // Everything mistyped: meters zero. The buffered path then floors to the
+        // reserved input cost, and the streaming path charges the reservation
+        // because a zero-cost settle would otherwise bill a whole stream at one
+        // micro. Neither silently bills zero.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":-29,"completion_tokens":491.5,"total_tokens":"589"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_openai_usage(&v), Usage::default());
+    }
+
+    #[test]
+    fn openai_missing_prompt_tokens_bills_the_whole_total_as_output() {
+        // With no prompt_tokens to subtract, the residual attributes everything
+        // to the output leg. That over-charges on any sane price book, where the
+        // output rate is at least the input rate, and never under-charges.
+        let v: Value =
+            serde_json::from_str(r#"{"usage":{"completion_tokens":10,"total_tokens":589}}"#)
+                .unwrap();
+        let u = parse_openai_usage(&v);
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 589);
+    }
+
+    #[test]
+    fn buffered_and_streaming_agree_on_the_same_usage_payload() {
+        // The streaming path meters through usage_from_sse_data while the
+        // buffered path meters through parse_openai_usage. If they ever diverge,
+        // a caller can pick the cheaper one by setting stream:true. Pin them
+        // together on the exact terminal-chunk shape the live shim emits.
+        let usage = r#"{"prompt_tokens":29,"completion_tokens":491,
+            "completion_tokens_details":{"reasoning_tokens":69},"total_tokens":589}"#;
+
+        let buffered: Value = serde_json::from_str(&format!(r#"{{"usage":{usage}}}"#)).unwrap();
+        let from_buffered = parse_openai_usage(&buffered);
+
+        let sse = format!(r#"data: {{"choices":[],"usage":{usage}}}"#);
+        let from_stream = usage_from_sse_data(&sse).expect("terminal chunk carries usage");
+
+        assert_eq!(from_buffered, from_stream);
+        assert_eq!(from_stream.output_tokens, 560);
     }
 
     #[test]
