@@ -54,6 +54,7 @@ pub trait KeyStore: Send + Sync {
 /// Why a reservation failed: a real budget denial, or a backend (infra) error.
 /// These map to different HTTP statuses (402 vs 503) and the backend error text
 /// is never shown to the client.
+#[derive(Debug)]
 pub enum ReserveError {
     Denied(BudgetDenied),
     Backend(String),

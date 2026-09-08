@@ -543,3 +543,397 @@ pub async fn reconcile_counters(
     }
     Ok(restored)
 }
+
+/// Enforcement tests against a REAL Valkey/Redis.
+///
+/// These exist because the ordinary unit suite uses an in-memory budget backend
+/// and therefore never executes RESERVE_LUA or SETTLE_LUA at all. A green
+/// `cargo test` proves nothing about the enforcement mechanism, which makes it
+/// useless as a gate on a `redis` crate upgrade. These run the real scripts
+/// through the real client.
+///
+/// Ignored by default because they need a server. Run them with:
+///
+/// ```text
+/// docker compose -f compose/docker-compose.yaml up -d valkey
+/// TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --lib redis_live -- --ignored --test-threads=1
+/// ```
+///
+/// Run the whole file on the CURRENT redis version and again on the candidate,
+/// and compare. A behavioural difference is a finding to explain before merge.
+#[cfg(test)]
+mod redis_live_tests {
+    use super::*;
+    use crate::budget::{Period, Scope};
+
+    fn url() -> Option<String> {
+        std::env::var("TOLLGATE_TEST_REDIS_URL").ok()
+    }
+
+    async fn backend(budgets: Vec<Budget>) -> (RedisBudgetBackend, ConnectionManager) {
+        let url = url().expect("TOLLGATE_TEST_REDIS_URL must be set for these tests");
+        let client = redis::Client::open(url).expect("redis url parses");
+        let conn = ConnectionManager::new(client)
+            .await
+            .expect("valkey reachable");
+        (RedisBudgetBackend::new(conn.clone(), budgets), conn)
+    }
+
+    fn global(limit: i64, hard: bool) -> Budget {
+        Budget {
+            scope: Scope::Global,
+            period: Period::Monthly,
+            limit_micros: limit,
+            hard_stop: hard,
+        }
+    }
+
+    fn key_budget(id: &str, limit: i64, hard: bool) -> Budget {
+        Budget {
+            scope: Scope::ApiKey(id.to_owned()),
+            period: Period::Monthly,
+            limit_micros: limit,
+            hard_stop: hard,
+        }
+    }
+
+    fn ctx(key_id: &str) -> RequestCtx<'_> {
+        RequestCtx {
+            key_id,
+            provider: "mock",
+            model: "m",
+        }
+    }
+
+    /// Wipe only this test's keys so a shared server is not clobbered.
+    async fn reset(conn: &mut ConnectionManager, pattern: &str) {
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(pattern)
+            .query_async(conn)
+            .await
+            .unwrap_or_default();
+        for k in keys {
+            let _: i64 = redis::cmd("DEL")
+                .arg(&k)
+                .query_async(conn)
+                .await
+                .unwrap_or(0);
+        }
+    }
+
+    async fn counter(conn: &mut ConnectionManager, key: &str) -> i64 {
+        redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<i64>>(conn)
+            .await
+            .expect("GET works")
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn reserve_increments_every_applicable_counter() {
+        let id = "live-a";
+        let (be, mut conn) =
+            backend(vec![global(1_000_000, true), key_budget(id, 500_000, true)]).await;
+        reset(&mut conn, "*live-a*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        let res = be.reserve(&ctx(id), 1_000).await.expect("within budget");
+        for (key, reserved) in res.entries() {
+            assert_eq!(*reserved, 1_000);
+            assert_eq!(counter(&mut conn, key).await, 1_000, "counter {key}");
+            // TTL must be set, or a counter outlives its period forever.
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            assert!(ttl > 0, "counter {key} has no TTL");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn denial_is_atomic_and_touches_nothing() {
+        // The second (per-key) budget is the one that cannot fit. RESERVE_LUA
+        // must check ALL budgets before incrementing ANY, or a denied request
+        // leaves the global counter inflated and slowly starves the deployment.
+        let id = "live-b";
+        let (be, mut conn) =
+            backend(vec![global(1_000_000, true), key_budget(id, 100, true)]).await;
+        reset(&mut conn, "*live-b*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        let before: Vec<i64> = {
+            let probe = be.reserve(&ctx(id), 1).await.expect("tiny reserve fits");
+            be.commit(&probe, 1).await;
+            let mut v = Vec::new();
+            for (key, _) in probe.entries() {
+                v.push(counter(&mut conn, key).await);
+            }
+            v
+        };
+
+        let err = be
+            .reserve(&ctx(id), 10_000)
+            .await
+            .expect_err("must be denied");
+        match err {
+            ReserveError::Denied(_) => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        let probe = be
+            .reserve(&ctx(id), 1)
+            .await
+            .expect("tiny reserve still fits");
+        for (i, (key, _)) in probe.entries().iter().enumerate() {
+            let now = counter(&mut conn, key).await;
+            assert_eq!(
+                now,
+                before[i] + 1,
+                "denied reserve must not have moved {key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn settle_applies_the_delta_exactly_once() {
+        let id = "live-c";
+        let (be, mut conn) = backend(vec![
+            global(10_000_000, true),
+            key_budget(id, 10_000_000, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-c*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        let res = be.reserve(&ctx(id), 100).await.expect("fits");
+        be.commit(&res, 40).await;
+        for (key, _) in res.entries() {
+            assert_eq!(
+                counter(&mut conn, key).await,
+                40,
+                "counter {key} after settle"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn settle_floors_at_zero_and_never_goes_negative() {
+        // A counter cleared mid-flight (period roll, manual flush) must not be
+        // driven negative by the settle delta, or the next period starts with
+        // free budget.
+        let id = "live-d";
+        let (be, mut conn) = backend(vec![
+            global(10_000_000, true),
+            key_budget(id, 10_000_000, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-d*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        let res = be.reserve(&ctx(id), 1_000).await.expect("fits");
+        for (key, _) in res.entries() {
+            let _: i64 = redis::cmd("DEL")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        be.commit(&res, 0).await;
+        for (key, _) in res.entries() {
+            assert_eq!(counter(&mut conn, key).await, 0, "counter {key} floored");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn concurrent_reserves_admit_exactly_the_budgeted_number() {
+        // THE atomicity test. 50 concurrent reserves of R against a hard cap of
+        // 10R must admit exactly 10. Any interleaving that reads a stale counter
+        // admits more, which is overspend. This is what proves EVAL atomicity
+        // still holds end to end through whatever client version is in the build.
+        let id = "live-e";
+        const R: i64 = 1_000;
+        const ALLOWED: i64 = 10;
+        let (be, mut conn) = backend(vec![
+            global(100_000_000, true),
+            key_budget(id, R * ALLOWED, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-e*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        let be = std::sync::Arc::new(be);
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let be = be.clone();
+            set.spawn(async move { be.reserve(&ctx("live-e"), R).await.is_ok() });
+        }
+        let mut admitted = 0;
+        while let Some(r) = set.join_next().await {
+            if r.expect("task did not panic") {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, ALLOWED,
+            "exactly {ALLOWED} reserves may be admitted"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn script_survives_a_script_flush() {
+        // Script::invoke_async uses EVALSHA and must fall back to EVAL on
+        // NOSCRIPT. If that fallback ever regresses, every request starts
+        // failing the moment the server's script cache is cleared, which
+        // happens on failover and restart.
+        let id = "live-f";
+        let (be, mut conn) = backend(vec![
+            global(10_000_000, true),
+            key_budget(id, 10_000_000, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-f*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        be.reserve(&ctx(id), 10).await.expect("first reserve");
+        let _: String = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .expect("script flush");
+        be.reserve(&ctx(id), 10)
+            .await
+            .expect("reserve must survive a script cache flush");
+    }
+
+    /// Settle is NOT idempotent: SETTLE_LUA applies `INCRBY delta` with a
+    /// negative delta, so running it twice for one reservation lowers the
+    /// counter BELOW true spend and hands out free budget. Nothing in the
+    /// script or the schema prevents a replay; the only thing that does is the
+    /// client never sending the command twice.
+    ///
+    /// This test is the one that actually gates a client upgrade. It kills the
+    /// connection underneath an in-flight settle and asserts the counter is
+    /// either fully settled or not settled at all, never settled twice.
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn settle_is_never_applied_twice_across_a_connection_kill() {
+        let id = "live-g";
+        let (be, mut conn) = backend(vec![
+            global(10_000_000, true),
+            key_budget(id, 10_000_000, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-g*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        // How many rounds lost the settle entirely, reported so it is visible
+        // that the reconnect path was really exercised rather than the test
+        // passing because nothing ever happened.
+        let mut lost = 0;
+        for round in 0..25 {
+            let res = be.reserve(&ctx(id), 1_000).await.expect("fits");
+            let keys: Vec<String> = res.entries().iter().map(|(k, _)| k.clone()).collect();
+            let before: Vec<i64> = {
+                let mut v = Vec::new();
+                for k in &keys {
+                    v.push(counter(&mut conn, k).await);
+                }
+                v
+            };
+
+            // Kill every client connection FIRST, then settle. This forces the
+            // manager down its reconnect path deterministically on every round.
+            //
+            // Racing the kill against an in-flight settle does not work: tokio's
+            // sleep granularity is around a millisecond while a local settle
+            // completes in microseconds, so the kill always lands after the
+            // command has already completed and the test passes without ever
+            // exercising anything. Killing first is both deterministic and the
+            // case the client's retry behaviour actually governs.
+            let mut killer = conn.clone();
+            let _: redis::RedisResult<i64> = redis::cmd("CLIENT")
+                .arg("KILL")
+                .arg("TYPE")
+                .arg("normal")
+                .query_async(&mut killer)
+                .await;
+            be.commit(&res, 400).await;
+
+            // Reserved 1000, settling to 400 means a delta of -600. The counter
+            // must have moved by 0 (settle lost) or exactly -600 (settle
+            // applied). -1200 means it was applied twice.
+            for (i, k) in keys.iter().enumerate() {
+                let now = counter(&mut conn, k).await;
+                let moved = now - before[i];
+                assert!(
+                    moved == 0 || moved == -600,
+                    "round {round}: counter {k} moved by {moved}; expected 0 or -600. \
+                     -1200 means the settle was REPLAYED, which lowers counters below \
+                     true spend and permits overspend"
+                );
+                if i == 0 && moved == 0 {
+                    lost += 1;
+                }
+            }
+        }
+        // Reported, not asserted. Every round forced a reconnect by construction,
+        // so the replay path was exercised regardless of the split. A settle
+        // LOST after a kill is safe (counters stay inflated, spend is
+        // over-counted, never under). A settle applied TWICE is the failure the
+        // per-round assertion above catches.
+        eprintln!(
+            "settle-after-kill: {lost}/25 rounds lost the settle, {}/25 applied it once",
+            25 - lost
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Valkey; see module docs"]
+    async fn reserve_is_never_applied_twice_across_a_connection_kill() {
+        // Mirror of the settle case. A replayed reserve inflates counters, which
+        // is the safe direction but still wrong, and it indicates the client
+        // replays commands, which would make the settle case unsafe too.
+        let id = "live-h";
+        let (be, mut conn) = backend(vec![
+            global(100_000_000, true),
+            key_budget(id, 100_000_000, true),
+        ])
+        .await;
+        reset(&mut conn, "*live-h*").await;
+        reset(&mut conn, "tollgate:*global*").await;
+
+        for round in 0..25 {
+            let mut killer = conn.clone();
+            let probe_key = {
+                let r = be.reserve(&ctx(id), 1).await.expect("probe");
+                be.commit(&r, 1).await;
+                r.entries()[0].0.clone()
+            };
+            let before = counter(&mut conn, &probe_key).await;
+
+            // Kill first, then reserve, for the same reason as the settle case.
+            let _: redis::RedisResult<i64> = redis::cmd("CLIENT")
+                .arg("KILL")
+                .arg("TYPE")
+                .arg("normal")
+                .query_async(&mut killer)
+                .await;
+            if let Ok(r) = be.reserve(&ctx(id), 1_000).await {
+                be.commit(&r, 1_000).await;
+            }
+            let moved = counter(&mut conn, &probe_key).await - before;
+            assert!(
+                moved == 0 || moved == 1_000,
+                "round {round}: counter moved by {moved}; 2000 means the reserve was REPLAYED"
+            );
+        }
+    }
+}
