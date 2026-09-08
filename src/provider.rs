@@ -26,6 +26,11 @@ pub struct ParsedRequest {
     /// The maximum output the request may produce (used to reserve the worst
     /// case so a request cannot overshoot its budget).
     pub max_output_tokens: u64,
+    /// Whether THIS request could cause a cache write, which bills above the
+    /// input rate. Adapters that can report writes at all set this from the
+    /// request body, so a request that cannot write is not reserved as if it
+    /// could. Defaults false; erring toward true only over-reserves.
+    pub may_cache_write: bool,
 }
 
 /// A provider response: upstream status, JSON body to return, and parsed usage.
@@ -100,13 +105,21 @@ pub trait Provider: Send + Sync {
         false
     }
 
-    /// The prompt-side worst case this adapter can produce, used to size the
-    /// reservation. Defaults to the cheapest assumption; adapters that can bill
-    /// a prompt token on more than one leg MUST say so, or a request will settle
-    /// above what it was admitted for.
-    fn prompt_reserve_profile(&self) -> crate::pricing::PromptReserveProfile {
+    /// The prompt-side worst case THIS request can produce, used to size the
+    /// reservation.
+    ///
+    /// The default ANDs the adapter's capability with the per-request flag, so a
+    /// request that cannot cause a cache write is not reserved as though it
+    /// could. Keeping the conjunction here rather than in each adapter means a
+    /// future write-capable adapter has to actively override to get it wrong.
+    /// Adapters that can bill a prompt token on more than one leg must override
+    /// and preserve that conjunction.
+    fn prompt_reserve_profile(
+        &self,
+        parsed: &ParsedRequest,
+    ) -> crate::pricing::PromptReserveProfile {
         crate::pricing::PromptReserveProfile {
-            can_cache_write: self.can_report_cache_write(),
+            can_cache_write: self.can_report_cache_write() && parsed.may_cache_write,
             may_double_bill_prompt: false,
         }
     }
@@ -156,6 +169,7 @@ impl Provider for MockProvider {
             model: b.model,
             estimated_input_tokens: Self::estimate_input_tokens(&b.prompt),
             max_output_tokens: b.max_output_tokens,
+            may_cache_write: false,
         })
     }
 

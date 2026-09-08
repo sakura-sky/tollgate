@@ -338,7 +338,7 @@ impl GatewayCore {
         // The prompt leg is reserved at the most expensive rate that could apply
         // to it, since we cannot know before forwarding how the prompt will split
         // across fresh, cache-read and cache-write tokens.
-        let reserve_profile = provider.prompt_reserve_profile();
+        let reserve_profile = provider.prompt_reserve_profile(&parsed);
         let reserve = price
             .reserve_micros(input_tokens, parsed.max_output_tokens, reserve_profile)
             .max(1);
@@ -402,6 +402,27 @@ impl GatewayCore {
                 return Outcome::Upstream(e.to_string());
             }
         };
+        // Tripwire: a cache write on a request we classified as unable to make
+        // one means the classifier was evaded, or the provider started writing
+        // caches without an explicit breakpoint. The write leg is still billed
+        // correctly by cost_micros, so the ledger stays right; what is wrong is
+        // that the reservation deliberately omitted the write premium, so this
+        // request can settle above it.
+        //
+        // Deliberately NOT routed through `suspect`: that charges the
+        // reservation, and this reservation is precisely the one that lacked the
+        // premium, so doing so would turn a bounded overshoot into an
+        // under-charge. Never-under-charge outranks never-overspend.
+        if resp.usage.cache_write_tokens > 0 && !reserve_profile.can_cache_write {
+            tracing::error!(
+                provider = provider_id,
+                model = %parsed.model,
+                cache_write_tokens = resp.usage.cache_write_tokens,
+                "upstream reported a cache WRITE on a request classified as unable to \
+                 produce one; billed correctly but reserved without the write premium, \
+                 so this request may settle above its reservation"
+            );
+        }
         // Settle by upstream status.
         let is_success = (200..300).contains(&resp.status);
         let metered = price.cost_micros(resp.usage);

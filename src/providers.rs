@@ -97,6 +97,119 @@ fn value_has_media_ref(v: &Value) -> bool {
     }
 }
 
+/// Reject request fields that change what a token COSTS without changing how
+/// many tokens are reported.
+///
+/// A price is one input rate and one output rate per model, so anything that
+/// silently re-rates the same token count, or adds a per-call fee that appears
+/// in no token field at all, is metered wrong and always in the cheap direction.
+/// Audio output is the clearest case: it bills several times the text output
+/// rate while sitting inside `completion_tokens`, and the caller selects it.
+///
+/// Fail closed until each is priced, which is the same posture external media
+/// already gets. Detecting these in the RESPONSE instead would be too late: the
+/// reservation was computed at the text rate, so falling back to charging it
+/// would still under-charge by the whole multiplier.
+fn reject_rate_switches(v: &Value) -> Result<(), ProviderError> {
+    let refuse = |what: &str, why: &str| {
+        Err(ProviderError::BadRequest(format!(
+            "{what} is not supported: {why}. Tollgate prices one input rate and one \
+             output rate per model, so it cannot meter this correctly yet and refuses \
+             rather than under-charging."
+        )))
+    };
+
+    // Audio output bills several times the text output rate, inside the same
+    // completion_tokens field. `modalities` absent or exactly ["text"] is fine.
+    if let Some(m) = v.get("modalities") {
+        let text_only = m
+            .as_array()
+            .is_some_and(|a| a.iter().all(|x| x.as_str() == Some("text")));
+        if !text_only {
+            return refuse(
+                "non-text output modalities",
+                "audio output is billed at a different rate from text",
+            );
+        }
+    }
+    if v.get("audio").is_some_and(|a| !a.is_null()) {
+        return refuse(
+            "the audio output config",
+            "audio output is billed at a different rate from text",
+        );
+    }
+    // Predicted Outputs: rejected prediction tokens bill at the output rate and
+    // are not reliably visible in completion_tokens across upstreams.
+    if v.get("prediction").is_some_and(|p| !p.is_null()) {
+        return refuse(
+            "prediction (Predicted Outputs)",
+            "rejected prediction tokens are billed but not reliably reported",
+        );
+    }
+    // Per-call fee in dollars, present in no token field whatsoever.
+    if v.get("web_search_options").is_some_and(|w| !w.is_null()) {
+        return refuse(
+            "web_search_options",
+            "server-side search is billed per call, which no token count reports",
+        );
+    }
+    // Priority tiers bill more per token at identical token counts.
+    if let Some(t) = v.get("service_tier").and_then(Value::as_str) {
+        if !matches!(t, "auto" | "default") {
+            return refuse(
+                "an explicit service_tier",
+                "non-default tiers change the per-token rate",
+            );
+        }
+    }
+    // Hosted/server-side tools carry per-call fees. Client-executed function
+    // tools are token-only and stay allowed.
+    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        for t in tools {
+            if let Some(ty) = t.get("type").and_then(Value::as_str) {
+                if !ty.eq_ignore_ascii_case("function") {
+                    return refuse(
+                        "server-side tools",
+                        "hosted tools are billed per call, which no token count reports",
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the body opts any block into prompt caching, i.e. carries a
+/// `cache_control` key anywhere.
+///
+/// Used to decide whether a request could produce a cache WRITE, which bills
+/// above the input rate and so has to be reserved for. A request with no
+/// breakpoint structurally cannot write, and reserving it at the write rate
+/// would inflate every request on the provider for nothing.
+///
+/// Walks the PARSED JSON for the same reason [`references_external_media`] does:
+/// `"cache_control"` is legal JSON that decodes to the real key, so a raw
+/// substring scan is evadable and would UNDER-reserve, which is the direction
+/// that breaks a hard cap.
+///
+/// Matching the key anywhere rather than only in its legal positions is
+/// deliberate. A superset match can only over-reserve, and it does not rot every
+/// time the provider adds a block type that accepts a breakpoint.
+#[must_use]
+pub fn requests_prompt_cache_write(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|v| value_has_cache_control(&v))
+}
+
+fn value_has_cache_control(v: &Value) -> bool {
+    match v {
+        Value::Object(map) => map.iter().any(|(k, val)| {
+            k.eq_ignore_ascii_case("cache_control") || value_has_cache_control(val)
+        }),
+        Value::Array(items) => items.iter().any(value_has_cache_control),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic
 // ---------------------------------------------------------------------------
@@ -199,10 +312,31 @@ impl Provider for AnthropicProvider {
             .get("max_tokens")
             .and_then(Value::as_u64)
             .ok_or_else(|| ProviderError::BadRequest("missing 'max_tokens'".to_owned()))?;
+        // Server-side tools (web search, code execution) carry per-call or
+        // per-session fees that appear in no token count, so they cannot be
+        // metered from usage at all. Client-executed custom tools are token-only
+        // and stay allowed.
+        if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+            for t in tools {
+                if let Some(ty) = t.get("type").and_then(Value::as_str) {
+                    if !ty.eq_ignore_ascii_case("custom") {
+                        return Err(ProviderError::BadRequest(
+                            "server-side tools are not supported: they are billed per call or \
+                             per session, which no token count reports, so Tollgate would \
+                             under-charge. Client-executed custom tools are supported."
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
         Ok(ParsedRequest {
             model,
             estimated_input_tokens: estimate_input_tokens(body),
             max_output_tokens,
+            // Only a request carrying a cache breakpoint can produce a cache
+            // write, so only that request is reserved at the write rate.
+            may_cache_write: value_has_cache_control(&v),
         })
     }
 
@@ -502,6 +636,9 @@ impl Provider for VertexProvider {
             model,
             estimated_input_tokens: estimate_input_tokens(body),
             max_output_tokens,
+            // Vertex cache creation is a separate cachedContents call that never
+            // transits the proxy, so a generateContent request cannot write.
+            may_cache_write: false,
         })
     }
 
@@ -711,8 +848,43 @@ fn parse_openai_usage(v: &Value, semantics: CacheSemantics) -> Usage {
         // ambiguous the usage is marked suspect above and never costed at all.
         _ => prompt,
     };
+    // Tripwire for billing dimensions that do not exist yet.
+    //
+    // Every field below is a token class billed at a rate this price book cannot
+    // express. They are all rejected at parse time today, so seeing one here
+    // means either the reject list was evaded or the upstream shipped a class we
+    // have never heard of. Either way the numbers cannot be costed correctly, so
+    // treat it as a metering failure rather than guessing.
+    //
+    // This is a BACKSTOP, not the defence. Charging the reservation still
+    // under-charges when the reservation itself was priced at the wrong rate, so
+    // anything that fires here belongs on the parse-time reject list, not here.
+    let unpriced_class = [
+        "audio_tokens",
+        "accepted_prediction_tokens",
+        "rejected_prediction_tokens",
+    ]
+    .iter()
+    .any(|k| {
+        ["completion_tokens_details", "prompt_tokens_details"]
+            .iter()
+            .any(|d| {
+                u.and_then(|u| u.get(d))
+                    .and_then(|d| d.get(*k))
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|n| n > 0)
+            })
+    });
+    if unpriced_class {
+        tracing::error!(
+            "upstream reported tokens in a class Tollgate has no rate for (audio or \
+             predicted output); charging the reservation. This should have been refused \
+             at parse time: treat it as a bug, not as normal operation"
+        );
+    }
+
     let usage = Usage::with_cache(fresh, output, cached, 0);
-    if contradictory || ambiguous {
+    if contradictory || ambiguous || unpriced_class {
         usage.into_suspect()
     } else {
         usage
@@ -885,6 +1057,7 @@ impl OpenAiProvider {
                 ));
             }
         }
+        reject_rate_switches(&v)?;
         let model = v
             .get("model")
             .and_then(Value::as_str)
@@ -895,6 +1068,9 @@ impl OpenAiProvider {
             model,
             estimated_input_tokens: estimate_input_tokens(body),
             max_output_tokens: openai_effective_max(&v),
+            // The OpenAI Chat Completions usage object carries no cache-write
+            // token field at all, so a write can never be observed on this path.
+            may_cache_write: false,
         })
     }
 
@@ -975,9 +1151,13 @@ impl Provider for OpenAiProvider {
     /// count, since that is the only reading that cannot under-charge. The
     /// reservation must therefore cover BOTH legs, or every cache hit settles
     /// above what it was admitted for and walks a hard cap.
-    fn prompt_reserve_profile(&self) -> crate::pricing::PromptReserveProfile {
+    fn prompt_reserve_profile(
+        &self,
+        parsed: &ParsedRequest,
+    ) -> crate::pricing::PromptReserveProfile {
         crate::pricing::PromptReserveProfile {
-            can_cache_write: false,
+            // Preserves the default's conjunction; this path can never write.
+            can_cache_write: self.can_report_cache_write() && parsed.may_cache_write,
             may_double_bill_prompt: matches!(self.cache_semantics(), CacheSemantics::Unverified),
         }
     }
@@ -1298,6 +1478,149 @@ mod tests {
         let u = parse_vertex_usage(&v);
         assert_eq!(u.input_tokens, 7);
         assert_eq!(u.output_tokens, 13);
+    }
+
+    #[test]
+    fn cache_breakpoint_detection_survives_unicode_escaping() {
+        // A raw substring scan is evadable: this body's decoded key IS
+        // cache_control, but the literal string never appears in the bytes. A
+        // false negative here reserves at the input rate while the upstream
+        // bills a cache write at up to 2x, so the request settles above its
+        // reservation and walks a hard cap.
+        // Build the escaped key at runtime so the source itself cannot contain
+        // the literal string. The JSON escape for '_' decodes to '_', so the
+        // decoded key is cache_control while the raw bytes never spell it.
+        let bs = '\\';
+        let escaped = format!(
+            r#"{{"system":[{{"type":"text","text":"x","cache{bs}u005fcontrol":{{"type":"ephemeral"}}}}]}}"#
+        );
+        assert!(
+            !escaped.contains("cache_control"),
+            "fixture must not contain the literal key, or it proves nothing"
+        );
+        assert!(
+            requests_prompt_cache_write(&escaped),
+            "unicode-escaped cache_control key must be detected"
+        );
+        // Plain spelling, nested in messages rather than system.
+        let plain = r#"{"messages":[{"content":[{"cache_control":{"type":"ephemeral"}}]}]}"#;
+        assert!(requests_prompt_cache_write(plain));
+        // No breakpoint: must NOT reserve at the write rate, or every request on
+        // the provider is inflated for nothing.
+        let none = r#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        assert!(!requests_prompt_cache_write(none));
+    }
+
+    #[test]
+    fn anthropic_reserves_the_write_rate_only_for_requests_that_can_write() {
+        let p = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "k".into(),
+            "https://api.anthropic.com".into(),
+            "2023-06-01".into(),
+        );
+        let plain = p
+            .parse_request("messages", r#"{"model":"m","max_tokens":10,"messages":[]}"#)
+            .unwrap();
+        assert!(!plain.may_cache_write);
+        assert!(!p.prompt_reserve_profile(&plain).can_cache_write);
+
+        let cached = p
+            .parse_request(
+                "messages",
+                r#"{"model":"m","max_tokens":10,"system":[{"type":"text","text":"x",
+                    "cache_control":{"type":"ephemeral"}}],"messages":[]}"#,
+            )
+            .unwrap();
+        assert!(cached.may_cache_write);
+        assert!(p.prompt_reserve_profile(&cached).can_cache_write);
+    }
+
+    #[test]
+    fn rate_switching_request_fields_are_refused() {
+        let p = openai_test_provider();
+        let cases = [
+            (
+                r#"{"model":"m","messages":[],"modalities":["text","audio"]}"#,
+                "audio modality",
+            ),
+            (
+                r#"{"model":"m","messages":[],"audio":{"voice":"alloy","format":"wav"}}"#,
+                "audio config",
+            ),
+            (
+                r#"{"model":"m","messages":[],"prediction":{"type":"content","content":"x"}}"#,
+                "prediction",
+            ),
+            (
+                r#"{"model":"m","messages":[],"web_search_options":{}}"#,
+                "web search",
+            ),
+            (
+                r#"{"model":"m","messages":[],"service_tier":"priority"}"#,
+                "priority tier",
+            ),
+            (
+                r#"{"model":"m","messages":[],"tools":[{"type":"web_search_preview"}]}"#,
+                "hosted tool",
+            ),
+        ];
+        for (body, what) in cases {
+            assert!(
+                p.parse_request("chat/completions", body).is_err(),
+                "{what} must be refused: it re-rates tokens or adds a fee no token count reports"
+            );
+        }
+        // The ordinary shapes still pass, including an explicit text-only
+        // modality and a normal function tool.
+        assert!(
+            p.parse_request(
+                "chat/completions",
+                r#"{"model":"m","messages":[],"modalities":["text"],"service_tier":"auto",
+                    "tools":[{"type":"function","function":{"name":"f"}}]}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn anthropic_server_side_tools_are_refused() {
+        let p = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "k".into(),
+            "https://api.anthropic.com".into(),
+            "2023-06-01".into(),
+        );
+        // Billed per search, reported in no token field.
+        assert!(
+            p.parse_request(
+                "messages",
+                r#"{"model":"m","max_tokens":10,"messages":[],
+                    "tools":[{"type":"web_search_20250305","name":"web_search"}]}"#
+            )
+            .is_err()
+        );
+        // A client-executed custom tool is token-only and stays allowed.
+        assert!(
+            p.parse_request(
+                "messages",
+                r#"{"model":"m","max_tokens":10,"messages":[],
+                    "tools":[{"name":"f","input_schema":{}}]}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unpriced_token_classes_in_a_response_are_marked_suspect() {
+        // Backstop for a class we have not enumerated. Audio is rejected at
+        // parse, so seeing it here means evasion or a new upstream behaviour.
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,
+                "completion_tokens_details":{"audio_tokens":15}}}"#,
+        )
+        .unwrap();
+        assert!(parse_openai_usage(&v, CacheSemantics::Inclusive).suspect);
     }
 
     #[test]
@@ -1662,13 +1985,23 @@ mod tests {
         );
         assert_eq!(vertex.cache_semantics(), CacheSemantics::Inclusive);
         assert!(!vertex.can_report_cache_write());
-        assert!(!vertex.prompt_reserve_profile().may_double_bill_prompt);
+        let req = ParsedRequest {
+            model: "m".to_owned(),
+            estimated_input_tokens: 1,
+            max_output_tokens: 1,
+            may_cache_write: false,
+        };
+        assert!(!vertex.prompt_reserve_profile(&req).may_double_bill_prompt);
 
         // A custom base URL is whatever the operator pointed it at, so it stays
         // unverified and MUST reserve for a prompt billed on two legs.
         let unverified = openai_test_provider();
         assert_eq!(unverified.cache_semantics(), CacheSemantics::Unverified);
-        assert!(unverified.prompt_reserve_profile().may_double_bill_prompt);
+        assert!(
+            unverified
+                .prompt_reserve_profile(&req)
+                .may_double_bill_prompt
+        );
     }
 
     #[test]

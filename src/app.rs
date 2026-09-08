@@ -548,7 +548,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         .reserve_micros(
             parsed.estimated_input_tokens,
             parsed.max_output_tokens,
-            provider.prompt_reserve_profile(),
+            provider.prompt_reserve_profile(&parsed),
         )
         .max(1);
     let reservation = {
