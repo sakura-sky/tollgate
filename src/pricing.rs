@@ -266,11 +266,26 @@ impl LongContextTier {
     /// # Errors
     /// Returns a message when the multiple is below 1.0x.
     pub fn validate(&self) -> Result<(), String> {
-        if self.threshold_tokens > 0 && self.multiple_permille < MIN_FALLBACK_PERMILLE {
+        if self.threshold_tokens == 0 {
+            return Ok(());
+        }
+        if self.multiple_permille < MIN_FALLBACK_PERMILLE {
             return Err(format!(
                 "long_context_multiple_permille is {}, below the minimum {MIN_FALLBACK_PERMILLE} \
                  (1.0x). A multiple under 1.0x would make a long-context request cheaper than a \
                  short one, when providers charge MORE for it.",
+                self.multiple_permille
+            ));
+        }
+        // Real tiers are 1.5x to 2x. A fat-fingered value (2_000_000 meaning
+        // 2x) saturates costs to i64::MAX, and the budget counter has no path
+        // back down from that: it wedges the deployment until the period rolls.
+        if self.multiple_permille > MAX_LONG_CONTEXT_PERMILLE {
+            return Err(format!(
+                "long_context_multiple_permille is {}, above the maximum \
+                 {MAX_LONG_CONTEXT_PERMILLE} (10x). Real long-context tiers are 1.5x to 2x; a \
+                 value this large is almost certainly a units mistake, and it would saturate \
+                 costs to the integer maximum, which no budget counter can recover from.",
                 self.multiple_permille
             ));
         }
@@ -326,6 +341,11 @@ impl Default for CacheRateFallback {
 /// is guessing downward on a number nobody has supplied: the same fail-open the
 /// nullable rate columns exist to avoid.
 pub const MIN_FALLBACK_PERMILLE: u32 = 1_000;
+
+/// Largest long-context multiple accepted. Real tiers are 1.5x to 2x, so
+/// anything above 10x is a units mistake, and a large enough one saturates the
+/// money path to `i64::MAX`, which no budget counter can come back from.
+pub const MAX_LONG_CONTEXT_PERMILLE: u32 = 10_000;
 
 impl CacheRateFallback {
     /// Reject a configuration that would make an unpriced class cheap or free.
@@ -773,6 +793,12 @@ mod tests {
         };
         assert!(bad.validate().is_err());
         assert!(LongContextTier::default().validate().is_ok());
+        // A units mistake (2_000_000 meaning 2x) would saturate the money path.
+        let absurd = LongContextTier {
+            threshold_tokens: 200_000,
+            multiple_permille: 2_000_000,
+        };
+        assert!(absurd.validate().is_err());
         // Threshold 0 disables the feature, so the multiple is not checked.
         let off = LongContextTier {
             threshold_tokens: 0,

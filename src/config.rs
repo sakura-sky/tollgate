@@ -166,11 +166,17 @@ pub struct BillingConfig {
     pub long_context_multiple_permille: u32,
 }
 
+// Delegated to the pricing type so there is ONE source of truth. These were
+// separate constants and drifted immediately: the pricing default said 1000
+// (off) while this said 2000, so every deployment ran at 2x above the threshold
+// while the tests, README and commit message all said the feature was off. The
+// tests passed because they build prices through `ModelPrice::new`, which reads
+// the pricing default; production goes through config, which read this one.
 fn default_long_context_threshold() -> u64 {
-    200_000
+    crate::pricing::LongContextTier::default().threshold_tokens
 }
 fn default_long_context_permille() -> u32 {
-    2_000
+    crate::pricing::LongContextTier::default().multiple_permille
 }
 
 fn default_cache_read_permille() -> u32 {
@@ -318,5 +324,43 @@ impl Config {
         }
         figment = figment.merge(Env::prefixed("TOLLGATE_").split("__"));
         figment.extract().context("loading configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config defaults and the pricing defaults must agree.
+    ///
+    /// They drifted the moment they were separate constants: pricing said the
+    /// long-context multiple was 1.0x (off) while config said 2.0x, so every
+    /// deployment silently doubled the cost of any prompt above the threshold,
+    /// on every model including ones that bill flat, while the test suite,
+    /// README and commit message all reported the feature as off. The tests did
+    /// not catch it because they build prices through `ModelPrice::new`, which
+    /// reads the pricing default; only production reads the config default.
+    #[test]
+    fn config_billing_defaults_match_the_pricing_defaults() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.billing.long_context_tier(),
+            crate::pricing::LongContextTier::default(),
+            "config default must not diverge from the pricing default"
+        );
+        assert_eq!(
+            cfg.billing.cache_rate_fallback(),
+            crate::pricing::CacheRateFallback::default(),
+            "config default must not diverge from the pricing default"
+        );
+    }
+
+    /// Whatever the defaults are, they must be valid, or a fresh deployment
+    /// fails to boot on config it never chose.
+    #[test]
+    fn default_billing_config_passes_its_own_validation() {
+        let cfg = Config::default();
+        assert!(cfg.billing.cache_rate_fallback().validate().is_ok());
+        assert!(cfg.billing.long_context_tier().validate().is_ok());
     }
 }
