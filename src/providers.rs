@@ -319,34 +319,72 @@ fn parse_anthropic_usage(v: &Value) -> Usage {
     )
 }
 
-#[async_trait]
-impl Provider for AnthropicProvider {
-    fn id(&self) -> &str {
-        "anthropic"
-    }
+/// `anthropic-beta` values known NOT to change how a request is billed.
+///
+/// A beta can change the rate: the 1M-context beta bills input above 200k tokens
+/// at twice the standard rate, which a single input rate cannot express. So
+/// unknown betas are refused rather than forwarded.
+///
+/// The list is seeded rather than empty because real clients send betas on every
+/// request. Claude Code sends several, and an empty allowlist would refuse the
+/// most obvious user of this route on day one.
+const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
+    "prompt-caching-2024-07-31",
+    "pdfs-2024-09-25",
+    "token-counting-2024-11-01",
+    "fine-grained-tool-streaming-2025-05-14",
+    "interleaved-thinking-2025-05-14",
+];
 
-    /// Anthropic is the one adapter that reports cache writes: a request marking
-    /// `cache_control` breakpoints returns `cache_creation_input_tokens`, billed
-    /// above the base input rate.
-    fn can_report_cache_write(&self) -> bool {
-        true
-    }
+/// Whether every beta in an `anthropic-beta` header value is known to be
+/// billing-neutral. The header may carry a comma-separated list, and a client
+/// may send the header more than once, so callers check each value.
+///
+/// Returns the first unrecognised beta so the refusal can name it.
+#[must_use]
+pub fn unknown_anthropic_beta(header_value: &str) -> Option<String> {
+    header_value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .find(|s| !ALLOWED_ANTHROPIC_BETAS.contains(s))
+        .map(str::to_owned)
+}
 
-    fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
+impl AnthropicProvider {
+    /// Shared parse for both the buffered and streaming paths, so a guard added
+    /// to one can never be missing from the other.
+    fn parse_common(
+        &self,
+        rest_path: &str,
+        body: &str,
+        allow_stream: bool,
+    ) -> Result<ParsedRequest, ProviderError> {
         // Allowlist: only the synchronous Messages endpoint. Anything else
-        // (batches, files, models, streaming) would settle to ~zero cost while
-        // spending real money upstream.
+        // (batches, files, models) would settle to ~zero cost while spending
+        // real money upstream.
         if safe_rest_path(rest_path)? != "messages" {
             return Err(ProviderError::BadRequest(
-                "only /v1/anthropic/messages is supported".to_owned(),
+                "only the messages endpoint is supported".to_owned(),
             ));
         }
         let v: Value =
             serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
-        // Reject streaming: usage cannot be metered from an SSE stream here.
-        if v.get("stream").and_then(Value::as_bool) == Some(true) {
+        if !allow_stream && v.get("stream").and_then(Value::as_bool) == Some(true) {
             return Err(ProviderError::BadRequest(
-                "streaming is not supported (set stream=false)".to_owned(),
+                "streaming is handled on a separate path".to_owned(),
+            ));
+        }
+        // External media has token cost unbounded by body size, so the fast
+        // estimate would under-reserve. The OpenAI adapter checks this itself;
+        // this path relied on the gateway's check, which the streaming handler
+        // bypasses, so a streamed request with a URL image could have reserved
+        // from body bytes and settled far above it.
+        if references_external_media(body) {
+            return Err(ProviderError::BadRequest(
+                "external media (url / file references) is not supported on this endpoint; \
+                 its token cost is not bounded by the request body"
+                    .to_owned(),
             ));
         }
         let model = v
@@ -376,6 +414,27 @@ impl Provider for AnthropicProvider {
                 }
             }
         }
+        // A 1-hour cache write bills at twice the input rate, a 5-minute write at
+        // 1.25x, against one configured write rate. An operator who set the 5m
+        // rate would reserve at 1.25x and settle at 2x, overshooting a hard cap
+        // by the difference on every request.
+        if let Some(ttl) = find_cache_control_ttl(&v) {
+            return Err(ProviderError::BadRequest(format!(
+                "cache_control ttl '{ttl}' is not supported: a longer TTL bills at a \
+                 different multiple of the input rate than the default, and one \
+                 configured cache-write rate cannot express both"
+            )));
+        }
+        // Priority tier bills the same tokens at a premium.
+        if let Some(t) = v.get("service_tier").and_then(Value::as_str) {
+            if !t.eq_ignore_ascii_case("standard_only") {
+                return Err(ProviderError::BadRequest(
+                    "service_tier must be 'standard_only': other tiers change the \
+                     per-token rate, which a single price cannot express"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(ParsedRequest {
             model,
             estimated_input_tokens: estimate_input_tokens(body),
@@ -384,6 +443,91 @@ impl Provider for AnthropicProvider {
             // write, so only that request is reserved at the write rate.
             may_cache_write: value_has_cache_control(&v),
         })
+    }
+}
+
+/// Build the body for `/v1/messages/count_tokens` from an ALLOWLIST.
+///
+/// The client's Messages body cannot be posted here unchanged. `count_tokens`
+/// rejects unknown fields, and `max_tokens` is REQUIRED on every Messages
+/// request, so forwarding the body verbatim returns
+/// `400 max_tokens: Extra inputs are not permitted` on literally every request.
+/// Exact admission then fails closed and the gateway refuses all Anthropic
+/// traffic. Verified against the live API; it had never been exercised.
+///
+/// Everything that contributes input tokens is carried over. `system` and
+/// `tools` matter especially: a live probe counted 8 tokens for a bare message
+/// pair and 541 with system and tools attached, so dropping them would
+/// under-reserve tool-heavy requests badly, which is the failure exact admission
+/// exists to prevent.
+fn count_tokens_payload(body: &str) -> Result<Value, ProviderError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+    let mut out = serde_json::Map::new();
+    // Fields the count endpoint accepts AND that affect the input token count.
+    for k in [
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "tool_choice",
+        "thinking",
+    ] {
+        if let Some(val) = v.get(k) {
+            if !val.is_null() {
+                out.insert(k.to_owned(), val.clone());
+            }
+        }
+    }
+    if !out.contains_key("model") || !out.contains_key("messages") {
+        return Err(ProviderError::BadRequest(
+            "count_tokens needs 'model' and 'messages'".to_owned(),
+        ));
+    }
+    Ok(Value::Object(out))
+}
+
+/// The `ttl` of any `cache_control` block, when it is not the default.
+///
+/// Returned so the caller can refuse it: TTL selects a billing multiple, and the
+/// price book has one cache-write rate.
+fn find_cache_control_ttl(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                if k.eq_ignore_ascii_case("cache_control") {
+                    if let Some(ttl) = val.get("ttl").and_then(Value::as_str) {
+                        if !ttl.eq_ignore_ascii_case("5m") {
+                            return Some(ttl.to_owned());
+                        }
+                    }
+                }
+                if let Some(found) = find_cache_control_ttl(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(find_cache_control_ttl),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    fn id(&self) -> &str {
+        "anthropic"
+    }
+
+    /// Anthropic is the one adapter that reports cache writes: a request marking
+    /// `cache_control` breakpoints returns `cache_creation_input_tokens`, billed
+    /// above the base input rate.
+    fn can_report_cache_write(&self) -> bool {
+        true
+    }
+
+    fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
+        self.parse_common(rest_path, body, false)
     }
 
     async fn forward(
@@ -420,13 +564,14 @@ impl Provider for AnthropicProvider {
         _parsed: &ParsedRequest,
     ) -> Result<u64, ProviderError> {
         let url = format!("{}/v1/messages/count_tokens", self.base_url);
+        let payload = count_tokens_payload(body)?;
         let resp = self
             .http
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
             .header("content-type", "application/json")
-            .body(body.to_owned())
+            .json(&payload)
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
@@ -1512,6 +1657,83 @@ mod tests {
         let u = parse_vertex_usage(&v);
         assert_eq!(u.input_tokens, 7);
         assert_eq!(u.output_tokens, 13);
+    }
+
+    #[test]
+    fn count_tokens_payload_drops_what_the_endpoint_refuses() {
+        // Verified live: posting the client body unchanged returns
+        // "400 max_tokens: Extra inputs are not permitted", and max_tokens is
+        // mandatory on every Messages request, so exact admission failed closed
+        // on 100% of Anthropic traffic.
+        let body = r#"{"model":"claude-sonnet-4","max_tokens":1024,"stream":true,
+            "temperature":0.5,"top_p":0.9,"stop_sequences":["x"],"metadata":{"user_id":"u"},
+            "system":"be brief","tools":[{"name":"f","input_schema":{}}],
+            "messages":[{"role":"user","content":"hello"}]}"#;
+        let p = count_tokens_payload(body).unwrap();
+        let obj = p.as_object().unwrap();
+
+        for refused in [
+            "max_tokens",
+            "stream",
+            "temperature",
+            "top_p",
+            "stop_sequences",
+            "metadata",
+        ] {
+            assert!(!obj.contains_key(refused), "{refused} must not be sent");
+        }
+        // Everything that contributes input tokens must survive. A live probe
+        // counted 8 tokens bare and 541 with system+tools, so dropping these
+        // would under-reserve tool-heavy requests.
+        for kept in ["model", "messages", "system", "tools"] {
+            assert!(obj.contains_key(kept), "{kept} must be counted");
+        }
+    }
+
+    #[test]
+    fn count_tokens_payload_requires_the_countable_minimum() {
+        assert!(count_tokens_payload(r#"{"max_tokens":10}"#).is_err());
+        assert!(count_tokens_payload("not json").is_err());
+    }
+
+    #[test]
+    fn anthropic_refuses_a_longer_cache_ttl() {
+        let p = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "k".into(),
+            "https://api.anthropic.com".into(),
+            "2023-06-01".into(),
+        );
+        // A 1h write bills at 2x the input rate, a 5m write at 1.25x, against a
+        // single configured cache-write rate. Reserving at one and settling at
+        // the other overshoots a hard cap on every request.
+        let one_hour = r#"{"model":"m","max_tokens":10,"messages":[],
+            "system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#;
+        assert!(p.parse_request("messages", one_hour).is_err());
+        // The default TTL is fine and still marks the request cache-writing.
+        let default_ttl = r#"{"model":"m","max_tokens":10,"messages":[],
+            "system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}"#;
+        assert!(
+            p.parse_request("messages", default_ttl)
+                .unwrap()
+                .may_cache_write
+        );
+    }
+
+    #[test]
+    fn anthropic_refuses_external_media_on_both_paths() {
+        // This guard used to live only in the gateway, which the streaming
+        // handler bypasses, so a streamed request with a URL image would have
+        // reserved from body bytes and settled far above it.
+        let p = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "k".into(),
+            "https://api.anthropic.com".into(),
+            "2023-06-01".into(),
+        );
+        let media = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user",
+            "content":[{"type":"image","source":{"type":"url","url":"https://x/y.png"}}]}]}"#;
+        assert!(p.parse_request("messages", media).is_err());
     }
 
     #[test]
