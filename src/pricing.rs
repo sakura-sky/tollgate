@@ -108,6 +108,16 @@ pub struct Usage {
     /// reservation instead of costing them: see [`Usage::is_untrustworthy`].
     #[serde(default)]
     pub suspect: bool,
+    /// Set when the prompt classes OVERLAP rather than partitioning the prompt.
+    ///
+    /// True only on an upstream whose cache convention is unverified, where the
+    /// adapter deliberately bills the full prompt AND the cached count because
+    /// it cannot know whether they are disjoint. The billing is right, but the
+    /// classes then sum to more than the provider's own prompt, so anything
+    /// asking "how big was this prompt" must not add them up. See
+    /// [`Usage::threshold_prompt_tokens`].
+    #[serde(default)]
+    pub classes_overlap: bool,
 }
 
 /// Ceiling on the tokens one leg of a single request can plausibly consume.
@@ -129,6 +139,7 @@ impl Usage {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             suspect: false,
+            classes_overlap: false,
         }
     }
 
@@ -154,6 +165,7 @@ impl Usage {
             cache_read_tokens,
             cache_write_tokens,
             suspect: false,
+            classes_overlap: false,
         }
     }
 
@@ -164,6 +176,35 @@ impl Usage {
         self.input_tokens
             .saturating_add(self.cache_read_tokens)
             .saturating_add(self.cache_write_tokens)
+    }
+
+    /// How large the provider's own prompt was, for deciding whether it crossed
+    /// a size threshold.
+    ///
+    /// Not the same as [`Self::total_prompt_tokens`], which is what we BILL. On
+    /// an unverified upstream the classes overlap by design, so the billed total
+    /// exceeds the real prompt: a 150k prompt with 100k cached bills as 250k.
+    /// Using the billed total to test a 200k threshold would re-rate a request
+    /// the provider itself never tiered, inventing a charge on top of an already
+    /// conservative one.
+    #[must_use]
+    pub fn threshold_prompt_tokens(&self) -> u64 {
+        if self.classes_overlap {
+            // The classes cover the same tokens, so the larger is the prompt.
+            self.input_tokens.max(
+                self.cache_read_tokens
+                    .saturating_add(self.cache_write_tokens),
+            )
+        } else {
+            self.total_prompt_tokens()
+        }
+    }
+
+    /// Mark the prompt classes as overlapping rather than partitioning.
+    #[must_use]
+    pub fn with_overlapping_classes(mut self) -> Self {
+        self.classes_overlap = true;
+        self
     }
 
     /// True when a leg exceeds [`MAX_PLAUSIBLE_TOKENS_PER_LEG`].
@@ -214,10 +255,18 @@ impl Usage {
 /// Integer per-mille, so no float touches the money path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LongContextTier {
-    /// Prompt tokens above which the multiple applies. Zero disables it.
+    /// Prompt tokens above which the multiples apply. Zero disables it.
     pub threshold_tokens: u64,
     /// Applied to every prompt-side rate once the threshold is crossed.
     pub multiple_permille: u32,
+    /// Applied to the OUTPUT rate once the threshold is crossed.
+    ///
+    /// Separate from the prompt multiple because real tiers move the two by
+    /// different amounts: Gemini 2.5 Pro goes 2x on input and 1.5x on output,
+    /// Sonnet's 1M tier likewise. An earlier version re-rated only the prompt,
+    /// which meant enabling the feature still under-charged the output leg of
+    /// every long request: it failed at the one thing it exists to fix.
+    pub output_multiple_permille: u32,
 }
 
 impl Default for LongContextTier {
@@ -237,27 +286,68 @@ impl Default for LongContextTier {
         Self {
             threshold_tokens: 200_000,
             multiple_permille: 1_000,
+            output_multiple_permille: 1_000,
         }
     }
 }
 
+/// How far below the threshold a reservation still reserves at the tier rate.
+///
+/// The reservation tests the COUNTED prompt; the settlement tests the prompt the
+/// provider REPORTS. They differ: token counters are approximate, and a request
+/// that counts at 199,995 can report 200,005. Without a guard band that flips a
+/// 1x reservation into a 2x settlement of the entire prompt leg, so a ten-token
+/// discrepancy breaks a hard cap by the whole multiple.
+///
+/// Five percent costs transient headroom on requests near the threshold and
+/// removes the cliff. Over-reserving is released at settle; under-reserving is
+/// an overspend.
+///
+/// Note what this does NOT fix: a provider reporting more tokens than we counted
+/// overshoots its reservation on any request, tiered or not, which is the
+/// documented limit of `exact` admission. The band keeps that drift from being
+/// MULTIPLIED, so the overshoot stays proportional to the discrepancy rather
+/// than re-rating the entire prompt.
+const TIER_RESERVE_GUARD_PERMILLE: u64 = 950;
+
 impl LongContextTier {
+    /// Whether this tier does anything at all.
+    #[must_use]
+    fn configured(&self) -> bool {
+        self.threshold_tokens > 0
+            && (self.multiple_permille > 1_000 || self.output_multiple_permille > 1_000)
+    }
+
     /// Whether an uplift applies to this prompt. False when no multiple is
     /// configured, even above the threshold.
     #[must_use]
     pub fn applies_to(&self, prompt_tokens: u64) -> bool {
-        self.threshold_tokens > 0
-            && self.multiple_permille > 1_000
-            && prompt_tokens > self.threshold_tokens
+        self.configured() && prompt_tokens > self.threshold_tokens
+    }
+
+    /// Whether a RESERVATION should be taken at the tier rate.
+    ///
+    /// Deliberately looser than [`Self::applies_to`]: it triggers slightly below
+    /// the threshold, because the counted prompt and the reported prompt differ
+    /// and a request that straddles the line would otherwise settle above its
+    /// reservation by the whole multiple.
+    #[must_use]
+    pub fn reserve_applies_to(&self, prompt_tokens: u64) -> bool {
+        if !self.configured() {
+            return false;
+        }
+        let guard = self
+            .threshold_tokens
+            .saturating_mul(TIER_RESERVE_GUARD_PERMILLE)
+            / 1_000;
+        prompt_tokens > guard
     }
 
     /// Whether this prompt is large enough that the provider may be tiering it
     /// while Tollgate is not. Used to log the gap rather than silently accept it.
     #[must_use]
     pub fn is_unpriced_long_context(&self, prompt_tokens: u64) -> bool {
-        self.threshold_tokens > 0
-            && self.multiple_permille <= 1_000
-            && prompt_tokens > self.threshold_tokens
+        self.threshold_tokens > 0 && !self.configured() && prompt_tokens > self.threshold_tokens
     }
 
     /// Reject a multiple that would make a large request CHEAPER, which would
@@ -265,10 +355,14 @@ impl LongContextTier {
     ///
     /// # Errors
     /// Returns a message when the multiple is below 1.0x.
+    /// Validates the MULTIPLES regardless of the threshold.
+    ///
+    /// An earlier version returned early when the threshold was zero, which left
+    /// a hole: a deployment default of `(0, 2_000_000, 1000)` booted fine, and a
+    /// price row that set a threshold but inherited the multiples then picked up
+    /// a 2000x uplift that no CHECK constraint had seen, because the value never
+    /// went near the database.
     pub fn validate(&self) -> Result<(), String> {
-        if self.threshold_tokens == 0 {
-            return Ok(());
-        }
         if self.multiple_permille < MIN_FALLBACK_PERMILLE {
             return Err(format!(
                 "long_context_multiple_permille is {}, below the minimum {MIN_FALLBACK_PERMILLE} \
@@ -280,6 +374,20 @@ impl LongContextTier {
         // Real tiers are 1.5x to 2x. A fat-fingered value (2_000_000 meaning
         // 2x) saturates costs to i64::MAX, and the budget counter has no path
         // back down from that: it wedges the deployment until the period rolls.
+        if self.output_multiple_permille < MIN_FALLBACK_PERMILLE {
+            return Err(format!(
+                "long_context_output_multiple_permille is {}, below the minimum \
+                 {MIN_FALLBACK_PERMILLE} (1.0x).",
+                self.output_multiple_permille
+            ));
+        }
+        if self.output_multiple_permille > MAX_LONG_CONTEXT_PERMILLE {
+            return Err(format!(
+                "long_context_output_multiple_permille is {}, above the maximum \
+                 {MAX_LONG_CONTEXT_PERMILLE} (10x).",
+                self.output_multiple_permille
+            ));
+        }
         if self.multiple_permille > MAX_LONG_CONTEXT_PERMILLE {
             return Err(format!(
                 "long_context_multiple_permille is {}, above the maximum \
@@ -388,8 +496,18 @@ impl CacheRateFallback {
 /// but callers MUST reject implausible token counts upstream (see the metering
 /// layer) so saturation never actually occurs on the money path.
 #[must_use]
-fn round_to_micros(numerator: i128) -> i64 {
-    let rounded = numerator.saturating_add(TOKENS_PER_MILLION / 2) / TOKENS_PER_MILLION;
+/// Divide a numerator of `Σ tokens × price_per_1M × permille` by one million and
+/// a further thousand, rounding half-up to the nearest micro.
+///
+/// The per-mille scale exists so a long-context multiple can be folded into the
+/// sum and the WHOLE thing rounded once. Rounding a base cost and then rounding
+/// a separate uplift is the round-each-leg pattern this module forbids: it
+/// differs from a single rounding by up to a micro, and truncation runs in the
+/// cheap direction. A tier that does not apply passes a multiple of 1000, so
+/// the arithmetic is identical for an ordinary request.
+fn round_scaled_to_micros(numerator: i128) -> i64 {
+    const SCALE: i128 = TOKENS_PER_MILLION * 1_000;
+    let rounded = numerator.saturating_add(SCALE / 2) / SCALE;
     i64::try_from(rounded).unwrap_or(i64::MAX)
 }
 
@@ -448,54 +566,65 @@ impl ModelPrice {
         self
     }
 
-    /// The uplift owed on a prompt that crosses the long-context threshold.
+    /// Resolve this model's tier from its own columns, falling back per field to
+    /// the deployment default.
     ///
-    /// The multiple applies to the WHOLE prompt, not just the excess, because
-    /// that is how providers bill it: crossing the threshold re-rates the entire
-    /// request rather than the tokens beyond it.
-    fn long_context_uplift(&self, usage: Usage) -> i64 {
-        if !self.long_context.applies_to(usage.total_prompt_tokens()) {
-            return 0;
-        }
-        let prompt_only = Usage::with_cache(
-            usage.input_tokens,
-            0,
-            usage.cache_read_tokens,
-            usage.cache_write_tokens,
-        );
-        let prompt_base = self.cost_micros_untiered(prompt_only);
-        let uplift = i128::from(prompt_base)
-            * i128::from(self.long_context.multiple_permille.saturating_sub(1_000))
-            / 1_000;
-        i64::try_from(uplift).unwrap_or(i64::MAX)
+    /// Per-field rather than all-or-nothing so an operator can set just the
+    /// threshold for a model and inherit the multiples, or vice versa.
+    #[must_use]
+    pub fn with_long_context_row(
+        self,
+        threshold: Option<i64>,
+        input_permille: Option<i32>,
+        output_permille: Option<i32>,
+        fallback: LongContextTier,
+    ) -> Self {
+        let tier = LongContextTier {
+            threshold_tokens: threshold
+                .map_or(fallback.threshold_tokens, |v| u64::try_from(v).unwrap_or(0)),
+            multiple_permille: input_permille.map_or(fallback.multiple_permille, |v| {
+                u32::try_from(v).unwrap_or(1_000).max(1_000)
+            }),
+            output_multiple_permille: output_permille
+                .map_or(fallback.output_multiple_permille, |v| {
+                    u32::try_from(v).unwrap_or(1_000).max(1_000)
+                }),
+        };
+        self.with_long_context(tier)
     }
 
     /// Cost of `usage` at this price, in micros, INCLUDING long-context
     /// re-rating.
+    ///
+    /// The multiples are folded into the numerator and the whole sum is rounded
+    /// ONCE, at a scale of a thousandth of a micro. Computing a base cost and
+    /// then adding a separately-rounded uplift is the round-each-leg pattern the
+    /// module comment forbids: it differs from a single rounding by up to a
+    /// micro, and the truncation runs in the cheap direction.
+    ///
+    /// A crossed threshold re-rates the WHOLE request, not just the excess,
+    /// because that is how providers bill it.
     #[must_use]
     pub fn cost_micros(&self, usage: Usage) -> i64 {
-        let base = self.cost_micros_untiered(usage);
-        base.saturating_add(self.long_context_uplift(usage))
-    }
-
-    /// Cost at the flat per-class rates, before any long-context re-rating.
-    #[must_use]
-    fn cost_micros_untiered(&self, usage: Usage) -> i64 {
-        // Sum ALL FOUR legs at full micro-precision, THEN round once. Rounding
-        // each leg independently multiplies the rounding error by the number of
-        // legs and can over-count a request's cost.
-        let input = i128::from(usage.input_tokens) * i128::from(self.input_per_1m_micros);
-        let output = i128::from(usage.output_tokens) * i128::from(self.output_per_1m_micros);
-        let read = i128::from(usage.cache_read_tokens) * i128::from(self.cache_read_per_1m_micros);
-        let write =
-            i128::from(usage.cache_write_tokens) * i128::from(self.cache_write_per_1m_micros);
-        // saturating_add: near-maximal legs can overflow even i128.
-        round_to_micros(
-            input
-                .saturating_add(output)
-                .saturating_add(read)
-                .saturating_add(write),
-        )
+        let tier = self.long_context;
+        let (prompt_m, output_m) = if tier.applies_to(usage.threshold_prompt_tokens()) {
+            (
+                i128::from(tier.multiple_permille),
+                i128::from(tier.output_multiple_permille),
+            )
+        } else {
+            (1_000, 1_000)
+        };
+        let leg = |tokens: u64, rate: i64| i128::from(tokens) * i128::from(rate);
+        let prompt = leg(usage.input_tokens, self.input_per_1m_micros)
+            .saturating_add(leg(usage.cache_read_tokens, self.cache_read_per_1m_micros))
+            .saturating_add(leg(
+                usage.cache_write_tokens,
+                self.cache_write_per_1m_micros,
+            ))
+            .saturating_mul(prompt_m);
+        let output = leg(usage.output_tokens, self.output_per_1m_micros).saturating_mul(output_m);
+        round_scaled_to_micros(prompt.saturating_add(output))
     }
 
     /// The rate to reserve prompt-side tokens at, given whether this request's
@@ -547,16 +676,28 @@ impl ModelPrice {
         max_output_tokens: u64,
         profile: PromptReserveProfile,
     ) -> i64 {
-        let mut rate = i128::from(self.reserve_prompt_rate(profile));
         // A prompt that will be re-rated for length must be RESERVED at the
-        // re-rated price too, or settle exceeds reserve on exactly the largest
-        // requests and walks a hard cap.
-        if self.long_context.applies_to(prompt_tokens) {
-            rate = rate * i128::from(self.long_context.multiple_permille) / 1_000;
-        }
-        let prompt = i128::from(prompt_tokens) * rate;
-        let output = i128::from(max_output_tokens) * i128::from(self.output_per_1m_micros);
-        round_to_micros(prompt.saturating_add(output))
+        // re-rated price, on BOTH legs, or settle exceeds reserve on exactly the
+        // largest requests and walks a hard cap.
+        //
+        // `reserve_applies_to` triggers slightly below the threshold on purpose:
+        // this sees the COUNTED prompt while settlement sees the REPORTED one,
+        // and a request that straddles the line would otherwise flip a 1x
+        // reservation into a 2x settlement.
+        let tier = self.long_context;
+        let (prompt_m, output_m) = if tier.reserve_applies_to(prompt_tokens) {
+            (
+                i128::from(tier.multiple_permille),
+                i128::from(tier.output_multiple_permille),
+            )
+        } else {
+            (1_000, 1_000)
+        };
+        let prompt =
+            i128::from(prompt_tokens) * i128::from(self.reserve_prompt_rate(profile)) * prompt_m;
+        let output =
+            i128::from(max_output_tokens) * i128::from(self.output_per_1m_micros) * output_m;
+        round_scaled_to_micros(prompt.saturating_add(output))
     }
 }
 
@@ -749,33 +890,31 @@ mod tests {
             1_000_000,
             "the default must not change what a rate means"
         );
-        let on = off.clone().with_long_context(LongContextTier {
-            threshold_tokens: 200_000,
-            multiple_permille: 2_000,
-        });
+        // 2x input, 1.5x output: the real shape of a provider tier.
+        let on = off.clone().with_long_context(tier(200_000, 2_000, 1_500));
 
         // Under the threshold: identical either way.
         let small = Usage::new(100_000, 1_000);
         assert_eq!(on.cost_micros(small), off.cost_micros(small));
 
-        // Over it: the PROMPT leg doubles, output does not.
+        // Over it: BOTH legs are re-rated, each by its own multiple. Re-rating
+        // only the prompt was the earlier bug: it left the output leg of every
+        // long request under-charged, which is the thing this exists to fix.
+        // 300k input at 1/1M doubled = 600_000; 1k output at 5/1M by 1.5 = 7_500.
         let big = Usage::new(300_000, 1_000);
-        assert_eq!(
-            on.cost_micros(big),
-            off.cost_micros(big) + 300_000,
-            "prompt leg should double, output unchanged"
-        );
+        assert_eq!(on.cost_micros(big), 600_000 + 7_500);
+        assert_eq!(off.cost_micros(big), 300_000 + 5_000);
 
         // Cache classes count toward the threshold and are re-rated with it: a
         // 300k prompt served from cache is still a 300k prompt to the provider.
         let cached = Usage::with_cache(0, 1_000, 300_000, 0);
         assert!(on.cost_micros(cached) > off.cost_micros(cached));
 
-        // The RESERVATION is re-rated too, or settle would exceed reserve on
-        // exactly the largest requests and walk a hard cap.
+        // The RESERVATION is re-rated on both legs too, or settle exceeds
+        // reserve on exactly the largest requests and walks a hard cap.
         let prof = profile(false, false);
-        assert!(on.reserve_micros(300_000, 1_000, prof) > off.reserve_micros(300_000, 1_000, prof));
         let reserved = on.reserve_micros(300_000, 1_000, prof);
+        assert!(reserved > off.reserve_micros(300_000, 1_000, prof));
         let settled = on.cost_micros(Usage::new(300_000, 1_000));
         assert!(
             settled <= reserved,
@@ -784,27 +923,88 @@ mod tests {
     }
 
     #[test]
+    fn a_request_straddling_the_threshold_cannot_settle_above_its_reservation() {
+        // The reservation sees the COUNTED prompt; settlement sees the prompt the
+        // provider REPORTS. Token counters are approximate, so a request counted
+        // at 199,995 can report 200,005. Without a guard band that flips a 1x
+        // reservation into a 2x settlement of the whole prompt leg: a ten-token
+        // discrepancy breaching a hard cap by the entire multiple.
+        let p = ModelPrice::new("anthropic", "m", 1_000_000, 5_000_000)
+            .with_long_context(tier(200_000, 2_000, 1_500));
+        let prof = profile(false, false);
+
+        let reserved = p.reserve_micros(199_995, 1_000, prof);
+        let settled = p.cost_micros(Usage::new(200_005, 1_000));
+
+        // What the band guarantees is NOT settle <= reserve outright. A provider
+        // reporting more tokens than we counted overshoots on any request, tier
+        // or no tier, which is the documented limit of `exact` admission. What
+        // it prevents is that drift being MULTIPLIED: the overshoot stays
+        // proportional to the ten-token discrepancy instead of the whole prompt
+        // being re-rated.
+        let overshoot = settled - reserved;
+        assert!(
+            overshoot <= 10 * 2 * 5,
+            "overshoot {overshoot} is larger than the token drift can explain"
+        );
+
+        // Without the band this request sits just under the threshold, so it
+        // would reserve at 1x and settle at 2x: the breach would be the entire
+        // prompt leg rather than a rounding of it.
+        let untiered = ModelPrice::new("anthropic", "m", 1_000_000, 5_000_000);
+        let without_band = untiered.reserve_micros(199_995, 1_000, prof);
+        assert!(
+            reserved > without_band,
+            "the band must reserve at the tier rate below the threshold"
+        );
+        assert!(
+            settled - without_band > 100_000,
+            "without the band the breach would be the whole multiple"
+        );
+
+        // Well below the band, no uplift is reserved: it costs transient
+        // headroom near the threshold, not everywhere.
+        let far_below = p.reserve_micros(100_000, 1_000, prof);
+        assert_eq!(far_below, 100_000 + 5_000);
+    }
+
+    #[test]
+    fn overlapping_prompt_classes_do_not_inflate_the_threshold() {
+        // On an unverified upstream the prompt is billed on BOTH legs, so the
+        // classes overlap: a 150k prompt with 100k cached BILLS as 250k. Testing
+        // a 200k threshold against the billed total would re-rate a request the
+        // provider itself never tiered, inventing a charge on top of an already
+        // conservative one.
+        let overlapping = Usage::with_cache(150_000, 100, 100_000, 0).with_overlapping_classes();
+        assert_eq!(overlapping.total_prompt_tokens(), 250_000, "billed as");
+        assert_eq!(overlapping.threshold_prompt_tokens(), 150_000, "sized as");
+
+        let p = ModelPrice::new("openai", "m", 1_000_000, 1_000_000)
+            .with_long_context(tier(200_000, 2_000, 2_000));
+        // Disjoint classes summing to the same 250k DO cross the threshold.
+        let disjoint = Usage::with_cache(150_000, 100, 100_000, 0);
+        assert!(p.cost_micros(disjoint) > p.cost_micros(overlapping));
+    }
+
+    #[test]
     fn a_long_context_multiple_below_one_is_rejected() {
         // Would make a large request cheaper than a small one, when providers
         // charge more for it.
-        let bad = LongContextTier {
-            threshold_tokens: 200_000,
-            multiple_permille: 500,
-        };
-        assert!(bad.validate().is_err());
+        assert!(tier(200_000, 500, 1_000).validate().is_err());
+        // The output multiple is bounded on both sides too, or re-rating output
+        // downward would under-charge exactly the requests being re-rated.
+        assert!(tier(200_000, 2_000, 500).validate().is_err());
         assert!(LongContextTier::default().validate().is_ok());
-        // A units mistake (2_000_000 meaning 2x) would saturate the money path.
-        let absurd = LongContextTier {
-            threshold_tokens: 200_000,
-            multiple_permille: 2_000_000,
-        };
-        assert!(absurd.validate().is_err());
-        // Threshold 0 disables the feature, so the multiple is not checked.
-        let off = LongContextTier {
-            threshold_tokens: 0,
-            multiple_permille: 0,
-        };
-        assert!(off.validate().is_ok());
+        // A units mistake (2_000_000 meaning 2x) would saturate the money path
+        // to i64::MAX, which no budget counter can come back from.
+        assert!(tier(200_000, 2_000_000, 1_000).validate().is_err());
+        assert!(tier(200_000, 2_000, 2_000_000).validate().is_err());
+        // Threshold 0 disables the feature, but the multiples are STILL checked:
+        // a per-model row that sets a threshold inherits these, and that
+        // inherited value never passes a database CHECK, so boot is the only
+        // place it can be caught.
+        assert!(tier(0, 1_000, 1_000).validate().is_ok());
+        assert!(tier(0, 2_000_000, 1_000).validate().is_err());
 
         // The default is a no-op uplift with a threshold to notice at, so a
         // large prompt is flagged as possibly under-charged rather than being
@@ -868,6 +1068,15 @@ mod tests {
         let p = ModelPrice::new("p", "m", 3_000_000, 15_000_000);
         assert_eq!(p.reserve_prompt_rate(profile(false, false)), 3_000_000);
         assert_eq!(p.reserve_prompt_rate(profile(true, false)), 6_000_000);
+    }
+
+    /// Build a tier without spelling the struct out at every call site.
+    fn tier(threshold: u64, input_permille: u32, output_permille: u32) -> LongContextTier {
+        LongContextTier {
+            threshold_tokens: threshold,
+            multiple_permille: input_permille,
+            output_multiple_permille: output_permille,
+        }
     }
 
     /// Build a reserve profile without spelling the struct out at every call.

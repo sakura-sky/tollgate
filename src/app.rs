@@ -1330,7 +1330,27 @@ fn stream_settlement(
             (reserve_micros, Usage::default(), "estimated")
         }
         // Measured: the only branch that costs what the provider reported.
-        (true, Some(usage)) => (price.cost_micros(usage).max(1), usage, "allowed"),
+        (true, Some(usage)) => {
+            // Same visibility as the buffered path. Streams are the bulk of real
+            // traffic, so warning only in `evaluate` would leave the gap
+            // invisible for most requests, which defeats the point of a default
+            // that reports the gap rather than guessing at it.
+            if price
+                .long_context
+                .is_unpriced_long_context(usage.threshold_prompt_tokens())
+            {
+                tracing::warn!(
+                    provider = %price.provider,
+                    model = %price.model,
+                    prompt_tokens = usage.threshold_prompt_tokens(),
+                    "streamed prompt exceeds the long-context threshold and no tier is \
+                     configured for this model; if it re-rates long requests, this is an \
+                     UNDER-charge. Set it with `admin price set --long-context-threshold \
+                     --long-context-input-permille --long-context-output-permille`"
+                );
+            }
+            (price.cost_micros(usage).max(1), usage, "allowed")
+        }
         // The remaining branches all charge the RESERVATION, so they are
         // `estimated`, not `allowed` or `error`. Streams are the bulk of real
         // traffic, and mislabelling them here would make the console's

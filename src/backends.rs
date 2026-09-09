@@ -309,7 +309,9 @@ pub async fn load_prices(
 ) -> Result<PriceBook, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT provider, model, input_per_1m_micros, output_per_1m_micros, \
-                cache_read_per_1m_micros, cache_write_per_1m_micros \
+                cache_read_per_1m_micros, cache_write_per_1m_micros, \
+                long_context_threshold_tokens, long_context_input_permille, \
+                long_context_output_permille \
          FROM model_prices WHERE effective_to IS NULL",
     )
     .fetch_all(pool)
@@ -331,7 +333,15 @@ pub async fn load_prices(
                 row.get::<Option<i64>, _>("cache_write_per_1m_micros"),
                 fallback,
             )
-            .with_long_context(long_context)
+            // Per-model tier where set, deployment default otherwise, resolved
+            // per field so a model can take just the threshold or just the
+            // multiples.
+            .with_long_context_row(
+                row.get::<Option<i64>, _>("long_context_threshold_tokens"),
+                row.get::<Option<i32>, _>("long_context_input_permille"),
+                row.get::<Option<i32>, _>("long_context_output_permille"),
+                long_context,
+            )
         })
         .collect();
     // One warning per reload naming the models being over-charged on purpose,
@@ -347,6 +357,37 @@ pub async fn load_prices(
             "no cache rates configured; charging cache tokens at a conservative \
              multiple of the input rate, which OVER-charges cache reads. Set real \
              rates with `admin price set --cache-read-per-1m/--cache-write-per-1m`"
+        );
+    }
+    // A resolved tier mixes per-model columns with the deployment default, so
+    // the combination is never seen by a database CHECK and boot validation only
+    // saw the default. Validate what each model actually ended up with.
+    for p in &prices {
+        if let Err(e) = p.long_context.validate() {
+            return Err(sqlx::Error::Protocol(format!(
+                "model {}/{} resolves to an invalid long-context tier: {e}",
+                p.provider, p.model
+            )));
+        }
+    }
+    // Surface tiers that are set but inert: multiples configured against a zero
+    // threshold do nothing AND suppress the under-charge warning, so a long
+    // request on that model bills flat with no signal at all.
+    let inert: Vec<String> = prices
+        .iter()
+        .filter(|p| {
+            p.long_context.threshold_tokens == 0
+                && (p.long_context.multiple_permille > 1_000
+                    || p.long_context.output_multiple_permille > 1_000)
+        })
+        .map(|p| format!("{}/{}", p.provider, p.model))
+        .collect();
+    if !inert.is_empty() {
+        tracing::warn!(
+            models = %inert.join(", "),
+            "long-context multiples are set but the threshold is 0, so they do \
+             nothing and no under-charge warning will fire. Set \
+             `admin price set --long-context-threshold`"
         );
     }
     Ok(PriceBook::from_prices(prices))

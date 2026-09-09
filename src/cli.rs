@@ -120,6 +120,29 @@ pub enum PriceCommand {
         /// Unset the cache-write price, restoring the conservative fallback.
         #[arg(long, conflicts_with = "cache_write_per_1m")]
         clear_cache_write: bool,
+        /// Prompt tokens above which THIS model re-rates the whole request.
+        /// Omit to carry forward; 0 disables tiering for this model.
+        #[arg(long)]
+        long_context_threshold: Option<u64>,
+        /// Multiple applied to prompt rates above the threshold, per-mille
+        /// (2000 = 2.0x). Omit to carry forward.
+        #[arg(long)]
+        long_context_input_permille: Option<u32>,
+        /// Multiple applied to the output rate above the threshold, per-mille
+        /// (1500 = 1.5x). Separate from the input multiple because real tiers
+        /// move the two by different amounts. Omit to carry forward.
+        #[arg(long)]
+        long_context_output_permille: Option<u32>,
+        /// Unset this model's tier, falling back to the deployment default.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "long_context_threshold",
+                "long_context_input_permille",
+                "long_context_output_permille"
+            ]
+        )]
+        clear_long_context: bool,
     },
 }
 
@@ -181,6 +204,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             cache_write_per_1m,
             clear_cache_read,
             clear_cache_write,
+            long_context_threshold,
+            long_context_input_permille,
+            long_context_output_permille,
+            clear_long_context,
         })) => {
             admin_price_set(
                 &cfg,
@@ -192,6 +219,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 cache_write_per_1m,
                 clear_cache_read,
                 clear_cache_write,
+                long_context_threshold,
+                long_context_input_permille,
+                long_context_output_permille,
+                clear_long_context,
             )
             .await
         }
@@ -359,6 +390,10 @@ async fn admin_price_set(
     cache_write_per_1m: Option<f64>,
     clear_cache_read: bool,
     clear_cache_write: bool,
+    long_context_threshold: Option<u64>,
+    long_context_input_permille: Option<u32>,
+    long_context_output_permille: Option<u32>,
+    clear_long_context: bool,
 ) -> Result<()> {
     let input = to_micros(input_per_1m)?;
     let output = to_micros(output_per_1m)?;
@@ -374,7 +409,9 @@ async fn admin_price_set(
     let carried = sqlx::query(
         "UPDATE model_prices SET effective_to = NOW() \
          WHERE provider = $1 AND model = $2 AND effective_to IS NULL \
-         RETURNING cache_read_per_1m_micros, cache_write_per_1m_micros",
+         RETURNING cache_read_per_1m_micros, cache_write_per_1m_micros, \
+                   long_context_threshold_tokens, long_context_input_permille, \
+                   long_context_output_permille",
     )
     .bind(provider)
     .bind(model)
@@ -382,19 +419,81 @@ async fn admin_price_set(
     .await
     .context("closing current price")?;
     // No row means this is the first price for the model: nothing to carry.
-    let (carried_read, carried_write) = carried.map_or((None, None), |row| {
+    #[allow(clippy::type_complexity)]
+    let (carried_read, carried_write, carried_thr, carried_in, carried_out): (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i32>,
+        Option<i32>,
+    ) = carried.map_or((None, None, None, None, None), |row| {
         (
-            row.get::<Option<i64>, _>("cache_read_per_1m_micros"),
-            row.get::<Option<i64>, _>("cache_write_per_1m_micros"),
+            row.get("cache_read_per_1m_micros"),
+            row.get("cache_write_per_1m_micros"),
+            row.get("long_context_threshold_tokens"),
+            row.get("long_context_input_permille"),
+            row.get("long_context_output_permille"),
         )
     });
     let cache_read = RateChange::resolve(cache_read_per_1m, clear_cache_read, carried_read)?;
     let cache_write = RateChange::resolve(cache_write_per_1m, clear_cache_write, carried_write)?;
+    // Carried forward unless explicitly set or cleared, for the same reason the
+    // cache rates are: the common operation is bumping a base rate, and silently
+    // dropping a model's tier there would under-charge every long request on it.
+    let (lc_threshold, lc_input, lc_output) = if clear_long_context {
+        (None, None, None)
+    } else {
+        (
+            long_context_threshold
+                .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+                .or(carried_thr),
+            long_context_input_permille
+                .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
+                .or(carried_in),
+            long_context_output_permille
+                .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
+                .or(carried_out),
+        )
+    };
+    // Refuse a tier that would be inert. Multiples against a zero or absent
+    // threshold do nothing AND suppress the under-charge warning, so a long
+    // request bills flat with no signal, which is the one direction this proxy
+    // may never err in silently.
+    //
+    // Resolve the threshold the SAME way the price loader will: this model's
+    // column if set, otherwise the deployment default. Treating an absent column
+    // as zero here would refuse a perfectly good configuration, because
+    // inheriting the deployment threshold is exactly what the per-field fallback
+    // is for.
+    let deployment_threshold = cfg.billing.long_context_tier().threshold_tokens;
+    let effective_threshold =
+        lc_threshold.map_or(deployment_threshold, |v| u64::try_from(v).unwrap_or(0));
+    let sets_multiple = lc_input.is_some_and(|v| v > 1_000) || lc_output.is_some_and(|v| v > 1_000);
+    if sets_multiple && effective_threshold == 0 {
+        bail!(
+            "long-context multiples were given but no threshold applies to this model: \
+             neither --long-context-threshold nor the deployment default \
+             (TOLLGATE_BILLING__LONG_CONTEXT_THRESHOLD_TOKENS) is set. They would do \
+             nothing AND suppress the under-charge warning, so a long request would \
+             bill flat with no signal. Pass --long-context-threshold (e.g. 200000)."
+        );
+    }
+    // Validate the pair before the INSERT, so an out-of-range value is a clear
+    // message rather than a raw constraint violation.
+    crate::pricing::LongContextTier {
+        threshold_tokens: effective_threshold,
+        multiple_permille: u32::try_from(lc_input.unwrap_or(1_000)).unwrap_or(1_000),
+        output_multiple_permille: u32::try_from(lc_output.unwrap_or(1_000)).unwrap_or(1_000),
+    }
+    .validate()
+    .map_err(|e| anyhow::anyhow!(e))?;
     sqlx::query(
         "INSERT INTO model_prices \
          (provider, model, input_per_1m_micros, output_per_1m_micros, \
-          cache_read_per_1m_micros, cache_write_per_1m_micros, source) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'admin price set')",
+          cache_read_per_1m_micros, cache_write_per_1m_micros, \
+          long_context_threshold_tokens, long_context_input_permille, \
+          long_context_output_permille, source) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'admin price set')",
     )
     .bind(provider)
     .bind(model)
@@ -402,6 +501,9 @@ async fn admin_price_set(
     .bind(output)
     .bind(cache_read)
     .bind(cache_write)
+    .bind(lc_threshold)
+    .bind(lc_input)
+    .bind(lc_output)
     .execute(&mut *tx)
     .await
     .context("inserting price")?;

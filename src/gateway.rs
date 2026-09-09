@@ -487,15 +487,20 @@ impl GatewayCore {
         // saying nothing would under-charge the ones that do not.
         if price
             .long_context
-            .is_unpriced_long_context(resp.usage.total_prompt_tokens())
+            .is_unpriced_long_context(resp.usage.threshold_prompt_tokens())
         {
             tracing::warn!(
                 provider = provider_id,
                 model = %parsed.model,
-                prompt_tokens = resp.usage.total_prompt_tokens(),
-                "prompt exceeds the long-context threshold and no tier multiple is \
-                 configured; if this model re-rates long requests, this is an \
-                 UNDER-charge. Set TOLLGATE_BILLING__LONG_CONTEXT_MULTIPLE_PERMILLE"
+                // The size the PROVIDER saw, which is what the threshold tests.
+                // Logging the billed total instead would print a number above
+                // the threshold next to a warning that did not fire, on any
+                // upstream whose prompt classes overlap.
+                prompt_tokens = resp.usage.threshold_prompt_tokens(),
+                "prompt exceeds the long-context threshold and no tier is configured \
+                 for this model; if it re-rates long requests, this is an \
+                 UNDER-charge. Set it with `admin price set --long-context-threshold \
+                 --long-context-input-permille --long-context-output-permille`"
             );
         }
         // Settle by upstream status.

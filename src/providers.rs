@@ -1290,7 +1290,15 @@ fn parse_openai_usage(v: &Value, semantics: CacheSemantics) -> Usage {
         );
     }
 
-    let usage = Usage::with_cache(fresh, output, cached, 0);
+    let mut usage = Usage::with_cache(fresh, output, cached, 0);
+    // On an unverified upstream the prompt is billed on BOTH legs, so the
+    // classes overlap rather than partitioning the prompt. Anything asking how
+    // large the prompt actually was must not add them up: a 150k prompt with
+    // 100k cached bills as 250k, and testing a 200k size threshold against that
+    // would re-rate a request the provider itself never tiered.
+    if matches!(semantics, CacheSemantics::Unverified) {
+        usage = usage.with_overlapping_classes();
+    }
     if contradictory || ambiguous || unpriced_class {
         usage.into_suspect()
     } else {

@@ -164,6 +164,17 @@ pub struct BillingConfig {
     /// dimension costs more, not less.
     #[serde(default = "default_long_context_permille")]
     pub long_context_multiple_permille: u32,
+    /// Multiple applied to the OUTPUT rate above the threshold, per-mille.
+    ///
+    /// Separate from the prompt multiple because real tiers move the two by
+    /// different amounts (commonly 2x input, 1.5x output). Re-rating only the
+    /// prompt still under-charges the output leg of every long request.
+    #[serde(default = "default_long_context_output_permille")]
+    pub long_context_output_multiple_permille: u32,
+}
+
+fn default_long_context_output_permille() -> u32 {
+    crate::pricing::LongContextTier::default().output_multiple_permille
 }
 
 // Delegated to the pricing type so there is ONE source of truth. These were
@@ -202,6 +213,7 @@ impl BillingConfig {
         crate::pricing::LongContextTier {
             threshold_tokens: self.long_context_threshold_tokens,
             multiple_permille: self.long_context_multiple_permille,
+            output_multiple_permille: self.long_context_output_multiple_permille,
         }
     }
 }
@@ -275,6 +287,7 @@ impl Default for Config {
                 cache_write_fallback_permille: default_cache_write_permille(),
                 long_context_threshold_tokens: default_long_context_threshold(),
                 long_context_multiple_permille: default_long_context_permille(),
+                long_context_output_multiple_permille: default_long_context_output_permille(),
             },
             security: SecurityConfig {
                 api_key_pepper: String::new(),
