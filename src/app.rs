@@ -1128,19 +1128,14 @@ async fn relay_stream(
     // this branch there would hand out a full generation for the price of the
     // prompt, on demand and repeatably. Every other abnormal end charges the
     // full reservation.
-    let (actual, usage, decision) = match &meter {
-        StreamMeter::Anthropic { .. } if !clean && !meter.started() => {
-            tracing::warn!(
-                "anthropic stream failed before generating anything; charging the prompt leg"
-            );
-            (
-                prompt_floor_micros.min(reserve_micros).max(1),
-                Usage::default(),
-                "estimated",
-            )
-        }
-        _ => stream_settlement(clean, seen_usage, &price, reserve_micros),
-    };
+    let (actual, usage, decision) = choose_settlement(
+        &meter,
+        clean,
+        seen_usage,
+        &price,
+        reserve_micros,
+        prompt_floor_micros,
+    );
     guard.settle(actual, usage, decision).await;
 }
 
@@ -1209,12 +1204,12 @@ impl StreamMeter {
         }
     }
 
-    fn started(&self) -> bool {
-        match self {
-            Self::OpenAi { seen, .. } => seen.is_some(),
-            Self::Anthropic { meter, .. } => meter.started(),
-        }
-    }
+    // No `started()` here on purpose. It existed to feed the prompt-leg
+    // discount, and having it at this level is what made that discount
+    // applicable to OpenAI, where "started" cannot be distinguished from "client
+    // disconnected before the terminal usage chunk". `choose_settlement` now
+    // reaches the Anthropic meter directly, so the discount cannot be spread to
+    // a provider that has no pre-generation signal.
 
     fn usage(&self) -> Option<Usage> {
         match self {
@@ -1257,6 +1252,51 @@ fn scan_sse_for_usage(
 /// chunk charges the observed cost (floored to 1 micro). A clean finish with no
 /// usage chunk, or ANY abnormal end (disconnect, upstream error, idle/duration
 /// timeout), charges the FULL reservation so a stream is never under-charged.
+/// Pick the settlement for a finished relay.
+///
+/// Extracted as a pure function so the discount path is testable. It previously
+/// lived inline in `relay_stream`, which meant the branch that BYPASSES
+/// `stream_settlement` had no coverage at all: the regression test for it
+/// exercised `stream_settlement` and would have passed against the bug.
+fn choose_settlement(
+    meter: &StreamMeter,
+    clean: bool,
+    seen: Option<Usage>,
+    price: &ModelPrice,
+    reserve_micros: i64,
+    prompt_floor_micros: i64,
+) -> (i64, Usage, &'static str) {
+    // Anthropic delivers `overloaded_error` as an event on an otherwise-200
+    // stream, before message_start, so nothing was generated and nothing billed.
+    // Charging the full worst-case reservation there is punitive, and SDK
+    // retries multiply it through an overload window, so charge the prompt leg.
+    //
+    // Three conditions, all load-bearing:
+    //
+    // - Anthropic only. On the OpenAI path `started` can only become true when
+    //   the TERMINAL usage chunk arrives, so a client that reads a whole
+    //   response then disconnects looks identical to one that never started.
+    // - Nothing started.
+    // - The provider EXPLICITLY errored. Without this, any 200 that is not an
+    //   SSE stream at all (an upstream ignoring `stream`, a proxy rewriting the
+    //   response) is relayed to the client in full and then discounted, because
+    //   it contains neither message_start nor message_stop.
+    if let StreamMeter::Anthropic { meter: m, .. } = meter {
+        if !clean && !m.started() && m.errored() {
+            tracing::warn!(
+                "anthropic stream reported an error before generating anything; \
+                 charging the prompt leg"
+            );
+            return (
+                prompt_floor_micros.min(reserve_micros).max(1),
+                Usage::default(),
+                "estimated",
+            );
+        }
+    }
+    stream_settlement(clean, seen, price, reserve_micros)
+}
+
 fn stream_settlement(
     clean: bool,
     seen: Option<Usage>,
@@ -1622,6 +1662,79 @@ mod tests {
             stream_settlement(false, Some(Usage::new(10, 5)), &price, reserve);
         assert_eq!(actual, reserve);
         assert_eq!(decision, "estimated");
+    }
+
+    /// Drive the relay's settlement CHOICE, not just `stream_settlement`.
+    ///
+    /// The bypass bug lived in the arm that skips `stream_settlement` entirely,
+    /// so a test calling `stream_settlement` directly passed against it. These
+    /// go through `choose_settlement` with a real meter.
+    fn settle_via_meter(
+        meter: &StreamMeter,
+        clean: bool,
+        seen: Option<Usage>,
+    ) -> (i64, &'static str) {
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
+        let (actual, _u, decision) = choose_settlement(meter, clean, seen, &price, 999, 100);
+        (actual, decision)
+    }
+
+    fn anthropic_meter(lines: &[&str]) -> StreamMeter {
+        let mut m = crate::providers::AnthropicStreamMeter::new();
+        for l in lines {
+            m.observe_line(l);
+        }
+        StreamMeter::Anthropic {
+            line_buf: Vec::new(),
+            meter: m,
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_provider_error_earns_the_prompt_leg_discount() {
+        // The intended case: the provider said it failed before generating.
+        let errored =
+            anthropic_meter(&[r#"data: {"type":"error","error":{"type":"overloaded_error"}}"#]);
+        assert_eq!(settle_via_meter(&errored, false, None), (100, "estimated"));
+
+        // A 200 that is not an SSE stream at all: an upstream that ignored
+        // `stream`, or a proxy that rewrote the response. It has no
+        // message_start and no message_stop, exactly like the errored case, but
+        // the client was handed the whole body. Discounting it would give away
+        // the output leg on every request.
+        let not_a_stream =
+            anthropic_meter(&[r#"data: {"id":"msg_x","content":[{"text":"hello"}]}"#]);
+        assert_eq!(
+            settle_via_meter(&not_a_stream, false, None),
+            (999, "estimated")
+        );
+
+        // Nothing at all: connection died before a single complete line.
+        let silent = anthropic_meter(&[]);
+        assert_eq!(settle_via_meter(&silent, false, None), (999, "estimated"));
+
+        // Generation started, then failed: the provider did work, charge in full.
+        let started_then_died = anthropic_meter(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}"#,
+        ]);
+        assert_eq!(
+            settle_via_meter(&started_then_died, false, None),
+            (999, "estimated")
+        );
+    }
+
+    #[test]
+    fn the_prompt_leg_discount_never_applies_to_openai() {
+        // On the OpenAI path `started` only becomes true at the TERMINAL usage
+        // chunk, so a client that reads a full response then disconnects is
+        // indistinguishable from one that never started. Applying the discount
+        // there handed out a whole generation for a token of budget.
+        let openai = StreamMeter::OpenAi {
+            line_buf: Vec::new(),
+            semantics: crate::providers::CacheSemantics::Inclusive,
+            seen: None,
+        };
+        assert_eq!(settle_via_meter(&openai, false, None), (999, "estimated"));
     }
 
     #[test]

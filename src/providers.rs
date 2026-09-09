@@ -316,7 +316,7 @@ impl AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
             .header("content-type", "application/json")
-            .body(pin_service_tier(body))
+            .body(pin_outbound(body, true))
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))
@@ -336,7 +336,7 @@ impl AnthropicProvider {
 /// reserved and enforced agree. A body that will not parse is passed through
 /// untouched: `parse_common` has already rejected it, so this cannot be the
 /// thing that lets a bad body upstream.
-fn pin_service_tier(body: &str) -> String {
+fn pin_outbound(body: &str, streaming: bool) -> String {
     let Ok(mut v) = serde_json::from_str::<Value>(body) else {
         return body.to_owned();
     };
@@ -347,6 +347,16 @@ fn pin_service_tier(body: &str) -> String {
         "service_tier".to_owned(),
         Value::String("standard_only".to_owned()),
     );
+    // Pin `stream` to a real boolean matching the path we chose.
+    //
+    // `stream_requested` is deliberately lenient (it accepts "yes", 1, " TRUE ")
+    // so a truthy value cannot slip past the buffered check. That leniency means
+    // the value we route on can differ from what a strict upstream would honour:
+    // route to the streaming relay on `"yes"`, forward `"yes"` verbatim, and an
+    // upstream that treats it as false returns a buffered body which the relay
+    // then forwards with no SSE events in it. Pinning removes the disagreement,
+    // the same way the OpenAI adapter pins its own stream flag.
+    obj.insert("stream".to_owned(), Value::Bool(streaming));
     serde_json::to_string(&v).unwrap_or_else(|_| body.to_owned())
 }
 
@@ -598,6 +608,20 @@ impl AnthropicStreamMeter {
         self.start.is_some()
     }
 
+    /// Whether the provider EXPLICITLY reported a failure.
+    ///
+    /// The prompt-leg discount requires this, not merely the absence of
+    /// `message_start`. Without it, any 200 that is not an SSE stream at all
+    /// (an upstream that ignores `stream` and returns a buffered body, a proxy
+    /// that rewrites it) is relayed to the client in full and then charged the
+    /// prompt leg alone, because it contains neither `message_start` nor
+    /// `message_stop`. The provider has to tell us it failed before we discount
+    /// the request.
+    #[must_use]
+    pub fn errored(&self) -> bool {
+        self.errored
+    }
+
     /// The metered usage: the maximum of each class across `message_start` and
     /// the final `message_delta`.
     ///
@@ -744,7 +768,7 @@ impl Provider for AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
             .header("content-type", "application/json")
-            .body(pin_service_tier(body))
+            .body(pin_outbound(body, false))
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))?;
@@ -2026,16 +2050,33 @@ mod tests {
         // an org has it, and almost nobody sets the field. Pinning it in the
         // adapter rather than a route handler means the legacy
         // /v1/anthropic/messages route is covered too.
-        let pinned = pin_service_tier(r#"{"model":"m","max_tokens":10,"messages":[]}"#);
+        let pinned = pin_outbound(r#"{"model":"m","max_tokens":10,"messages":[]}"#, false);
         let v: Value = serde_json::from_str(&pinned).unwrap();
         assert_eq!(v["service_tier"], "standard_only");
         // An explicit value is overwritten, not merely defaulted.
-        let pinned = pin_service_tier(r#"{"model":"m","service_tier":"auto"}"#);
+        let pinned = pin_outbound(r#"{"model":"m","service_tier":"auto"}"#, false);
         let v: Value = serde_json::from_str(&pinned).unwrap();
         assert_eq!(v["service_tier"], "standard_only");
         // Unparseable bodies pass through: parse_common already rejected them,
         // so this must not be what lets a bad body upstream.
-        assert_eq!(pin_service_tier("not json"), "not json");
+        assert_eq!(pin_outbound("not json", false), "not json");
+    }
+
+    #[test]
+    fn outbound_body_pins_stream_to_a_real_boolean() {
+        // `stream_requested` accepts "yes", 1 and " TRUE " so a truthy value
+        // cannot slip past the buffered check. That leniency means the value we
+        // ROUTE on can differ from what a strict upstream honours: route to the
+        // relay on "yes", forward "yes", and an upstream reading it as false
+        // returns a buffered body the relay then forwards containing no SSE
+        // events at all.
+        let pinned = pin_outbound(r#"{"model":"m","stream":"yes"}"#, true);
+        let v: Value = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(v["stream"], Value::Bool(true));
+
+        let pinned = pin_outbound(r#"{"model":"m","stream":true}"#, false);
+        let v: Value = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(v["stream"], Value::Bool(false));
     }
 
     #[test]
