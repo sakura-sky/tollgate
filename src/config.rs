@@ -151,6 +151,26 @@ pub struct BillingConfig {
     /// real write rate observed (2x the input rate for a long-TTL entry).
     #[serde(default = "default_cache_write_permille")]
     pub cache_write_fallback_permille: u32,
+    /// Prompt size above which providers commonly re-rate the WHOLE request.
+    /// Zero disables long-context re-rating entirely.
+    #[serde(default = "default_long_context_threshold")]
+    pub long_context_threshold_tokens: u64,
+    /// Multiple applied to the prompt legs above that threshold, in per-mille.
+    ///
+    /// A price is one rate per class and cannot express a rate that changes with
+    /// size, so without this a large request is UNDER-charged by the tier
+    /// multiple, and under-charging is the one direction this product may never
+    /// err in. Same posture as the unpriced-cache-class fallback: an unmodelled
+    /// dimension costs more, not less.
+    #[serde(default = "default_long_context_permille")]
+    pub long_context_multiple_permille: u32,
+}
+
+fn default_long_context_threshold() -> u64 {
+    200_000
+}
+fn default_long_context_permille() -> u32 {
+    2_000
 }
 
 fn default_cache_read_permille() -> u32 {
@@ -167,6 +187,15 @@ impl BillingConfig {
         crate::pricing::CacheRateFallback {
             read_permille: self.cache_read_fallback_permille,
             write_permille: self.cache_write_fallback_permille,
+        }
+    }
+
+    /// The long-context tier these settings describe.
+    #[must_use]
+    pub fn long_context_tier(&self) -> crate::pricing::LongContextTier {
+        crate::pricing::LongContextTier {
+            threshold_tokens: self.long_context_threshold_tokens,
+            multiple_permille: self.long_context_multiple_permille,
         }
     }
 }
@@ -238,6 +267,8 @@ impl Default for Config {
                 currency: "USD".to_string(),
                 cache_read_fallback_permille: default_cache_read_permille(),
                 cache_write_fallback_permille: default_cache_write_permille(),
+                long_context_threshold_tokens: default_long_context_threshold(),
+                long_context_multiple_permille: default_long_context_permille(),
             },
             security: SecurityConfig {
                 api_key_pepper: String::new(),

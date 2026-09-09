@@ -305,6 +305,7 @@ pub async fn load_budgets(pool: &PgPool) -> Result<Vec<Budget>, sqlx::Error> {
 pub async fn load_prices(
     pool: &PgPool,
     fallback: crate::pricing::CacheRateFallback,
+    long_context: crate::pricing::LongContextTier,
 ) -> Result<PriceBook, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT provider, model, input_per_1m_micros, output_per_1m_micros, \
@@ -330,6 +331,7 @@ pub async fn load_prices(
                 row.get::<Option<i64>, _>("cache_write_per_1m_micros"),
                 fallback,
             )
+            .with_long_context(long_context)
         })
         .collect();
     // One warning per reload naming the models being over-charged on purpose,

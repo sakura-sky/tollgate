@@ -151,7 +151,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // Load budget config and prices from Postgres into the core.
     let budgets = load_budgets(&db).await.context("loading budgets")?;
-    let prices = load_prices(&db, cache_fallback)
+    let long_context = cfg.billing.long_context_tier();
+    long_context
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
+
+    let prices = load_prices(&db, cache_fallback, long_context)
         .await
         .context("loading model prices")?;
     tracing::info!(
@@ -349,6 +354,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             budgets_view.clone(),
             cfg.reload.interval,
             cache_fallback,
+            long_context,
         );
         tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
     }
@@ -385,6 +391,7 @@ fn spawn_reload_task(
     budgets_view: Arc<ArcSwap<Vec<Budget>>>,
     interval: Duration,
     cache_fallback: crate::pricing::CacheRateFallback,
+    long_context: crate::pricing::LongContextTier,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -398,7 +405,7 @@ fn spawn_reload_task(
                     continue;
                 }
             };
-            let prices = match load_prices(&db, cache_fallback).await {
+            let prices = match load_prices(&db, cache_fallback, long_context).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "config reload: prices query failed; keeping current");

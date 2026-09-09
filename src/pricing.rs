@@ -73,6 +73,12 @@ pub struct ModelPrice {
     /// operator. Surfaced so a deployment can see it is being over-charged on
     /// purpose instead of discovering it in a variance review.
     pub cache_rates_are_fallback: bool,
+    /// Long-context re-rating, resolved at price-book build time like the cache
+    /// rates. Carried on the price rather than passed to each call site so that
+    /// every cost and every reservation inherits it, and a new call site cannot
+    /// forget to apply it.
+    #[serde(default)]
+    pub long_context: LongContextTier,
 }
 
 /// Token usage for a single request, normalised across providers by the
@@ -195,6 +201,83 @@ impl Usage {
     }
 }
 
+/// Long-context tiering: several current models bill the WHOLE prompt at a
+/// higher rate once it crosses a threshold (commonly 200k tokens, commonly 2x).
+///
+/// A price is one rate per class, so it cannot express a rate that changes with
+/// size. Ignoring that under-charges every large request by the tier multiple,
+/// and under-charging is the one direction this product may never err in.
+///
+/// Rather than refuse large prompts, or wait for tiered rate rows in the schema,
+/// apply a conservative multiple above the threshold. Same shape as the
+/// unpriced-cache-class fallback: an unmodelled dimension costs more, not less.
+/// Integer per-mille, so no float touches the money path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LongContextTier {
+    /// Prompt tokens above which the multiple applies. Zero disables it.
+    pub threshold_tokens: u64,
+    /// Applied to every prompt-side rate once the threshold is crossed.
+    pub multiple_permille: u32,
+}
+
+impl Default for LongContextTier {
+    /// OFF by default: a threshold to notice at, and no uplift.
+    ///
+    /// Defaulting to an uplift would invent a charge. Unlike an unpriced cache
+    /// class, where the class demonstrably exists and demonstrably costs more,
+    /// a given model may not tier at all, and a 2x default would silently double
+    /// the bill for large prompts on a model that bills flat. It would also
+    /// break the definition of the unit: one million tokens would no longer cost
+    /// the per-million rate.
+    ///
+    /// So the default leaves cost unchanged and instead makes the gap visible:
+    /// a prompt above the threshold logs that it may be under-charged. An
+    /// operator who knows their model tiers sets the multiple.
+    fn default() -> Self {
+        Self {
+            threshold_tokens: 200_000,
+            multiple_permille: 1_000,
+        }
+    }
+}
+
+impl LongContextTier {
+    /// Whether an uplift applies to this prompt. False when no multiple is
+    /// configured, even above the threshold.
+    #[must_use]
+    pub fn applies_to(&self, prompt_tokens: u64) -> bool {
+        self.threshold_tokens > 0
+            && self.multiple_permille > 1_000
+            && prompt_tokens > self.threshold_tokens
+    }
+
+    /// Whether this prompt is large enough that the provider may be tiering it
+    /// while Tollgate is not. Used to log the gap rather than silently accept it.
+    #[must_use]
+    pub fn is_unpriced_long_context(&self, prompt_tokens: u64) -> bool {
+        self.threshold_tokens > 0
+            && self.multiple_permille <= 1_000
+            && prompt_tokens > self.threshold_tokens
+    }
+
+    /// Reject a multiple that would make a large request CHEAPER, which would
+    /// invert the whole point.
+    ///
+    /// # Errors
+    /// Returns a message when the multiple is below 1.0x.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.threshold_tokens > 0 && self.multiple_permille < MIN_FALLBACK_PERMILLE {
+            return Err(format!(
+                "long_context_multiple_permille is {}, below the minimum {MIN_FALLBACK_PERMILLE} \
+                 (1.0x). A multiple under 1.0x would make a long-context request cheaper than a \
+                 short one, when providers charge MORE for it.",
+                self.multiple_permille
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a provider's worst case looks like on the prompt side, used to size a
 /// reservation before the response reveals how the prompt actually split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -313,6 +396,7 @@ impl ModelPrice {
             cache_read_per_1m_micros: CacheRateFallback::apply(input, fb.read_permille),
             cache_write_per_1m_micros: CacheRateFallback::apply(input, fb.write_permille),
             cache_rates_are_fallback: true,
+            long_context: LongContextTier::default(),
         }
     }
 
@@ -337,9 +421,46 @@ impl ModelPrice {
         self
     }
 
-    /// Cost of `usage` at this price, in micros.
+    /// Attach a long-context tier. Applied by every cost and every reservation.
+    #[must_use]
+    pub fn with_long_context(mut self, tier: LongContextTier) -> Self {
+        self.long_context = tier;
+        self
+    }
+
+    /// The uplift owed on a prompt that crosses the long-context threshold.
+    ///
+    /// The multiple applies to the WHOLE prompt, not just the excess, because
+    /// that is how providers bill it: crossing the threshold re-rates the entire
+    /// request rather than the tokens beyond it.
+    fn long_context_uplift(&self, usage: Usage) -> i64 {
+        if !self.long_context.applies_to(usage.total_prompt_tokens()) {
+            return 0;
+        }
+        let prompt_only = Usage::with_cache(
+            usage.input_tokens,
+            0,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        );
+        let prompt_base = self.cost_micros_untiered(prompt_only);
+        let uplift = i128::from(prompt_base)
+            * i128::from(self.long_context.multiple_permille.saturating_sub(1_000))
+            / 1_000;
+        i64::try_from(uplift).unwrap_or(i64::MAX)
+    }
+
+    /// Cost of `usage` at this price, in micros, INCLUDING long-context
+    /// re-rating.
     #[must_use]
     pub fn cost_micros(&self, usage: Usage) -> i64 {
+        let base = self.cost_micros_untiered(usage);
+        base.saturating_add(self.long_context_uplift(usage))
+    }
+
+    /// Cost at the flat per-class rates, before any long-context re-rating.
+    #[must_use]
+    fn cost_micros_untiered(&self, usage: Usage) -> i64 {
         // Sum ALL FOUR legs at full micro-precision, THEN round once. Rounding
         // each leg independently multiplies the rounding error by the number of
         // legs and can over-count a request's cost.
@@ -406,7 +527,14 @@ impl ModelPrice {
         max_output_tokens: u64,
         profile: PromptReserveProfile,
     ) -> i64 {
-        let prompt = i128::from(prompt_tokens) * i128::from(self.reserve_prompt_rate(profile));
+        let mut rate = i128::from(self.reserve_prompt_rate(profile));
+        // A prompt that will be re-rated for length must be RESERVED at the
+        // re-rated price too, or settle exceeds reserve on exactly the largest
+        // requests and walks a hard cap.
+        if self.long_context.applies_to(prompt_tokens) {
+            rate = rate * i128::from(self.long_context.multiple_permille) / 1_000;
+        }
+        let prompt = i128::from(prompt_tokens) * rate;
         let output = i128::from(max_output_tokens) * i128::from(self.output_per_1m_micros);
         round_to_micros(prompt.saturating_add(output))
     }
@@ -581,6 +709,87 @@ mod tests {
                 .is_none()
         );
         assert!(book.lookup("openai", "gpt-5").is_none());
+    }
+
+    #[test]
+    fn long_context_prompts_are_re_rated_not_under_charged() {
+        // Several current models bill the WHOLE prompt at a higher rate above a
+        // threshold. A single rate per class cannot express that, and ignoring
+        // it under-charges every large request by the tier multiple.
+        // Tiering rides on the price, so every cost AND every reservation
+        // inherits it and a new call site cannot forget to apply it.
+        //
+        // OFF by default: `off` is a plain price. Defaulting to an uplift would
+        // invent a charge on models that bill flat, and would break the
+        // definition of the unit (one million tokens costing the per-million
+        // rate), which two existing tests correctly pin.
+        let off = ModelPrice::new("anthropic", "m", 1_000_000, 5_000_000);
+        assert_eq!(
+            off.cost_micros(Usage::new(1_000_000, 0)),
+            1_000_000,
+            "the default must not change what a rate means"
+        );
+        let on = off.clone().with_long_context(LongContextTier {
+            threshold_tokens: 200_000,
+            multiple_permille: 2_000,
+        });
+
+        // Under the threshold: identical either way.
+        let small = Usage::new(100_000, 1_000);
+        assert_eq!(on.cost_micros(small), off.cost_micros(small));
+
+        // Over it: the PROMPT leg doubles, output does not.
+        let big = Usage::new(300_000, 1_000);
+        assert_eq!(
+            on.cost_micros(big),
+            off.cost_micros(big) + 300_000,
+            "prompt leg should double, output unchanged"
+        );
+
+        // Cache classes count toward the threshold and are re-rated with it: a
+        // 300k prompt served from cache is still a 300k prompt to the provider.
+        let cached = Usage::with_cache(0, 1_000, 300_000, 0);
+        assert!(on.cost_micros(cached) > off.cost_micros(cached));
+
+        // The RESERVATION is re-rated too, or settle would exceed reserve on
+        // exactly the largest requests and walk a hard cap.
+        let prof = profile(false, false);
+        assert!(on.reserve_micros(300_000, 1_000, prof) > off.reserve_micros(300_000, 1_000, prof));
+        let reserved = on.reserve_micros(300_000, 1_000, prof);
+        let settled = on.cost_micros(Usage::new(300_000, 1_000));
+        assert!(
+            settled <= reserved,
+            "settle {settled} exceeded reserve {reserved}"
+        );
+    }
+
+    #[test]
+    fn a_long_context_multiple_below_one_is_rejected() {
+        // Would make a large request cheaper than a small one, when providers
+        // charge more for it.
+        let bad = LongContextTier {
+            threshold_tokens: 200_000,
+            multiple_permille: 500,
+        };
+        assert!(bad.validate().is_err());
+        assert!(LongContextTier::default().validate().is_ok());
+        // Threshold 0 disables the feature, so the multiple is not checked.
+        let off = LongContextTier {
+            threshold_tokens: 0,
+            multiple_permille: 0,
+        };
+        assert!(off.validate().is_ok());
+
+        // The default is a no-op uplift with a threshold to notice at, so a
+        // large prompt is flagged as possibly under-charged rather than being
+        // silently re-rated on a model that may not tier at all.
+        let d = LongContextTier::default();
+        assert!(!d.applies_to(500_000), "default must not change any cost");
+        assert!(
+            d.is_unpriced_long_context(500_000),
+            "but it must be visible"
+        );
+        assert!(!d.is_unpriced_long_context(1_000));
     }
 
     #[test]

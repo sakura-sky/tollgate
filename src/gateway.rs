@@ -481,6 +481,23 @@ impl GatewayCore {
                  so this request may settle above its reservation"
             );
         }
+        // A prompt large enough that the provider may be re-rating the whole
+        // request while we are billing it flat. Logged rather than guessed at:
+        // inventing a multiple would over-charge models that bill flat, and
+        // saying nothing would under-charge the ones that do not.
+        if price
+            .long_context
+            .is_unpriced_long_context(resp.usage.total_prompt_tokens())
+        {
+            tracing::warn!(
+                provider = provider_id,
+                model = %parsed.model,
+                prompt_tokens = resp.usage.total_prompt_tokens(),
+                "prompt exceeds the long-context threshold and no tier multiple is \
+                 configured; if this model re-rates long requests, this is an \
+                 UNDER-charge. Set TOLLGATE_BILLING__LONG_CONTEXT_MULTIPLE_PERMILLE"
+            );
+        }
         // Settle by upstream status.
         let is_success = (200..300).contains(&resp.status);
         let metered = price.cost_micros(resp.usage);
