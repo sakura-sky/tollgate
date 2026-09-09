@@ -263,6 +263,10 @@ fn value_has_cache_control(v: &Value) -> bool {
 /// Adapter for the Anthropic Messages API.
 pub struct AnthropicProvider {
     http: reqwest::Client,
+    /// Streaming client: NO total request timeout, since a stream is expected to
+    /// be long-lived. The buffered `http` client's total timeout would sever one
+    /// mid-body. Bounded instead by the relay's idle and max-duration guards.
+    stream_http: reqwest::Client,
     api_key: String,
     base_url: String,
     version: String,
@@ -270,14 +274,80 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     #[must_use]
-    pub fn new(http: reqwest::Client, api_key: String, base_url: String, version: String) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        stream_http: reqwest::Client,
+        api_key: String,
+        base_url: String,
+        version: String,
+    ) -> Self {
         Self {
             http,
+            stream_http,
             api_key,
             base_url: base_url.trim_end_matches('/').to_owned(),
             version,
         }
     }
+
+    /// Parse a request that IS allowed to stream.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::BadRequest`] if the body cannot be metered.
+    pub fn parse_streaming(
+        &self,
+        rest_path: &str,
+        body: &str,
+    ) -> Result<ParsedRequest, ProviderError> {
+        self.parse_common(rest_path, body, true)
+    }
+
+    /// Open the upstream SSE stream. Forwards the body verbatim: unlike the
+    /// OpenAI path there is no cap field to normalise, because Anthropic already
+    /// requires `max_tokens` and `parse_common` refused the request without it,
+    /// so reserved and enforced already agree.
+    ///
+    /// # Errors
+    /// Returns a provider error if the upstream call fails.
+    pub async fn forward_stream(&self, body: &str) -> Result<reqwest::Response, ProviderError> {
+        let url = format!("{}/v1/messages", self.base_url);
+        self.stream_http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", &self.version)
+            .header("content-type", "application/json")
+            .body(pin_service_tier(body))
+            .send()
+            .await
+            .map_err(|e| classify_transport_error(&e))
+    }
+}
+
+/// Force `service_tier: "standard_only"` on an outbound Messages body.
+///
+/// An ABSENT tier means "auto", which uses priority capacity at a premium where
+/// an organisation has it. So refusing only an explicit non-standard value, as
+/// `parse_common` does, leaves the common case unmetered: almost nobody sets the
+/// field. Pinning it here rather than in a route handler means BOTH the native
+/// `/v1/messages` route and the legacy `/v1/anthropic/messages` route get it,
+/// and it cannot be forgotten by a future third caller.
+///
+/// Mirrors how the OpenAI adapter already pins the outbound `max_tokens` so that
+/// reserved and enforced agree. A body that will not parse is passed through
+/// untouched: `parse_common` has already rejected it, so this cannot be the
+/// thing that lets a bad body upstream.
+fn pin_service_tier(body: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<Value>(body) else {
+        return body.to_owned();
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return body.to_owned();
+    };
+    obj.insert(
+        "service_tier".to_owned(),
+        Value::String("standard_only".to_owned()),
+    );
+    serde_json::to_string(&v).unwrap_or_else(|_| body.to_owned())
 }
 
 /// Anthropic reports prompt-side tokens as three DISJOINT classes:
@@ -674,7 +744,7 @@ impl Provider for AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
             .header("content-type", "application/json")
-            .body(body.to_owned())
+            .body(pin_service_tier(body))
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))?;
@@ -1510,6 +1580,16 @@ impl Provider for OpenAiProvider {
 mod tests {
     use super::*;
 
+    fn anthropic_test_provider() -> AnthropicProvider {
+        AnthropicProvider::new(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            "k".into(),
+            "https://api.anthropic.com".into(),
+            "2023-06-01".into(),
+        )
+    }
+
     fn openai_test_provider() -> OpenAiProvider {
         OpenAiProvider::custom(
             reqwest::Client::new(),
@@ -1750,12 +1830,7 @@ mod tests {
 
     #[test]
     fn anthropic_parse_request_reads_model_and_max_tokens() {
-        let p = AnthropicProvider::new(
-            reqwest::Client::new(),
-            "k".into(),
-            "https://api.anthropic.com".into(),
-            "2023-06-01".into(),
-        );
+        let p = anthropic_test_provider();
         let body = r#"{"model":"claude-3-5-sonnet","max_tokens":512,"messages":[]}"#;
         let parsed = p.parse_request("messages", body).unwrap();
         assert_eq!(parsed.model, "claude-3-5-sonnet");
@@ -1946,13 +2021,26 @@ mod tests {
     }
 
     #[test]
+    fn outbound_body_pins_the_service_tier() {
+        // Absent means "auto", which uses priority capacity at a premium where
+        // an org has it, and almost nobody sets the field. Pinning it in the
+        // adapter rather than a route handler means the legacy
+        // /v1/anthropic/messages route is covered too.
+        let pinned = pin_service_tier(r#"{"model":"m","max_tokens":10,"messages":[]}"#);
+        let v: Value = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(v["service_tier"], "standard_only");
+        // An explicit value is overwritten, not merely defaulted.
+        let pinned = pin_service_tier(r#"{"model":"m","service_tier":"auto"}"#);
+        let v: Value = serde_json::from_str(&pinned).unwrap();
+        assert_eq!(v["service_tier"], "standard_only");
+        // Unparseable bodies pass through: parse_common already rejected them,
+        // so this must not be what lets a bad body upstream.
+        assert_eq!(pin_service_tier("not json"), "not json");
+    }
+
+    #[test]
     fn anthropic_refuses_a_longer_cache_ttl() {
-        let p = AnthropicProvider::new(
-            reqwest::Client::new(),
-            "k".into(),
-            "https://api.anthropic.com".into(),
-            "2023-06-01".into(),
-        );
+        let p = anthropic_test_provider();
         // A 1h write bills at 2x the input rate, a 5m write at 1.25x, against a
         // single configured cache-write rate. Reserving at one and settling at
         // the other overshoots a hard cap on every request.
@@ -1974,12 +2062,7 @@ mod tests {
         // This guard used to live only in the gateway, which the streaming
         // handler bypasses, so a streamed request with a URL image would have
         // reserved from body bytes and settled far above it.
-        let p = AnthropicProvider::new(
-            reqwest::Client::new(),
-            "k".into(),
-            "https://api.anthropic.com".into(),
-            "2023-06-01".into(),
-        );
+        let p = anthropic_test_provider();
         let media = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user",
             "content":[{"type":"image","source":{"type":"url","url":"https://x/y.png"}}]}]}"#;
         assert!(p.parse_request("messages", media).is_err());
@@ -2018,12 +2101,7 @@ mod tests {
 
     #[test]
     fn anthropic_reserves_the_write_rate_only_for_requests_that_can_write() {
-        let p = AnthropicProvider::new(
-            reqwest::Client::new(),
-            "k".into(),
-            "https://api.anthropic.com".into(),
-            "2023-06-01".into(),
-        );
+        let p = anthropic_test_provider();
         let plain = p
             .parse_request("messages", r#"{"model":"m","max_tokens":10,"messages":[]}"#)
             .unwrap();
@@ -2090,12 +2168,7 @@ mod tests {
 
     #[test]
     fn anthropic_server_side_tools_are_refused() {
-        let p = AnthropicProvider::new(
-            reqwest::Client::new(),
-            "k".into(),
-            "https://api.anthropic.com".into(),
-            "2023-06-01".into(),
-        );
+        let p = anthropic_test_provider();
         // Billed per search, reported in no token field.
         assert!(
             p.parse_request(

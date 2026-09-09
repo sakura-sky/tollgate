@@ -123,10 +123,12 @@ immutability. `audit_log` is likewise append-only.
   configured currency unit; cost math uses `i128` intermediates and rounds once.
 - **Reserve then settle.** The worst-case cost is reserved before the forward and
   settled to the provider's reported usage after, so a hard cap cannot be blown by
-  an unknown output length. Cost is exact for the standard input and output token
-  classes; provider prompt-caching token classes (cache-read and cache-write) are
-  not yet priced separately, so cost is approximate on cache-heavy workloads (see
-  the README "Limitations").
+  an unknown output length. Cost is exact for the input, output and prompt-cache
+  token classes, each priced separately, PROVIDED the operator has set a rate for
+  each class; an unpriced cache class falls back to a conservative multiple of the
+  input rate rather than to zero, which over-charges rather than under-charging.
+  Where usage cannot be trusted at all the request is charged its reservation and
+  recorded as `estimated` (see the README "Limitations").
 - **Atomic enforcement.** The Valkey reserve is a single Lua check-and-increment;
   the settle is a single Lua apply. A cache failure fails closed (503), not a
   budget bypass.
