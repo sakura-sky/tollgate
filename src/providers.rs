@@ -446,6 +446,136 @@ impl AnthropicProvider {
     }
 }
 
+/// Meters an Anthropic SSE stream.
+///
+/// Anthropic's usage is NOT terminal, which is the whole difficulty. Observed
+/// from a live stream:
+///
+/// - `message_start` carries the input classes AND `output_tokens: 1`, which is
+///   a placeholder, not a count.
+/// - `message_delta` repeats the input classes and carries the real, cumulative
+///   output. Cumulative means the LAST one wins; summing them over-charges.
+/// - `message_stop` is the final event and carries no usage.
+/// - `ping` events and bare `event:` lines are interleaved throughout.
+///
+/// The placeholder is why "usage seen" must mean `message_stop` reached rather
+/// than "some event carried a usage object". A stream that dies after
+/// `message_start` has a usage object in hand reporting ONE output token for
+/// what may have been a full response. Treating that as a clean finish would
+/// under-charge by the entire output leg, which is precisely the shape of bug
+/// the OpenAI path is immune to only because its usage chunk is terminal.
+#[derive(Debug, Default)]
+pub struct AnthropicStreamMeter {
+    start: Option<Usage>,
+    last_delta: Option<Usage>,
+    errored: bool,
+    stopped: bool,
+}
+
+impl AnthropicStreamMeter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one SSE line. Ignores `event:` lines, pings, comments and blanks.
+    pub fn observe_line(&mut self, line: &str) {
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(u) = v.get("message").and_then(|m| m.get("usage")) {
+                    self.start = Some(parse_anthropic_usage_obj(u));
+                }
+            }
+            Some("message_delta") => {
+                if let Some(u) = v.get("usage") {
+                    // Cumulative: overwrite rather than accumulate.
+                    self.last_delta = Some(parse_anthropic_usage_obj(u));
+                }
+            }
+            Some("message_stop") => self.stopped = true,
+            // An `error` event on an otherwise-200 stream (overloaded_error is
+            // the common one). The transport then closes normally, so without
+            // this the relay would see a clean EOF and settle as if finished.
+            Some("error") => self.errored = true,
+            _ => {}
+        }
+    }
+
+    /// True only when the stream genuinely completed.
+    ///
+    /// Deliberately NOT transport EOF: an error event followed by a normal close
+    /// is an EOF, and a `message_stop` followed by a held-open socket is not.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.stopped && !self.errored
+    }
+
+    /// Whether anything was generated at all. An error before `message_start`
+    /// means the provider produced nothing, so the caller can charge the input
+    /// floor instead of the full reservation.
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.start.is_some()
+    }
+
+    /// The metered usage: the maximum of each class across `message_start` and
+    /// the final `message_delta`.
+    ///
+    /// Max rather than "trust the delta" because both events carry the input
+    /// classes and taking the larger can only over-charge. A class that DECREASES
+    /// between them is self-contradictory, and no real version does that, so it
+    /// is marked suspect and settles at the reservation rather than being costed
+    /// on numbers that cannot both be true.
+    #[must_use]
+    pub fn usage(&self) -> Option<Usage> {
+        let (s, d) = match (self.start, self.last_delta) {
+            (None, None) => return None,
+            (s, d) => (s.unwrap_or_default(), d.unwrap_or_default()),
+        };
+        let decreased = self.start.is_some()
+            && self.last_delta.is_some()
+            && (d.input_tokens < s.input_tokens
+                || d.cache_read_tokens < s.cache_read_tokens
+                || d.cache_write_tokens < s.cache_write_tokens);
+        let u = Usage::with_cache(
+            s.input_tokens.max(d.input_tokens),
+            s.output_tokens.max(d.output_tokens),
+            s.cache_read_tokens.max(d.cache_read_tokens),
+            s.cache_write_tokens.max(d.cache_write_tokens),
+        );
+        Some(if decreased {
+            tracing::warn!(
+                "anthropic stream reported a DECREASING input class between \
+                            message_start and message_delta; usage is self-contradictory"
+            );
+            u.into_suspect()
+        } else {
+            u
+        })
+    }
+}
+
+/// Parse a bare Anthropic `usage` object (not a whole response body).
+fn parse_anthropic_usage_obj(u: &Value) -> Usage {
+    let get = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Usage::with_cache(
+        get("input_tokens"),
+        get("output_tokens"),
+        get("cache_read_input_tokens"),
+        get("cache_creation_input_tokens"),
+    )
+}
+
 /// Build the body for `/v1/messages/count_tokens` from an ALLOWLIST.
 ///
 /// The client's Messages body cannot be posted here unchanged. `count_tokens`
@@ -1657,6 +1787,125 @@ mod tests {
         let u = parse_vertex_usage(&v);
         assert_eq!(u.input_tokens, 7);
         assert_eq!(u.output_tokens, 13);
+    }
+
+    // Lines copied verbatim from a live claude-haiku-4-5 stream capture, trailing
+    // whitespace and all, so these fixtures cannot drift from what the API sends.
+    const START: &str = r#"data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","id":"msg_x","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":3920,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1,"service_tier":"standard"}}  }"#;
+    const DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":3920,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":26}        }"#;
+    const STOP: &str = r#"data: {"type":"message_stop"          }"#;
+
+    fn meter_over(lines: &[&str]) -> AnthropicStreamMeter {
+        let mut m = AnthropicStreamMeter::new();
+        for l in lines {
+            m.observe_line(l);
+        }
+        m
+    }
+
+    #[test]
+    fn anthropic_stream_clean_finish_meters_the_final_delta() {
+        let m = meter_over(&[
+            "event: message_start",
+            START,
+            r#"data: {"type": "ping"}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1, 2"}}"#,
+            DELTA,
+            STOP,
+        ]);
+        assert!(m.is_clean());
+        let u = m.usage().unwrap();
+        assert_eq!(u.input_tokens, 3920);
+        // 26 from the delta, NOT the placeholder 1 in message_start.
+        assert_eq!(u.output_tokens, 26);
+        assert!(!u.suspect);
+    }
+
+    #[test]
+    fn anthropic_stream_dying_after_start_is_not_clean() {
+        // THE case this meter exists for. message_start carries a usage object
+        // with output_tokens: 1, a placeholder. If "usage seen" meant "an event
+        // carried usage", a stream that died after generating a full response
+        // would settle on ONE output token.
+        let m = meter_over(&["event: message_start", START]);
+        assert!(!m.is_clean(), "no message_stop means not clean");
+        assert_eq!(m.usage().unwrap().output_tokens, 1);
+        assert!(m.started());
+    }
+
+    #[test]
+    fn anthropic_stream_error_event_is_not_clean() {
+        // An error event arrives on an otherwise-200 stream and the transport
+        // then closes normally, so EOF alone would look like success.
+        let m = meter_over(&[
+            START,
+            DELTA,
+            r#"data: {"type":"error","error":{"type":"overloaded_error"}}"#,
+        ]);
+        assert!(!m.is_clean());
+    }
+
+    #[test]
+    fn anthropic_stream_error_before_start_generated_nothing() {
+        let m = meter_over(&[r#"data: {"type":"error","error":{"type":"overloaded_error"}}"#]);
+        assert!(!m.is_clean());
+        assert!(!m.started(), "nothing was generated, so nothing was billed");
+        assert!(m.usage().is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_output_is_cumulative_not_summed() {
+        // Successive deltas restate a running total. Summing them would bill
+        // 10 + 20 + 26 = 56 for a 26-token response.
+        let d = |n: u64| {
+            format!(
+                r#"data: {{"type":"message_delta","delta":{{}},"usage":{{"input_tokens":3920,"output_tokens":{n}}}}}"#
+            )
+        };
+        let m = meter_over(&[START, &d(10), &d(20), &d(26), STOP]);
+        assert_eq!(m.usage().unwrap().output_tokens, 26);
+    }
+
+    #[test]
+    fn anthropic_stream_takes_the_larger_of_each_input_class() {
+        // Synthetic: the live capture never produced non-zero cache classes, so
+        // this pins the rule rather than an observed response. Both events carry
+        // the input classes, and the larger can only over-charge.
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50,"cache_read_input_tokens":9000,"cache_creation_input_tokens":100,"output_tokens":1}}}"#;
+        let delta = r#"data: {"type":"message_delta","delta":{},"usage":{"input_tokens":50,"cache_read_input_tokens":9000,"cache_creation_input_tokens":100,"output_tokens":40}}"#;
+        let m = meter_over(&[start, delta, STOP]);
+        let u = m.usage().unwrap();
+        assert_eq!(u.cache_read_tokens, 9_000);
+        assert_eq!(u.cache_write_tokens, 100);
+        assert_eq!(u.output_tokens, 40);
+        assert!(!u.suspect);
+    }
+
+    #[test]
+    fn anthropic_stream_decreasing_input_class_is_suspect() {
+        // Self-contradictory: no real version lowers an input class mid-stream.
+        // Costing it on either reading could settle above a reservation sized
+        // from the other, so it charges the reservation instead.
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9000,"output_tokens":1}}}"#;
+        let delta = r#"data: {"type":"message_delta","delta":{},"usage":{"input_tokens":5,"output_tokens":40}}"#;
+        let m = meter_over(&[start, delta, STOP]);
+        assert!(m.usage().unwrap().suspect);
+    }
+
+    #[test]
+    fn anthropic_stream_ignores_noise() {
+        let m = meter_over(&[
+            "event: message_start",
+            ": keep-alive",
+            "",
+            r#"data: {"type": "ping"}"#,
+            "data: not json at all",
+            START,
+            DELTA,
+            STOP,
+        ]);
+        assert!(m.is_clean());
+        assert_eq!(m.usage().unwrap().output_tokens, 26);
     }
 
     #[test]
