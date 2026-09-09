@@ -46,8 +46,21 @@ pub struct ProviderResponse {
 pub enum ProviderError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// The call failed BEFORE the provider could have served it: connect, DNS or
+    /// TLS failure, or a failure building or authorising the request. Nothing was
+    /// billed upstream, so the reservation is released in full.
     #[error("upstream provider error: {0}")]
     Upstream(String),
+    /// The request may have reached the provider and been billed, but the result
+    /// could not be metered: a timeout after the request was sent, a transport
+    /// error mid-response, or a 2xx whose body will not parse.
+    ///
+    /// Releasing the reservation here would under-charge a request the provider
+    /// is invoicing, so the caller charges the reservation instead and records
+    /// the row as `estimated`. Over-charging visibly beats under-charging
+    /// silently.
+    #[error("metering failed: {0}")]
+    MeteringFailed(String),
 }
 
 /// A backend Tollgate can proxy to.

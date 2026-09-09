@@ -57,8 +57,29 @@ pub struct ReloadConfig {
     pub interval: Duration,
 }
 
+fn default_provider_timeout() -> Duration {
+    Duration::from_secs(600)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersConfig {
+    /// Total time allowed for one BUFFERED upstream call.
+    ///
+    /// Separate from `http.request_timeout`, which bounds Tollgate's own local
+    /// routes, because the two want opposite values. A console query should
+    /// finish in seconds; a non-streaming LLM sends no headers at all until
+    /// generation completes, so a large response legitimately takes minutes and
+    /// looks identical to a hang until it arrives.
+    ///
+    /// Sharing one knob meant either cutting off real responses or leaving the
+    /// local routes effectively unbounded. When this expires the request is
+    /// treated as POSSIBLY BILLED and charged its reservation, because the
+    /// provider may well have generated a full response we never read.
+    ///
+    /// Streaming ignores this: it is bounded by the idle and max-duration
+    /// guards instead, since a stream is expected to be long-lived.
+    #[serde(with = "humantime_serde", default = "default_provider_timeout")]
+    pub request_timeout: Duration,
     /// How input tokens are counted for the pre-forward budget reservation:
     /// `fast` (over-estimate from body size, no extra call, lowest latency) or
     /// `exact` (a pre-flight token-count call to the provider). Both settle to
@@ -222,6 +243,7 @@ impl Default for Config {
                 api_key_pepper: String::new(),
             },
             providers: ProvidersConfig {
+                request_timeout: default_provider_timeout(),
                 admission: "fast".to_string(),
                 enable_mock: false,
                 vertex: VertexConfig {

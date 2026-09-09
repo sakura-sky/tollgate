@@ -38,7 +38,7 @@ use crate::backends::{
 use crate::budget::{Budget, RequestCtx, Scope};
 use crate::config::Config;
 use crate::gateway::{
-    GatewayCore, KeyStore, ReserveError, StreamSettlement, UsageSink, outcome_response,
+    GatewayCore, KeyStore, ReserveError, Settlement, UsageSink, outcome_response,
 };
 use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
 use crate::provider::{MockProvider, Provider, ProviderError};
@@ -193,7 +193,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // including provider credentials (e.g. Anthropic's x-api-key), to another
     // host. Treat any 3xx as an upstream error instead.
     let http = reqwest::Client::builder()
-        .timeout(cfg.http.request_timeout)
+        // The PROVIDER timeout, not the local-route one. A non-streaming LLM
+        // sends no headers until generation finishes, so this has to allow for a
+        // full large response.
+        .timeout(cfg.providers.request_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP client")?;
@@ -417,20 +420,42 @@ fn spawn_maintenance_task(db: PgPool, window: Duration) {
 }
 
 pub fn router(state: AppState, request_timeout: Duration) -> Router {
-    Router::new()
+    // Local routes: bounded by the HTTP timeout, because nothing else bounds
+    // them. They do their own work and should never run long.
+    let local = Router::new()
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
         .route("/metrics", get(metrics))
         .route("/console", get(console))
         .route("/console/budgets", get(console_budgets))
         .route("/console/usage", get(console_usage))
-        .route("/v1/chat/completions", post(openai_chat))
-        .route("/v1/{provider}/{*rest}", post(gateway))
-        .with_state(state)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             request_timeout,
-        ))
+        ));
+
+    // Proxy routes: deliberately NOT under that layer.
+    //
+    // The layer's clock starts at the request head, while the provider client's
+    // starts later, after auth, parse and reserve. Applying the same duration to
+    // both means the layer always wins, and tower-http cancels the handler
+    // future rather than letting the provider call fail on its own terms. That
+    // matters because a non-streaming LLM sends no headers until generation
+    // finishes, so any response slower than the timeout, which large outputs
+    // routinely are, was cancelled mid-flight.
+    //
+    // A cancelled handler is now caught by the Settlement guard, so it no longer
+    // strands a reservation, but it would still turn every slow-but-successful
+    // request into a 503 charged at its reservation. These routes carry their
+    // own bounds instead: the buffered client's request timeout, and the
+    // streaming path's idle and max-duration guards.
+    let proxied = Router::new()
+        .route("/v1/chat/completions", post(openai_chat))
+        .route("/v1/{provider}/{*rest}", post(gateway));
+
+    local
+        .merge(proxied)
+        .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -473,7 +498,7 @@ async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: St
 /// Streaming path for `/v1/chat/completions`. Authenticates, prices, and reserves
 /// the worst case up front (fast admission), opens the upstream SSE stream, then
 /// spawns [`relay_stream`] to pass chunks through to the client while metering
-/// usage from the terminal chunk. Settlement is owned by a [`StreamSettlement`]
+/// usage from the terminal chunk. Settlement is owned by a [`Settlement`]
 /// guard that charges the observed cost on a clean finish and the FULL reservation
 /// on any abnormal end (client/upstream disconnect, idle/duration timeout, panic),
 /// so a stream is never under-charged.
@@ -521,7 +546,8 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
                 &format!("invalid request: {m}"),
             );
         }
-        Err(ProviderError::Upstream(_)) => {
+        // Pre-reservation, so nothing can have been billed on either variant.
+        Err(ProviderError::Upstream(_) | ProviderError::MeteringFailed(_)) => {
             return openai_error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
@@ -581,7 +607,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     // the buffered path's definition. Build the settlement guard now: from here on,
     // every exit settles the reservation exactly once (Drop covers panic/cancel).
     let overhead_micros = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
-    let guard = StreamSettlement::new(
+    let guard = Settlement::new(
         &core,
         reservation,
         reserve_micros,
@@ -644,14 +670,14 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
 }
 
 /// Relay upstream SSE chunks to the client while metering usage. Runs to a single
-/// exit point that settles the [`StreamSettlement`] guard: observed cost on a
+/// exit point that settles the [`Settlement`] guard: observed cost on a
 /// clean finish with a terminal usage chunk, otherwise the FULL reservation (never
 /// under-charge). Enforces an idle timeout, a max total duration, and a bounded
 /// line-reassembly buffer so a hostile or hung upstream cannot grief the gateway.
 async fn relay_stream(
     upstream: reqwest::Response,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
-    guard: StreamSettlement,
+    guard: Settlement,
     price: ModelPrice,
     reserve_micros: i64,
     semantics: CacheSemantics,

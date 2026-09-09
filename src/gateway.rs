@@ -286,7 +286,13 @@ impl GatewayCore {
         let parsed = match provider.parse_request(rest_path, body) {
             Ok(p) => p,
             Err(ProviderError::BadRequest(m)) => return Outcome::BadRequest(m),
-            Err(ProviderError::Upstream(m)) => return Outcome::Upstream(m),
+            // Nothing is reserved or forwarded yet, so neither of these can have
+            // been billed. MeteringFailed from a parser would be an adapter bug;
+            // it is handled rather than ignored so the match stays exhaustive if
+            // a future parser starts returning it.
+            Err(ProviderError::Upstream(m) | ProviderError::MeteringFailed(m)) => {
+                return Outcome::Upstream(m);
+            }
         };
         // In fast admission, refuse requests that reference external media: their
         // token cost is not bounded by body size, so the reservation would be far
@@ -380,27 +386,78 @@ impl GatewayCore {
                 return Outcome::BackendError(msg);
             }
         };
+        // Arm the settle guard IMMEDIATELY after reserving, before anything that
+        // can be cancelled. axum drops this future when the HTTP timeout fires or
+        // the client disconnects, and a buffered LLM call routinely outruns that
+        // timeout, so without the guard the reservation below would be stranded
+        // in every counter until the period rolled over, with no ledger row.
+        // Nothing between here and `settle` may return early without going
+        // through the guard.
+        let guard = Settlement::new(
+            self,
+            reservation,
+            reserve,
+            key_id.clone(),
+            provider_id.to_owned(),
+            parsed.model.clone(),
+            i64::try_from(
+                started
+                    .elapsed()
+                    .as_micros()
+                    .saturating_sub(provider_micros),
+            )
+            .unwrap_or(i64::MAX),
+        );
         // Forward. On error, release the whole reservation. The forward is the
         // upstream call, so its duration is excluded from our overhead.
         let f0 = std::time::Instant::now();
         let forwarded = provider.forward(rest_path, body, &parsed).await;
         provider_micros += f0.elapsed().as_micros();
+        let overhead_now = |provider_micros: u128| {
+            i64::try_from(
+                started
+                    .elapsed()
+                    .as_micros()
+                    .saturating_sub(provider_micros),
+            )
+            .unwrap_or(i64::MAX)
+        };
         let resp = match forwarded {
             Ok(r) => r,
-            Err(e) => {
-                self.budgets.commit(&reservation, 0).await;
-                self.record(
-                    &key_id,
-                    provider_id,
-                    &parsed.model,
-                    Usage::default(),
-                    0,
-                    "error",
-                    started,
-                    provider_micros,
-                )
-                .await;
-                return Outcome::Upstream(e.to_string());
+            // Never reached the provider: connect, DNS, TLS, or a failure
+            // building the call. Nothing was billed, so release it all.
+            Err(e @ ProviderError::Upstream(_) | e @ ProviderError::BadRequest(_)) => {
+                let msg = e.to_string();
+                guard
+                    .settle_with_overhead(
+                        0,
+                        Usage::default(),
+                        "error",
+                        overhead_now(provider_micros),
+                    )
+                    .await;
+                return Outcome::Upstream(msg);
+            }
+            // May well have been served and billed, but cannot be metered: a
+            // timeout after the request was sent, or a 2xx that will not parse.
+            // Releasing here would under-charge a request the provider is
+            // invoicing, so charge the reservation and say so in the ledger.
+            Err(ProviderError::MeteringFailed(msg)) => {
+                tracing::error!(
+                    provider = provider_id,
+                    model = %parsed.model,
+                    error = %msg,
+                    "upstream may have been billed but could not be metered; charging the reservation"
+                );
+                guard
+                    .settle_with_overhead(
+                        reserve,
+                        Usage::default(),
+                        "estimated",
+                        overhead_now(provider_micros),
+                    )
+                    .await;
+                return Outcome::Upstream(msg);
             }
         };
         // Tripwire: a cache write on a request we classified as unable to make
@@ -447,7 +504,7 @@ impl GatewayCore {
                 status = resp.status,
                 "upstream usage is implausible or self-contradictory; charging the reservation"
             );
-            (Usage::default(), reserve, "error")
+            (Usage::default(), reserve, "estimated")
         } else if is_success {
             if metered == 0 {
                 // 2xx with no usage reported (e.g. a safety-blocked response):
@@ -459,12 +516,15 @@ impl GatewayCore {
                 // plain input rate. On a write-capable adapter the prompt may
                 // have been cache-written at up to 2x, and this is the path that
                 // exists to prevent an under-charge, so it must not create one.
+                // `estimated`, not `allowed`: this figure is the reserved input
+                // leg, not anything the provider reported, and an operator
+                // reconciling against an invoice needs to see that.
                 (
                     resp.usage,
                     price
                         .reserve_micros(input_tokens, 0, reserve_profile)
                         .max(1),
-                    "allowed",
+                    "estimated",
                 )
             } else {
                 (resp.usage, metered, "allowed")
@@ -474,30 +534,19 @@ impl GatewayCore {
             // zero), never the reservation; record as an error.
             (resp.usage, metered, "error")
         };
-        self.budgets.commit(&reservation, actual).await;
-        self.record(
-            &key_id,
-            provider_id,
-            &parsed.model,
-            usage_for_ledger,
-            actual,
-            decision,
-            started,
-            provider_micros,
-        )
-        .await;
-        let overhead_micros = i64::try_from(
-            started
-                .elapsed()
-                .as_micros()
-                .saturating_sub(provider_micros),
-        )
-        .unwrap_or(i64::MAX);
+        guard
+            .settle_with_overhead(
+                actual,
+                usage_for_ledger,
+                decision,
+                overhead_now(provider_micros),
+            )
+            .await;
         Outcome::Allowed {
             status: resp.status,
             body: resp.body,
             cost_micros: actual,
-            overhead_micros,
+            overhead_micros: overhead_now(provider_micros),
             key_id,
         }
     }
@@ -535,13 +584,24 @@ impl GatewayCore {
     }
 }
 
-/// Guarantees a streaming request's budget reservation is settled EXACTLY ONCE.
-/// The relay task calls [`StreamSettlement::settle`] at its single exit point; if
-/// the guard is instead dropped without settling (task panic, cancellation, or
-/// runtime shutdown), `Drop` spawns a best-effort commit of the FULL reserved
-/// amount plus an error ledger row, so a reservation is never left dangling and a
-/// stream is never under-charged.
-pub struct StreamSettlement {
+/// Guarantees a request's budget reservation is settled EXACTLY ONCE, on EVERY
+/// path including the ones that never reach their own settle call.
+///
+/// Used by both the buffered and streaming paths. It was originally built for
+/// streaming, and while the buffered path went without it there was a live hole:
+/// axum drops a handler's future when the request times out or the client
+/// disconnects, so a buffered request that outran the HTTP timeout, which large
+/// LLM responses do routinely, never reached `commit`. Its full worst-case
+/// reservation stayed in every applicable counter until the period expired, with
+/// no ledger row to explain it, and because `reconcile_counters` only ever
+/// raises, nothing could bring it back down. The budget looked spent while the
+/// ledger showed headroom.
+///
+/// Callers settle at their single exit point. If the guard is instead dropped
+/// without settling (cancellation, disconnect, panic, runtime shutdown), `Drop`
+/// spawns a best-effort commit of the FULL reserved amount and an `estimated`
+/// ledger row, so a reservation is never left dangling and never under-charged.
+pub struct Settlement {
     budgets: Arc<dyn BudgetBackend>,
     usage: Arc<dyn UsageSink>,
     reservation: Option<Reservation>,
@@ -552,7 +612,7 @@ pub struct StreamSettlement {
     overhead_micros: i64,
 }
 
-impl StreamSettlement {
+impl Settlement {
     #[must_use]
     pub fn new(
         core: &GatewayCore,
@@ -577,7 +637,23 @@ impl StreamSettlement {
 
     /// Settle to `actual_micros`, record the usage row, and disarm the guard.
     /// Idempotent: a second call (or the Drop guard) is a no-op.
-    pub async fn settle(mut self, actual_micros: i64, usage: Usage, decision: &str) {
+    pub async fn settle(self, actual_micros: i64, usage: Usage, decision: &str) {
+        let overhead = self.overhead_micros;
+        self.settle_with_overhead(actual_micros, usage, decision, overhead)
+            .await;
+    }
+
+    /// As [`Self::settle`], but records a final overhead measurement taken after
+    /// the upstream call rather than the admission-time figure captured when the
+    /// guard was built. The buffered path measures overhead across the whole
+    /// request minus provider time, which is only known at the end.
+    pub async fn settle_with_overhead(
+        mut self,
+        actual_micros: i64,
+        usage: Usage,
+        decision: &str,
+        overhead_micros: i64,
+    ) {
         if let Some(r) = self.reservation.take() {
             self.budgets.commit(&r, actual_micros).await;
             self.usage
@@ -588,17 +664,21 @@ impl StreamSettlement {
                     usage,
                     cost_micros: actual_micros,
                     decision,
-                    overhead_micros: self.overhead_micros,
+                    overhead_micros,
                 })
                 .await;
         }
     }
 }
 
-impl Drop for StreamSettlement {
+impl Drop for Settlement {
     fn drop(&mut self) {
-        // Only fires if `settle` was never called (panic/cancel/shutdown). Charge
-        // the FULL reservation (never under-charge) and record an error row.
+        // Only fires if `settle` was never called: a cancelled handler (HTTP
+        // timeout or client disconnect), a panic, or runtime shutdown. Charge the
+        // FULL reservation, because the upstream may well have served and billed
+        // the request, and record it as `estimated` rather than `allowed` or
+        // `error` so the ledger says plainly that this figure was assumed rather
+        // than measured.
         if let Some(r) = self.reservation.take() {
             // Only spawn if a runtime is present. `tokio::spawn` panics without one,
             // and a panic in a destructor risks a process abort; during runtime
@@ -606,7 +686,7 @@ impl Drop for StreamSettlement {
             // (fail-closed) until its period counter expires.
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 tracing::warn!(
-                    "StreamSettlement dropped without a runtime; reservation left held (fail-closed)"
+                    "Settlement dropped without a runtime; reservation left held (fail-closed)"
                 );
                 return;
             };
@@ -626,7 +706,7 @@ impl Drop for StreamSettlement {
                         model: &model,
                         usage: Usage::default(),
                         cost_micros: reserved,
-                        decision: "error",
+                        decision: "estimated",
                         overhead_micros: overhead,
                     })
                     .await;
@@ -834,6 +914,128 @@ mod tests {
             admission_exact: false,
         };
         (core, generated.plaintext)
+    }
+
+    /// A provider whose `forward` never returns, standing in for a slow LLM
+    /// response, and one that fails in each of the two ways that matter.
+    struct StubProvider(StubBehaviour);
+    #[derive(Clone, Copy)]
+    enum StubBehaviour {
+        Hang,
+        NotDelivered,
+        MaybeBilled,
+    }
+
+    #[async_trait]
+    impl Provider for StubProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+        fn parse_request(
+            &self,
+            rest_path: &str,
+            body: &str,
+        ) -> Result<crate::provider::ParsedRequest, ProviderError> {
+            MockProvider.parse_request(rest_path, body)
+        }
+        async fn forward(
+            &self,
+            _rest_path: &str,
+            _body: &str,
+            _parsed: &crate::provider::ParsedRequest,
+        ) -> Result<crate::provider::ProviderResponse, ProviderError> {
+            match self.0 {
+                StubBehaviour::Hang => std::future::pending().await,
+                StubBehaviour::NotDelivered => {
+                    Err(ProviderError::Upstream("connection refused".to_owned()))
+                }
+                StubBehaviour::MaybeBilled => Err(ProviderError::MeteringFailed(
+                    "timed out waiting for response".to_owned(),
+                )),
+            }
+        }
+    }
+
+    fn core_with_stub(b: StubBehaviour) -> (GatewayCore, String, Arc<MemUsageSink>) {
+        let (mut core, key) = core_with_key();
+        let sink = Arc::new(MemUsageSink::new());
+        core.usage = sink.clone();
+        core.providers
+            .insert("mock".to_owned(), Arc::new(StubProvider(b)));
+        (core, key, sink)
+    }
+
+    /// The bug this guards: axum drops a handler's future when the HTTP timeout
+    /// fires or the client disconnects. A buffered LLM call routinely outruns
+    /// that timeout, and without a settle guard the reservation stayed in every
+    /// counter until the period rolled over, with no ledger row to explain it,
+    /// and `reconcile_counters` only ever raises so nothing could undo it.
+    #[tokio::test]
+    async fn a_cancelled_request_still_settles_its_reservation() {
+        let (core, key, sink) = core_with_stub(StubBehaviour::Hang);
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+
+        // Drop the future mid-forward, exactly as the HTTP layer does.
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            core.evaluate("mock", "generate", &header(&key), body),
+        )
+        .await;
+        assert!(timed_out.is_err(), "the stub must still be hanging");
+
+        // The Drop guard settles on a spawned task; let it run.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let events = sink.snapshot();
+        assert_eq!(
+            events.len(),
+            1,
+            "a cancelled request must still be recorded"
+        );
+        assert_eq!(
+            events[0].decision, "estimated",
+            "charged its reservation, not measured, so it must not read as allowed"
+        );
+        assert!(
+            events[0].cost_micros > 0,
+            "a dangling reservation must be charged, never released silently"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_request_is_released_not_charged() {
+        let (core, key, sink) = core_with_stub(StubBehaviour::NotDelivered);
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+        let out = core.evaluate("mock", "generate", &header(&key), body).await;
+        assert!(matches!(out, Outcome::Upstream(_)));
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        // Connect/DNS/TLS failures never reached the provider, so nothing was
+        // billed and the reservation is released in full.
+        assert_eq!(events[0].cost_micros, 0);
+        assert_eq!(events[0].decision, "error");
+    }
+
+    #[tokio::test]
+    async fn a_possibly_billed_request_is_charged_its_reservation() {
+        let (core, key, sink) = core_with_stub(StubBehaviour::MaybeBilled);
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+        let out = core.evaluate("mock", "generate", &header(&key), body).await;
+        assert!(matches!(out, Outcome::Upstream(_)));
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        // A timeout AFTER the request was sent may mean the provider generated a
+        // full response we never read. Releasing would under-charge a request
+        // the provider is invoicing.
+        assert!(
+            events[0].cost_micros > 0,
+            "a possibly-billed request must not be released"
+        );
+        assert_eq!(events[0].decision, "estimated");
     }
 
     #[tokio::test]

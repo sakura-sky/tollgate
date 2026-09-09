@@ -179,6 +179,52 @@ fn reject_rate_switches(v: &Value) -> Result<(), ProviderError> {
     Ok(())
 }
 
+/// Classify a `reqwest` failure by whether the provider could already have
+/// served, and therefore billed, the request.
+///
+/// This distinction is the difference between releasing a reservation and
+/// charging it. Only a connect-phase failure proves nothing was billed. Anything
+/// later, most importantly a timeout while waiting for a response, may mean the
+/// provider generated a full response we simply never read, and non-streaming
+/// LLM APIs send no headers until generation completes, so a slow large response
+/// looks exactly like a hang.
+/// Only `is_connect` and `is_builder` prove nothing was delivered. Everything
+/// else, timeouts included, is treated as possibly billed.
+///
+/// `is_request` is deliberately NOT in that list, though it reads like it should
+/// be. reqwest reports a timeout waiting for a RESPONSE as a request-kind error
+/// ("error sending request for url"), so including it silently classified the
+/// single most important case, a slow non-streaming LLM response, as never
+/// delivered and released its reservation. That is the exact under-charge this
+/// function exists to prevent, and it survived a green unit test because the
+/// test constructed the error variant directly instead of going through here.
+fn classify_transport_error(e: &reqwest::Error) -> ProviderError {
+    if e.is_connect() || e.is_builder() {
+        ProviderError::Upstream(e.to_string())
+    } else {
+        ProviderError::MeteringFailed(e.to_string())
+    }
+}
+
+/// Read a JSON response body, classifying a parse failure by status.
+///
+/// A 2xx that will not parse was served and billed, so it is a metering failure.
+/// A non-2xx that will not parse (an HTML 502 from a CDN, an empty 3xx body) was
+/// not billed, so it releases the reservation.
+async fn json_or_classified(resp: reqwest::Response) -> Result<(u16, Value), ProviderError> {
+    let status = resp.status().as_u16();
+    let success = (200..300).contains(&status);
+    match resp.json::<Value>().await {
+        Ok(v) => Ok((status, v)),
+        Err(e) if success => Err(ProviderError::MeteringFailed(format!(
+            "2xx response body did not parse: {e}"
+        ))),
+        Err(e) => Err(ProviderError::Upstream(format!(
+            "status {status} with unparseable body: {e}"
+        ))),
+    }
+}
+
 /// Whether the body opts any block into prompt caching, i.e. carries a
 /// `cache_control` key anywhere.
 ///
@@ -357,12 +403,8 @@ impl Provider for AnthropicProvider {
             .body(body.to_owned())
             .send()
             .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+            .map_err(|e| classify_transport_error(&e))?;
+        let (status, json) = json_or_classified(resp).await?;
         let usage = parse_anthropic_usage(&json);
         Ok(ProviderResponse {
             status,
@@ -663,12 +705,8 @@ impl Provider for VertexProvider {
             .body(body.to_owned())
             .send()
             .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+            .map_err(|e| classify_transport_error(&e))?;
+        let (status, json) = json_or_classified(resp).await?;
         let usage = parse_vertex_usage(&json);
         Ok(ProviderResponse {
             status,
@@ -1182,12 +1220,8 @@ impl Provider for OpenAiProvider {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+            .map_err(|e| classify_transport_error(&e))?;
+        let (status, json) = json_or_classified(resp).await?;
         let usage = parse_openai_usage(&json, self.cache_semantics());
         Ok(ProviderResponse {
             status,
