@@ -19,12 +19,40 @@ cargo fmt --all
 # Lint (treats warnings as errors, matches CI)
 cargo clippy --all-targets --locked -- -D warnings
 
-# Tests
-cargo test --locked
+# Tests (--all-targets, because that is what CI and cloudbuild run)
+cargo test --locked --all-targets
 
 # Run the gateway
 cargo run --bin tollgate -- serve
 ```
+
+Two gates CI runs that the loop above does not. Both are cheap and both catch
+things the ordinary suite cannot see.
+
+The Valkey enforcement battery runs against a real server, because the ordinary
+suite uses an in-memory budget backend and never executes the Lua that actually
+reserves and settles budgets. The tests are `#[ignore]`d so nobody is blocked
+without a server:
+
+```bash
+docker compose -f compose/docker-compose.yaml up -d valkey
+TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo test --lib redis_live -- --ignored --test-threads=1
+```
+
+CI fails if fewer than 12 of them run, so a battery that silently stops being
+collected is caught rather than reported as green. Deleting one of these tests
+therefore means lowering that floor in the workflow, which is a decision to make
+on purpose rather than a side effect.
+
+```bash
+# Advisories against the dependencies we already have
+cargo audit
+```
+
+`.cargo/audit.toml` already matches CI's settings, including its ignore and its
+`--deny warnings`, so a local run gives the same answer CI gives. A gate that
+disagrees with the one in CI is a gate people learn to ignore.
 
 ## Database migrations
 

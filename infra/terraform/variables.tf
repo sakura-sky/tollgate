@@ -42,8 +42,9 @@ variable "provider_env" {
 
     Every provider is DISABLED by default, so leaving this empty deploys a
     gateway that answers health, metrics and the console and refuses every
-    proxied request as unpriced. That is fail-closed and intended; this variable
-    is how you opt in.
+    proxied request: `400 unpriced` on the buffered routes, `503 backend_error`
+    on the streaming ones. That is fail-closed and intended; this variable is
+    how you opt in.
 
     Example, Vertex only (no secret needed, the runtime service account carries
     the credential):

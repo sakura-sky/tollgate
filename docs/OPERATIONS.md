@@ -52,11 +52,11 @@ a request that touches several budgets at once, which is the normal case (a key
 budget, a provider budget, a model budget, a global one), hands several keys to
 one Lua script. In a sharded Valkey those keys hash to different slots and the
 script is refused with `CROSSSLOT`, which surfaces as a `503` on every request
-that spans more than one budget. The Terraform module defaults to
-`valkey_shard_count = 1` for this reason. Raising it will not scale the gateway,
-it will break enforcement, until the keys are given a common hash tag so they
-land in one slot. That change has to be made deliberately, because it also moves
-every existing counter to a new key name.
+that spans more than one budget. The Terraform module pins `valkey_shard_count`
+to 1 and validates it: any other value fails `plan`. Raising it would not scale
+the gateway, it would break enforcement, so lifting the restriction means giving
+the counter keys a common hash tag in the code first, which also moves every
+existing counter to a new key name.
 
 Run Valkey with `maxmemory-policy noeviction` and do not share the instance with
 other workloads. Counters carry a 40-day expiry, so under any `volatile-*` policy

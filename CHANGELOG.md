@@ -30,6 +30,11 @@ Telling the caller whose fault a refusal is, and leaving a trace of it.
   decision words match the buffered path: `unpriced`, `rejected_budget`, `error`.
   A parse failure is still not recorded on either path, since the request never
   resolved to a model.
+- **Provider calls use HTTP/2.** `reqwest` has been built without its default
+  features since the first release, to make the TLS backend an explicit choice,
+  and that quietly left `http2` out with it. Every outbound provider request in
+  every release up to now was HTTP/1.1, so the busiest path in the product had
+  no connection multiplexing.
 - Vertex `:countTokens` is sent an allowlisted body rather than the caller's
   `generateContent` body unchanged. Verified against live Vertex: the endpoint
   rejects `safetySettings`, `labels`, `toolConfig` and `cachedContent` with a
@@ -77,6 +82,10 @@ Telling the caller whose fault a refusal is, and leaving a trace of it.
   with `CROSSSLOT` rather than scaling anything.
 - The `redis` client is built without its default features, keeping only what
   the Lua reserve and settle paths need.
+- `hmac` and `sha2` move to the 0.12/0.10 generation, which is the one `sqlx`
+  already pulls in for SCRAM. That removes five duplicate crates and leaves one
+  SHA-256 implementation in the binary. Key hashing is unchanged: still
+  HMAC-SHA256 under the pepper, so no issued key is affected.
 
 ### Added
 
@@ -98,6 +107,15 @@ Telling the caller whose fault a refusal is, and leaving a trace of it.
   the Lua that actually reserves and settles budgets, and until now were run only
   by hand, so nothing stopped the enforcement path regressing between releases.
   They stay `#[ignore]`d, so a developer without a server is not blocked.
+- The advisory job runs on a weekly schedule and denies warning-class findings
+  (unmaintained, unsound, yanked). `.cargo/audit.toml` mirrors those settings so
+  a local `cargo audit` gives the same answer CI gives.
+- **A Terraform module applied as shipped now has a way to enable a provider.**
+  Every provider defaults to disabled, so a first `apply` produced a gateway
+  that served health, metrics and the console and refused every proxied request.
+  The new `provider_env` map sets `TOLLGATE_*` variables on the Cloud Run
+  container, and refuses any secret-shaped name, because values passed that way
+  are stored in Terraform state in plaintext.
 
 ## v0.2.2
 

@@ -129,14 +129,25 @@ erDiagram
     text decision
     timestamptz started_at "partition key"
   }
+  audit_log {
+    uuid id PK
+    text principal "cli:<user>@<host>, self-asserted"
+    text action "key.issue|key.revoke|budget.set|price.set"
+    text resource "key id (issue), key prefix (revoke), budget scope, provider/model"
+    jsonb metadata "never a secret"
+    timestamptz occurred_at
+  }
 ```
 
 `usage_events` is append-only (triggers reject UPDATE, DELETE, and TRUNCATE) and
 monthly range-partitioned so retention can drop old partitions without violating
 immutability. `audit_log` carries the same append-only triggers and records privileged CLI
 actions: `key.issue`, `key.revoke`, `budget.set` and `price.set`. Its `principal`
-is the OS user and host the command ran as, which correlates a change with a
-shell history rather than authenticating anybody; see `SECURITY.md`.
+is the OS user and host the command ran as, written literally as
+`cli:<user>@<host>`. The `cli:` prefix marks the row as a command line rather
+than an identity, so an operator querying for `alice@host` finds nothing without
+it. It correlates a change with a shell history rather than authenticating
+anybody; see `SECURITY.md`.
 
 ## Money and enforcement invariants
 
@@ -156,7 +167,10 @@ shell history rather than authenticating anybody; see `SECURITY.md`.
 - **Postgres is the system of record.** Valkey counters are a hot-path cache; on
   startup they are reconciled from the ledger, and reconcile only ever raises a
   counter (`max(counter, ledger)`), never lowers it.
-- **Mandatory backstop.** A request matching no budget is denied.
+- **No fail-open by omission.** A request matching no budget at all is denied. A
+  global budget is not required for this: a deployment holding only per-key
+  budgets serves normally. It is a strongly recommended backstop, not a
+  mandatory one.
 - **Auth.** Keys are `tgk_<pub>_<secret>`; only an HMAC of the secret under a
   server-side pepper is stored, compared in constant time, with a dummy-hash
   verify on prefix miss so hit and miss cost the same.

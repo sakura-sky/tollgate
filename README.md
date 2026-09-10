@@ -190,17 +190,42 @@ connects on load; when the gateway serves it in production the viewer supplies
 their own key. The console is deliberately observe-only: it reads the same
 key-authenticated JSON endpoints you would call with curl.
 
-### Monitoring
+## Quick start (local)
+
+Requires Rust 1.88, Docker, and Docker Compose.
+
+```bash
+# 1. Bring up Postgres + Valkey
+docker compose -f compose/docker-compose.yaml up -d
+
+# 2. Configure. Edit .env and set TOLLGATE_SECURITY__API_KEY_PEPPER to a real
+#    secret of at least 16 bytes: the placeholder shipped in .env.example is
+#    refused at boot, so leaving it makes step 4 fail.
+cp .env.example .env
+set -a; source .env; set +a
+
+# 3. Apply migrations
+cargo run --bin tollgate -- admin migrate
+
+# 4. Run the gateway
+cargo run --bin tollgate -- serve
+
+# 5. Smoke test
+curl -s http://localhost:8080/healthz | jq
+curl -s http://localhost:8080/readyz  | jq
+```
+
+## Monitoring
 
 The gateway exposes standard operational endpoints for your SRE stack:
 
 - `GET /healthz` - liveness ping
 - `GET /readyz` - readiness
-- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, and `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which is honest about querying
+- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, and `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` decision, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
 
 Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set.
 
-### Routes
+## Routes
 
 | Route | Method | Auth accepted |
 | --- | --- | --- |
@@ -217,7 +242,7 @@ Anthropic SDK works against it unchanged. Other sub-paths of `/v1/messages/`,
 such as `count_tokens` and `batches`, return 404: they are not metered, and
 serving them unmetered would put spend outside the ledger.
 
-The page is unauthenticated because it holds no data. It is a static asset that
+`/console` is unauthenticated because it holds no data. It is a static asset that
 fetches everything from the two JSON endpoints, so serving it to an anonymous
 viewer discloses nothing; the key is checked where the spend actually lives.
 
@@ -250,31 +275,6 @@ The response BODY is shaped for whichever client the route serves, so on
 Anthropic's vocabulary, which the SDK maps to an exception class. A budget
 refusal is therefore `permission_error` in the body and `budget_exceeded` in the
 header. Those are the same event described to two different audiences.
-
-## Quick start (local)
-
-Requires Rust 1.88, Docker, and Docker Compose.
-
-```bash
-# 1. Bring up Postgres + Valkey
-docker compose -f compose/docker-compose.yaml up -d
-
-# 2. Configure. Edit .env and set TOLLGATE_SECURITY__API_KEY_PEPPER to a real
-#    secret of at least 16 bytes: the placeholder shipped in .env.example is
-#    refused at boot, so leaving it makes step 4 fail.
-cp .env.example .env
-set -a; source .env; set +a
-
-# 3. Apply migrations
-cargo run --bin tollgate -- admin migrate
-
-# 4. Run the gateway
-cargo run --bin tollgate -- serve
-
-# 5. Smoke test
-curl -s http://localhost:8080/healthz | jq
-curl -s http://localhost:8080/readyz  | jq
-```
 
 ## Managing keys and budgets
 
@@ -339,6 +339,14 @@ values as `tollgate serve`.
 There is no `admin list` or `admin delete` in this release. To see or remove
 budgets and prices, query Postgres directly: `SELECT * FROM budgets;`,
 `SELECT * FROM model_prices WHERE effective_to IS NULL;`.
+
+`key issue`, `budget set` and `price set` each append a row to `audit_log`, as
+does `key revoke` when it actually revokes something, in the same
+transaction as the change, so a failed audit insert rolls the change back rather
+than leaving it untraced. Read it with `SELECT occurred_at, principal, action,
+resource, metadata FROM audit_log ORDER BY occurred_at DESC;`. The `principal` is
+`cli:<user>@<host>`, self-asserted rather than authenticated: see
+[`SECURITY.md`](./SECURITY.md). No secret is recorded.
 
 In a running deployment the gateway also serves the read-only web console at
 `/console`, along with the key-authenticated JSON it reads: `GET /console/budgets`
@@ -475,11 +483,11 @@ provider_env = {
 }
 ```
 
-That variable refuses any secret-shaped name (`API_KEY`, `ACCESS_TOKEN`, `SECRET`, `PASSWORD`, `PEPPER`, `CREDENTIAL`), because values passed through it are stored in Terraform state in plaintext. Anthropic keys, and Vertex's static `ACCESS_TOKEN`, need Secret Manager and a `secret_key_ref` in `cloudrun.tf`, the way the database URL and the pepper already are.
+That variable refuses any secret-shaped name (`API_KEY`, `ACCESS_TOKEN`, `SECRET`, `PASSWORD`, `PEPPER`, `CREDENTIAL`, `DATABASE__URL`), because values passed through it are stored in Terraform state in plaintext. Anthropic keys, and Vertex's static `ACCESS_TOKEN`, need Secret Manager and a `secret_key_ref` in `cloudrun.tf`, the way the database URL and the pepper already are.
 
 ## CI
 
-Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`. No cloud credentials are needed.
+Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`. No cloud credentials are needed.
 
 The MSRV was 1.85 until it became a liability: it pinned the `redis` crate five minor versions back, because redis 1.2.3 and later require 1.88, so dependabot kept opening updates CI had to reject. The toolchain files, the workflow, the Dockerfile and `cloudbuild.yaml` all move together with `rust-version` in `Cargo.toml`, or CI ends up contradicting the manifest.
 
@@ -516,7 +524,8 @@ assets/           - console.html and brand assets
 migrations/       - sqlx migrations
 infra/terraform/  - GCP infrastructure module
 compose/          - local dev dependencies
-docs/             - operations runbook and reference architectures
+.cargo/audit.toml - cargo-audit settings, matching the CI gate
+docs/             - architecture reference, operations runbook and reference architectures
 scripts/demo.sh   - narrated end-to-end demo runner
 scripts/probe-count-endpoints.sh - live probe of the providers' token-count endpoints
 ```
