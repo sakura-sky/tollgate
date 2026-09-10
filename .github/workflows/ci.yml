@@ -161,11 +161,33 @@ jobs:
       # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
       # this directory, but the audit tool itself should build on current stable.
       #
-      # Version-pinned the same way the Dockerfile pins cargo-chef. An unpinned
-      # `install` builds whatever is current at run time, so the gate can change
-      # behaviour on a day nobody changed the repo. Bump this deliberately.
+      # A MINIMUM version, not an exact pin, and the difference matters.
+      #
+      # An exact pin was tried and broke the gate within a day. The advisory
+      # database is a live input that gains entries continuously, which is the
+      # whole reason this job runs weekly, so pinning the tool does not make the
+      # result reproducible: it freezes the PARSER while the data keeps moving.
+      # RUSTSEC-2026-0037 arrived carrying a CVSS 4.0 vector, cargo-audit 0.21
+      # could not read it, and every run failed on a database entry rather than
+      # on anything in this repo.
+      #
+      # Exact pins are right for a tool with a fixed input, which is why the
+      # Dockerfile pins cargo-chef. They are wrong for a tool whose answer is
+      # SUPPOSED to change without the repo changing.
+      #
+      # NOT a caret. On a 0.x crate Cargo's caret pins the first non-zero
+      # component, so `^0.22` means `>=0.22.0, <0.23.0`: patch only. Every
+      # cargo-audit format update ships in a 0.x MINOR (CVSS 4.0 support arrived
+      # in 0.22), so a caret would have broken on exactly the same class of
+      # advisory, just a release later. A floor with a major ceiling takes those
+      # minors and still makes 1.0 a decision.
+      #
+      # This narrows the failure class rather than removing it: the gate still
+      # fails closed the day the database carries something no released parser
+      # understands. That is the correct direction for a security gate, and
+      # `--locked` fixes the tool's own dependency tree either way.
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked --version 0.21.2
+        run: cargo +stable install cargo-audit --locked --version ">=0.22, <1.0"
       - name: Audit dependencies
         # `--deny warnings` because the default exits 0 on the warning-class
         # advisories (unmaintained, unsound, yanked). Those are exactly the

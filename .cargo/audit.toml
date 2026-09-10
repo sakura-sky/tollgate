@@ -24,4 +24,13 @@ ignore = ["RUSTSEC-2023-0071"]
 # Match CI, which runs with --deny warnings. Unmaintained, unsound and yanked
 # findings are the early ones, worth acting on while moving off the crate is
 # still cheap.
+#
+# `quiet` is not optional: cargo-audit's [output] table requires it, and without
+# it the whole file fails to parse and `cargo audit` refuses to run at all. This
+# file shipped once without it and turned the advisory gate into a hard error.
+#
+# The tables here reject unknown keys, and some fields carry no serde default,
+# so a missing one is a parse error rather than a fallback. `[database]` has the
+# same trap with its `stale` field: if you ever add that table, set `stale` too.
 deny = ["warnings"]
+quiet = false
