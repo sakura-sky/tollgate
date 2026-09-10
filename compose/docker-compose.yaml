@@ -13,7 +13,10 @@ services:
       POSTGRES_PASSWORD: tollgate
       POSTGRES_DB: tollgate
     ports:
-      - "5432:5432"
+      # Loopback only. Docker publishes on all interfaces by default, which on a
+      # laptop on an untrusted network is an open Postgres with the password
+      # below.
+      - "127.0.0.1:5432:5432"
     volumes:
       - tollgate_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,7 +35,9 @@ services:
     container_name: tollgate-valkey
     command: ["valkey-server", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      # Loopback only. Valkey here has no password at all, and it holds live
+      # budget counters.
+      - "127.0.0.1:6379:6379"
     volumes:
       - tollgate_valkey_data:/data
     healthcheck:

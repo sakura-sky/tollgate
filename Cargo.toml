@@ -1,8 +1,13 @@
 [package]
 name = "tollgate"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
-rust-version = "1.85"
+# 1.88, not 1.85. The older MSRV was pinning `redis` five minor versions back:
+# 1.2.3 onward require 1.88, so dependabot kept proposing updates CI had to
+# reject. An MSRV is a promise to downstream consumers, and this is a binary
+# with none, so holding an old one bought nothing and cost security updates on
+# the client that talks to the budget store.
+rust-version = "1.88"
 license = "MIT"
 description = "Tollgate - AI gateway and spend-control proxy for LLM providers"
 authors = ["Andrew Stevens <andrew@andrewjstevens.com>"]
@@ -30,22 +35,53 @@ clap = { version = "4.5", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 http = "1"
 humantime-serde = "1"
-redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
+# Defaults off: they carry `acl`, `streams`, `geospatial` and `num-bigint`, none
+# of which this uses. Only `script` matters, because the reserve and settle paths
+# are Lua. Run the live enforcement battery after changing this list; it is the
+# only thing that exercises those scripts.
+redis = { version = "1.2", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "request-id", "timeout", "set-header", "util"] }
+tower-http = { version = "0.7", features = ["trace", "request-id", "timeout", "set-header", "util", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP client for provider adapters (Vertex, Anthropic) and the GCP metadata server.
-# `stream` enables response body streaming for the OpenAI SSE relay.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+#
+# Defaults are off so the TLS backend is an explicit choice (rustls, not the
+# platform's OpenSSL), but turning them off silently drops two things worth
+# naming, because both were dropped by accident here once:
+#
+# - `http2`, re-enabled below. Without it every provider call is HTTP/1.1, and
+#   the highest-volume path in the product gives up connection multiplexing.
+# - `system-proxy`, still off. HTTPS_PROXY, HTTP_PROXY and NO_PROXY are ignored.
+#   That is deliberate: a spend proxy should connect to the provider it was
+#   configured with, not to whatever an ambient environment variable names. A
+#   deployment behind a mandatory egress proxy has to route at the network layer
+#   instead, which is what the Secure Web Proxy architecture in docs/OPERATIONS.md
+#   describes.
+#
+# `stream` enables response body streaming for the SSE relay.
+#
+# 0.13 renamed the old `rustls-tls`. The `rustls` feature now brings
+# `rustls-platform-verifier`, and with no explicitly configured roots the client
+# verifies against the HOST trust store rather than a bundle compiled into the
+# binary, which is what 0.12 did. That is a behaviour change and a better
+# default: trust rotates with the base image instead of requiring a rebuild, and
+# a private CA added to the image is honoured, so a TLS-inspecting egress proxy
+# works. The cost is a new dependency on the runtime image actually carrying CA
+# certificates, which distroless `cc-debian12` does.
+#
+# `webpki-roots` is deliberately NOT enabled. reqwest only consults it under
+# `tls_certs_only()`, which this code never calls, so adding it would be an
+# inert dependency and a misleading one.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "http2", "rustls"] }
 
 # Streaming relay for the OpenAI-compatible endpoint (SSE pass-through + metering).
 bytes = "1"
@@ -54,8 +90,13 @@ tokio-stream = "0.1"
 
 # API-key hashing: HMAC-SHA256 (fast, correct for high-entropy keys) + constant-
 # time compare. rand for key generation, hex for encoding.
-hmac = "0.13"
-sha2 = "0.11"
+# The 0.12/0.10 generation, not the newer 0.13/0.11. Deliberate: sqlx already
+# pulls this generation in for SCRAM, so matching it removes five duplicate
+# crates and leaves one SHA-256 implementation in the binary instead of two. The
+# newer generation is fine, but this is API-key verification, and the line with
+# a decade of field exposure is the better default for that.
+hmac = "0.12"
+sha2 = "0.10"
 subtle = "2"
 rand = "0.8"
 hex = "0.4"
@@ -73,5 +114,10 @@ tower = { version = "0.5", features = ["util"] }
 [profile.release]
 codegen-units = 1
 lto = "thin"
-strip = "symbols"
-panic = "abort"
+# `debuginfo`, not `symbols`: an abort with no backtrace is an outage you cannot
+# explain afterwards, and symbol names are not sensitive.
+strip = "debuginfo"
+# `panic = "abort"` is deliberately NOT set. A panic anywhere, including inside a
+# dependency, on one request, for one key, would otherwise take the whole gateway
+# down rather than failing that request. Unwinding also lets the catch-panic
+# layer in `app.rs` turn a panic into a 500 for the request that caused it.

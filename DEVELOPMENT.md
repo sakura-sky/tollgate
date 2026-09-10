@@ -2,7 +2,10 @@
 
 ## Toolchain
 
-- Rust 1.85 (pinned in `rust-toolchain.toml`)
+- Rust 1.88 (pinned in `rust-toolchain.toml`, and the MSRV in `Cargo.toml`)
+  - It was 1.85. That pinned `redis` five minor versions back, because redis
+    1.2.3 and later require 1.88, so dependabot kept opening updates CI had to
+    reject.
 - Docker 24+ for local Postgres/Valkey and image builds
 - Terraform 1.7+ for infrastructure
 - `gcloud` CLI for GCP interaction

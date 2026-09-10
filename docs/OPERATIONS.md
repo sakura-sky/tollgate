@@ -47,6 +47,17 @@ the actual cost of whatever was in flight. That is bounded and it is the safe
 direction relative to the alternative, which was losing the entire period, but it
 is a reason to restart the gateway after a cache incident rather than leaving it.
 
+**Run Valkey as a single shard.** The budget counter keys carry no hash tag, so
+a request that touches several budgets at once, which is the normal case (a key
+budget, a provider budget, a model budget, a global one), hands several keys to
+one Lua script. In a sharded Valkey those keys hash to different slots and the
+script is refused with `CROSSSLOT`, which surfaces as a `503` on every request
+that spans more than one budget. The Terraform module defaults to
+`valkey_shard_count = 1` for this reason. Raising it will not scale the gateway,
+it will break enforcement, until the keys are given a common hash tag so they
+land in one slot. That change has to be made deliberately, because it also moves
+every existing counter to a new key name.
+
 Run Valkey with `maxmemory-policy noeviction` and do not share the instance with
 other workloads. Counters carry a 40-day expiry, so under any `volatile-*` policy
 a live budget counter is an eviction candidate. Eviction is now repaired rather
@@ -98,17 +109,38 @@ create-ahead and drop-old logic applies.
 
 The default Terraform deploys a private posture, not an open one:
 
-- Cloud Run runs with no public egress path of its own; it reaches Cloud SQL and
-  Valkey over internal ranges through the Serverless VPC Access connector.
+- Cloud Run reaches Cloud SQL and Valkey over internal ranges through the
+  Serverless VPC Access connector (`egress = PRIVATE_RANGES_ONLY`). Provider
+  traffic still leaves over Google's default public path; the application
+  restricts destinations, the network does not.
 - The provider adapters only ever connect to fixed provider hostnames. A caller
   supplies a provider name and a path suffix, both allowlisted; they never supply
   a destination host. There is no user-controlled URL in the forward path.
 - The outbound HTTP client refuses redirects (`redirect::Policy::none()`), so a
   `3xx` from an upstream cannot bounce the request, and its credentials, to a
   different host.
+- Outbound TLS is validated against the CA store in the running image, not
+  against a bundle compiled into the binary. Trust rotates when you rebase, and
+  a private CA added to the image is honoured, which is what makes the Secure
+  Web Proxy architecture below workable. The flip side is that an image without
+  CA certificates cannot reach any provider; the distroless runtime image ships
+  them, so treat a base-image change as a change to trust.
 - Secrets (database URL, API-key pepper) are read from Secret Manager by
   reference and scoped to the runtime service account per-secret, not granted
   project-wide.
+
+One gap in that posture, stated plainly because the module ships it this way:
+the Valkey connection has neither AUTH nor in-transit encryption. Budget counters
+travel unauthenticated and in cleartext, and the only thing keeping the instance
+off other networks is Private Service Connect. Anyone who reaches that address
+can read and write the counters that decide whether spending continues. Enable Memorystore AUTH and carry the credential in `TOLLGATE_REDIS__URL` if an
+attacker inside the VPC is in your threat model. In-transit encryption is not
+available in this build: the Valkey client is compiled without a TLS feature, so
+a `rediss://` URL is refused at startup rather than silently downgraded. Adding
+it is open work. The ledger
+bounds the consequence: counters are rebuilt from Postgres at startup and
+whenever one goes missing, so tampering suppresses enforcement until the next
+rebuild rather than corrupting the record of what was spent.
 
 The practical consequence is that Tollgate's server-side request forgery surface
 is small by construction: the set of hosts it will connect to is fixed in code

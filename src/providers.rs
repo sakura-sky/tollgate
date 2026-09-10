@@ -670,6 +670,80 @@ fn parse_anthropic_usage_obj(u: &Value) -> Usage {
     )
 }
 
+/// Build the body for Vertex `:countTokens` from an ALLOWLIST.
+///
+/// Same lesson as [`count_tokens_payload`], which the Anthropic adapter learned
+/// against the live API: a count endpoint is not the generate endpoint, and
+/// posting the caller's body unchanged puts fields in front of a parser that
+/// rejects unknown names with a 400.
+///
+/// Verified against live Vertex. `:countTokens` ACCEPTS `contents`,
+/// `systemInstruction`, `tools` and `generationConfig`, and REJECTS
+/// `toolConfig`, `safetySettings`, `labels` and `cachedContent`, each with
+/// `Invalid JSON payload received. Unknown name "X": Cannot find field`. An
+/// SDK-built `generateContent` body routinely carries `safetySettings`, so
+/// forwarding it unchanged, which is what this adapter used to do, refused every
+/// request under `exact` admission.
+///
+/// The first version of this allowlist included `toolConfig` on the reasoning
+/// that it accompanies `tools`. It does not exist here, and would have failed
+/// every request carrying it. Do not add a field to this list without probing
+/// it: `scripts/probe-count-endpoints.sh`.
+///
+/// `systemInstruction` and `tools` are carried because they are COUNTED, not
+/// merely tolerated: live, one bare user message counted 1 token, the same
+/// message with a system instruction counted 16, and with a function
+/// declaration added counted 32. Dropping them would under-reserve every
+/// tool-heavy request, the exact failure `exact` admission exists to prevent.
+///
+/// `generationConfig` is carried, against the obvious reading. It looks like it
+/// describes only the OUTPUT, and the first version of this dropped it on
+/// exactly that reasoning. The probe says otherwise: a `responseSchema` lives
+/// inside it and is counted as prompt material. Live, the same one-word message
+/// counted 1 token bare and 51 with a small four-property response schema
+/// attached. Dropping it under-reserves every structured-output request by the
+/// size of its schema, which is the failure `exact` admission exists to
+/// prevent. Reasoning about which fields "cannot" affect an input count is how
+/// that bug got written; measure instead.
+///
+/// `cachedContent` being rejected is a real limitation rather than a nuisance.
+/// A request naming a stored context cache has a small body and a large metered
+/// prompt, and `:countTokens` will not accept the field that says so, so `exact`
+/// admission cannot size those requests on Vertex at all. They settle correctly
+/// and can overshoot their reservation. See the README's `exact` limitation.
+fn vertex_count_payload(body: &str) -> Result<Value, ProviderError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+    let mut out = serde_json::Map::new();
+    for k in ["contents", "tools", "generationConfig"] {
+        if let Some(val) = v.get(k) {
+            if !val.is_null() {
+                out.insert(k.to_owned(), val.clone());
+            }
+        }
+    }
+    // Google's parser accepts either spelling, and its own REST examples use the
+    // snake form, so a caller can legitimately send `system_instruction` beside
+    // a camelCase `generationConfig`. Reading only one spelling drops the system
+    // prompt from the count while the request still carries it, which
+    // under-reserves by exactly the tokens this allowlist exists to include: a
+    // live probe measured a system instruction at 15 of 16 tokens.
+    for k in ["systemInstruction", "system_instruction"] {
+        if let Some(val) = v.get(k) {
+            if !val.is_null() {
+                out.insert("systemInstruction".to_owned(), val.clone());
+                break;
+            }
+        }
+    }
+    if !out.contains_key("contents") {
+        return Err(ProviderError::BadRequest(
+            "countTokens needs 'contents'".to_owned(),
+        ));
+    }
+    Ok(Value::Object(out))
+}
+
 /// Build the body for `/v1/messages/count_tokens` from an ALLOWLIST.
 ///
 /// The client's Messages body cannot be posted here unchanged. `count_tokens`
@@ -799,10 +873,20 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let json: Value = resp
-            .json()
+        let status = resp.status();
+        // Bytes then parse, rather than `.json()`: a refusal does not always
+        // come back as JSON. An edge proxy or a WAF in front of the provider
+        // answers a 400 with an HTML page, and letting the decode error decide
+        // would classify the caller's malformed body as an upstream outage,
+        // which an SDK then retries.
+        let raw = resp
+            .bytes()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        if let Some(e) = count_refusal(status, &json, "count_tokens") {
+            return Err(e);
+        }
         // Fail closed: a missing field must not silently downgrade to the weak
         // fast estimate (that would reopen the under-reservation hole).
         json.get("input_tokens")
@@ -1102,20 +1186,113 @@ impl Provider for VertexProvider {
             .post(&url)
             .bearer_auth(token)
             .header("content-type", "application/json")
-            .body(body.to_owned())
+            .json(&vertex_count_payload(body)?)
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let json: Value = resp
-            .json()
+        let status = resp.status();
+        // Bytes then parse, rather than `.json()`: a refusal does not always
+        // come back as JSON. An edge proxy or a WAF in front of the provider
+        // answers a 400 with an HTML page, and letting the decode error decide
+        // would classify the caller's malformed body as an upstream outage,
+        // which an SDK then retries.
+        let raw = resp
+            .bytes()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        if let Some(e) = count_refusal(status, &json, "countTokens") {
+            return Err(e);
+        }
         json.get("totalTokens")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
                 ProviderError::Upstream("countTokens returned no totalTokens".to_owned())
             })
     }
+}
+
+/// Classify a non-success reply from a token-count endpoint.
+///
+/// The count endpoints used to discard their HTTP status and report every
+/// failure as an upstream one, because the missing token field was all the
+/// caller looked at. That turns a request the PROVIDER rejected as malformed
+/// into a 502, which an SDK then retries as if the provider were down: three
+/// round trips to surface what is really a 400 on the caller's own body.
+///
+/// An ALLOWLIST, not a denylist. Only the statuses that describe the request
+/// BODY are the caller's fault: 400, 413 and 422. Everything else is the
+/// provider, including every 4xx not on that list.
+///
+/// Treating all 4xx as the caller's is the obvious reading and it is wrong in
+/// the worst direction. A 401 or 403 from a count endpoint is Tollgate's own
+/// credential, a rotated Anthropic key or a Vertex token that lost a scope, and
+/// a 404 is usually a model name or project in the price book. Blaming those on
+/// the caller tells every client that their body is malformed, sends them
+/// hunting through a payload that is fine, and produces no `upstream_error` for
+/// the operator's alert to catch, while 100% of traffic fails. A misconfigured
+/// gateway must look like a misconfigured gateway.
+///
+/// 429 is likewise the provider's: it is transient, and changing the body will
+/// not help.
+///
+/// The split is checked against what the endpoints actually return, not against
+/// what they ought to. Live: Anthropic `count_tokens` answers 400 to an empty
+/// `messages` array, 401 to a wrong key, and 404 to an unknown model; Vertex
+/// `:countTokens` answers 400 to an unknown field and 401 to a bad token. So
+/// every credential and configuration fault lands off the allowlist, which is
+/// the property that matters. Reprobe with
+/// `scripts/probe-count-endpoints.sh` before changing this list.
+///
+/// Only the allowlisted statuses have their message echoed to the caller, which
+/// also keeps provider text describing OUR deployment (a Vertex 403 names the
+/// project and region in its resource path) out of a client-facing response.
+///
+/// Returns `None` when the status is a success, leaving the caller to parse.
+fn count_refusal(
+    status: reqwest::StatusCode,
+    body: &Value,
+    endpoint: &str,
+) -> Option<ProviderError> {
+    if status.is_success() {
+        return None;
+    }
+    // Both providers nest a human-readable message, in different places.
+    let detail = body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .unwrap_or("no detail");
+
+    let describes_the_body = matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::PAYLOAD_TOO_LARGE
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    if describes_the_body {
+        return Some(ProviderError::BadRequest(format!(
+            "{endpoint} rejected this request ({status}): {detail}"
+        )));
+    }
+
+    // A credential failure is silent otherwise: it is not a transport error, so
+    // nothing else logs it, and the client-facing 502 says only "upstream".
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        tracing::error!(
+            endpoint,
+            %status,
+            detail,
+            "the provider rejected Tollgate's own credential on the pre-flight count; \
+             under `exact` admission this fails every request until it is fixed"
+        );
+    }
+    Some(ProviderError::Upstream(format!(
+        "{endpoint} failed ({status}): {detail}"
+    )))
 }
 
 /// Default worst-case output reservation when the request omits `max_tokens`.
@@ -2582,6 +2759,152 @@ mod tests {
             settled <= reserved,
             "settle {settled} exceeded reserve {reserved}"
         );
+    }
+
+    #[test]
+    fn the_vertex_count_body_carries_only_what_counts() {
+        // This allowlist has already been wrong once: it shipped with
+        // `toolConfig`, which `:countTokens` does not accept, and every request
+        // carrying it would have been refused. The live probe is the source of
+        // truth for the field list; this pins what the probe found so a future
+        // edit cannot quietly re-add a rejected field.
+        let body = r#"{
+            "contents":[{"role":"user","parts":[{"text":"hi"}]}],
+            "systemInstruction":{"parts":[{"text":"be brief"}]},
+            "tools":[{"functionDeclarations":[]}],
+            "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
+            "generationConfig":{"maxOutputTokens":16},
+            "safetySettings":[{"category":"HARM_CATEGORY_HARASSMENT"}],
+            "labels":{"team":"x"},
+            "cachedContent":"projects/p/locations/l/cachedContents/1"
+        }"#;
+        let out = vertex_count_payload(body).expect("a valid body");
+        let obj = out.as_object().expect("object");
+
+        // Accepted by the endpoint AND counted.
+        for k in ["contents", "systemInstruction", "tools"] {
+            assert!(obj.contains_key(k), "{k} must be carried: it is counted");
+        }
+        // Rejected by the endpoint with `Unknown name`, verified live. Carrying
+        // any of these fails every request that includes it.
+        for k in ["toolConfig", "safetySettings", "labels", "cachedContent"] {
+            assert!(!obj.contains_key(k), "{k} is rejected by :countTokens");
+        }
+        // Carried, because a responseSchema inside it IS counted: live, 1 token
+        // bare against 51 with a small schema attached. It looks like it
+        // describes only the output, which is why the first version dropped it.
+        assert!(
+            obj.contains_key("generationConfig"),
+            "generationConfig carries responseSchema, which counts as prompt"
+        );
+
+        // Google accepts either spelling and its own examples use the snake
+        // form. Reading only the camel one drops the system prompt from the
+        // count while the request still carries it: a silent under-reservation.
+        let snake = vertex_count_payload(
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],
+                "system_instruction":{"parts":[{"text":"be brief"}]}}"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            snake.get("systemInstruction"),
+            Some(&serde_json::json!({"parts":[{"text":"be brief"}]})),
+            "system_instruction must be carried, normalised to camelCase"
+        );
+
+        // An explicit null is not a value.
+        let nulled =
+            vertex_count_payload(r#"{"contents":[{"role":"user"}],"tools":null}"#).expect("valid");
+        assert!(!nulled.as_object().unwrap().contains_key("tools"));
+
+        // No contents means nothing to count, and Vertex would refuse it too.
+        assert!(matches!(
+            vertex_count_payload(r#"{"generationConfig":{}}"#),
+            Err(ProviderError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn a_count_endpoint_refusal_is_the_callers_fault_not_the_providers() {
+        // The count endpoints used to discard their status and report every
+        // failure as upstream, so a body the PROVIDER rejected came back as a
+        // 502. SDKs retry 5xx, so a client bug became three round trips and
+        // looked like a provider outage in the logs.
+        let body: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"invalid_request_error",
+                "message":"messages: at least one message is required"}}"#,
+        )
+        .unwrap();
+
+        let refused = count_refusal(reqwest::StatusCode::BAD_REQUEST, &body, "count_tokens")
+            .expect("a 400 is a refusal");
+        assert!(
+            matches!(refused, ProviderError::BadRequest(ref m) if m.contains("at least one message")),
+            "a 4xx must surface as BadRequest carrying the provider's reason, got {refused:?}"
+        );
+
+        // Everything NOT on the allowlist is the provider's, including 4xx.
+        // This is the important half: a denylist here blames the caller for
+        // Tollgate's own rotated key, and does it to 100% of traffic with no
+        // upstream signal for an operator to alert on.
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,      // our key is wrong
+            reqwest::StatusCode::FORBIDDEN,         // our IAM is wrong
+            reqwest::StatusCode::NOT_FOUND,         // our model or project is wrong
+            reqwest::StatusCode::REQUEST_TIMEOUT,   // transient
+            reqwest::StatusCode::TOO_MANY_REQUESTS, // transient
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                matches!(
+                    count_refusal(status, &body, "count_tokens"),
+                    Some(ProviderError::Upstream(_))
+                ),
+                "{status} is not the caller's fault"
+            );
+        }
+        // The other two body-describing statuses.
+        assert!(matches!(
+            count_refusal(
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                &body,
+                "count_tokens"
+            ),
+            Some(ProviderError::BadRequest(_))
+        ));
+        assert!(matches!(
+            count_refusal(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                &body,
+                "count_tokens"
+            ),
+            Some(ProviderError::BadRequest(_))
+        ));
+        // A success is not a refusal at all: the caller parses the body.
+        assert!(count_refusal(reqwest::StatusCode::OK, &body, "count_tokens").is_none());
+
+        // Vertex nests its message differently; both shapes must be picked up
+        // rather than falling back to "no detail".
+        let vertex: Value = serde_json::from_str(
+            r#"{"error":{"message":"Invalid JSON payload received. Unknown name \"foo\"","code":400}}"#,
+        )
+        .unwrap();
+        let e = count_refusal(reqwest::StatusCode::BAD_REQUEST, &vertex, "countTokens")
+            .expect("400 is a refusal");
+        assert!(matches!(e, ProviderError::BadRequest(ref m) if m.contains("Unknown name")));
+
+        // A Vertex 403 names the project and region in its resource path. That
+        // must not reach the caller as a "your request is malformed" message,
+        // which is the second reason the allowlist is narrow.
+        let denied: Value = serde_json::from_str(
+            r#"{"error":{"message":"Permission denied on resource //aiplatform.googleapis.com/projects/example-project/locations/us-central1/publishers/google/models/x","code":403}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            count_refusal(reqwest::StatusCode::FORBIDDEN, &denied, "countTokens"),
+            Some(ProviderError::Upstream(_))
+        ));
     }
 
     #[test]

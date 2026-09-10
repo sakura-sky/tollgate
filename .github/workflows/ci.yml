@@ -10,6 +10,13 @@ on:
     branches: [main, 'release/**']
     tags: ['v*']
   pull_request:
+  # The advisory database changes without us touching the repo: a new RUSTSEC
+  # entry is filed against a dependency we already ship. On push-only triggers
+  # that advisory stays invisible until somebody happens to push, which on a
+  # quiet week can be a long time. Only the audit job runs on this trigger;
+  # every other job is guarded below.
+  schedule:
+    - cron: '17 6 * * 1'
 
 permissions:
   contents: read
@@ -18,18 +25,39 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# TODO: pin third-party actions by full commit SHA, not by tag.
+#
+# A tag is mutable. Whoever controls the action's repository, or anyone who
+# takes over that account, can repoint `@v5` at different code, and that code
+# runs on our runner with our workflow token and our cache. A SHA cannot be
+# repointed. The tags below are kept only because pinning needs the real
+# digests, which have to be read from the upstream repositories.
+#
+# Pins go in as `uses: owner/action@<40-hex sha>  # v5.0.0`, with the version
+# in a trailing comment so the pin is still readable. Dependabot's
+# github-actions ecosystem is already enabled in .github/dependabot.yml and it
+# updates SHA pins and their comments automatically, so this costs nothing to
+# maintain once done.
 jobs:
   rust:
     name: fmt / clippy / test
+    # Scheduled runs exist for the advisory job alone. Rebuilding the same
+    # commit weekly proves nothing and burns runner minutes.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          # Nothing here pushes, comments or clones a second repository, so the
+          # token has no reason to survive in .git/config where every later
+          # step and every build script could read it.
+          persist-credentials: false
 
       # Pin to the MSRV so CI fails if code uses anything newer than we promise.
-      - name: Install Rust 1.85 (MSRV)
+      - name: Install Rust 1.88 (MSRV)
         run: |
-          rustup toolchain install 1.85 --profile minimal --component rustfmt,clippy
-          rustup default 1.85
+          rustup toolchain install 1.88 --profile minimal --component rustfmt,clippy
+          rustup default 1.88
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
@@ -43,29 +71,121 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets
 
+  enforcement:
+    name: budget enforcement (live Valkey)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    # The ordinary test suite uses an in-memory budget backend and therefore
+    # never executes the Lua that actually reserves and settles budgets. A green
+    # `cargo test` says nothing about the enforcement mechanism, which is the
+    # part of this system with the least margin for error. These tests run the
+    # real scripts against a real server, and they are `#[ignore]`d so a
+    # developer without one is not blocked.
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        # Do not start the suite against a server that is not accepting
+        # commands yet: the first test would fail on connect and read as a
+        # code failure.
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88 (MSRV)
+        run: |
+          rustup toolchain install 1.88 --profile minimal
+          rustup default 1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Single-threaded: these tests share one server and assert on absolute
+      # counter values, so running them concurrently makes them read each
+      # other's writes.
+      #
+      # The count is asserted afterwards because a cargo test filter that
+      # matches nothing exits 0. Without it, renaming the module or deleting the
+      # tests would leave a green job attesting to coverage that no longer
+      # exists, which is worse than having no job at all.
+      #
+      # One run, tee'd to a log: `pipefail` so a test failure is reported as a
+      # test failure rather than as a missing count, and the full output stays
+      # in the job log.
+      - name: Enforcement tests
+        env:
+          TOLLGATE_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          set -o pipefail
+          cargo test --locked --lib redis_live -- --ignored --test-threads=1 \
+            2>&1 | tee enforcement.log
+          # `|| true`: the step runs under `bash -e`, so a grep that matches
+          # nothing (cargo changing its output format) would abort here and the
+          # diagnostic below would never print.
+          ran=$(grep -oP '^test result: ok\. \K[0-9]+' enforcement.log | head -1 || true)
+          echo "enforcement tests run: ${ran:-0}"
+          if [ "${ran:-0}" -lt 12 ]; then
+            echo "::error::expected at least 12 enforcement tests, ran ${ran:-0}."
+            echo "::error::If tests were removed on purpose, lower this floor deliberately."
+            exit 1
+          fi
+
   reuse:
     name: REUSE compliance
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: fsfe/reuse-action@v5
 
   audit:
     name: cargo audit (advisories)
+    # No `if` guard here on purpose: this is the job the weekly schedule exists
+    # for.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Install Rust (stable, for the audit tool)
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
       # this directory, but the audit tool itself should build on current stable.
+      #
+      # Version-pinned the same way the Dockerfile pins cargo-chef. An unpinned
+      # `install` builds whatever is current at run time, so the gate can change
+      # behaviour on a day nobody changed the repo. Bump this deliberately.
       - name: Install cargo-audit
-        run: cargo +stable install cargo-audit --locked
+        run: cargo +stable install cargo-audit --locked --version 0.21.2
       - name: Audit dependencies
-        # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel) has no fixed release,
-        # and `rsa` is not in our build graph (a lockfile-only transitive from an
-        # inactive driver path; `cargo tree -i rsa` is empty), so its code never
-        # compiles into the binary. Ignored with that justification; everything
-        # else stays strict.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # `--deny warnings` because the default exits 0 on the warning-class
+        # advisories (unmaintained, unsound, yanked). Those are exactly the
+        # early signals worth acting on while there is still time to move off
+        # the crate, and a gate that passes on them is not a gate.
+        #
+        # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel) has no fixed
+        # release. It is ignored because the code never compiles into the
+        # binary: `rsa` has exactly one reverse dependency in Cargo.lock,
+        # `sqlx-mysql`, which is an optional dependency of sqlx that no enabled
+        # feature turns on. We do not enable sqlx's `mysql` feature, and every
+        # other reference to it uses weak activation (`sqlx-mysql?/...`), which
+        # cannot enable an optional dependency that is otherwise off.
+        #
+        # To re-verify, read those reverse dependencies out of Cargo.lock.
+        # Do not reach for `cargo tree -i rsa`: for a package that is in the
+        # lockfile but not in the build graph, that exits non-zero with
+        # "package ID specification `rsa` did not match any packages", which
+        # looks like a broken command rather than an answer.
+        #
+        # This ignore stops being valid the moment anyone adds `mysql` to the
+        # sqlx feature list. Everything else stays strict.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071

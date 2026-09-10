@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use axum::Json;
@@ -219,6 +220,56 @@ pub struct GatewayCore {
     /// When true (`exact` admission), reserve against the provider's exact
     /// pre-flight token count; otherwise use the fast parse-time estimate.
     pub admission_exact: bool,
+    /// Process-lifetime counters behind `/metrics`.
+    ///
+    /// Shared across core rebuilds, not owned by one. The reload task builds a
+    /// fresh `GatewayCore` every fifteen seconds, so a counter living in the
+    /// core would reset on that tick and every rate in a dashboard would be
+    /// wrong in a way that looks like traffic.
+    pub metrics: Arc<Metrics>,
+}
+
+/// What `/metrics` reports, counted in process.
+///
+/// Counters reset on restart, which is what Prometheus expects and handles. They
+/// are deliberately not read back from the ledger: a metrics scrape that queries
+/// Postgres puts the observability path on the same dependency as the money
+/// path, so an outage would take the thing you use to see the outage with it.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub allowed: AtomicU64,
+    pub estimated: AtomicU64,
+    pub rejected_budget: AtomicU64,
+    pub unpriced: AtomicU64,
+    pub errors: AtomicU64,
+    pub unauthenticated: AtomicU64,
+    /// Sum of settled cost, in currency micros. Wrapping is unreachable: at
+    /// u64 micros this is more currency than exists, and Prometheus treats a
+    /// counter reset as a restart anyway.
+    pub cost_micros: AtomicU64,
+}
+
+impl Metrics {
+    /// Count one terminal decision. Unknown decisions fall to `errors` rather
+    /// than being dropped, so a new decision word shows up somewhere rather than
+    /// silently vanishing from the totals.
+    pub fn observe(&self, decision: &str, cost_micros: i64) {
+        let counter = match decision {
+            "allowed" => &self.allowed,
+            "estimated" => &self.estimated,
+            "rejected_budget" => &self.rejected_budget,
+            "unpriced" => &self.unpriced,
+            _ => &self.errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(c) = u64::try_from(cost_micros) {
+            self.cost_micros.fetch_add(c, Ordering::Relaxed);
+        }
+    }
+
+    pub fn observe_unauthenticated(&self) {
+        self.unauthenticated.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Extract the presented Tollgate key from either the `x-tollgate-key` header or
@@ -244,7 +295,19 @@ fn presented_key(headers: &HeaderMap) -> Option<String> {
 
 impl GatewayCore {
     /// Resolve the caller's key id from the request headers, or `None`.
+    /// Counting lives here rather than at the call sites: the streaming routes
+    /// and the console authenticate themselves without going through
+    /// `evaluate`, so counting there left a key-guesser sending `stream: true`
+    /// invisible to the one series most worth alerting on.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Option<String> {
+        let id = self.authenticate_inner(headers).await;
+        if id.is_none() {
+            self.metrics.observe_unauthenticated();
+        }
+        id
+    }
+
+    async fn authenticate_inner(&self, headers: &HeaderMap) -> Option<String> {
         let presented = presented_key(headers)?;
         let (prefix, secret) = apikey::parse(&presented).ok()?;
         match self.keys.lookup(&prefix).await {
@@ -272,6 +335,8 @@ impl GatewayCore {
         let started = std::time::Instant::now();
         let mut provider_micros: u128 = 0;
         let Some(key_id) = self.authenticate(headers).await else {
+            // Counted inside `authenticate`, which every route uses, rather
+            // than here, which only the buffered ones reach.
             return Outcome::Unauthenticated;
         };
         let Some(provider) = self.providers.get(provider_id) else {
@@ -341,9 +406,54 @@ impl GatewayCore {
             provider_micros += c0.elapsed().as_micros();
             match counted {
                 Ok(n) => n,
+                // The provider REFUSED the count rather than failing to answer:
+                // a malformed request that `parse_request` let through. That is
+                // the client's fault, so it is a 400, not a 502, and it must not
+                // be retried by an SDK that retries 5xx.
+                Err(ProviderError::BadRequest(m)) => {
+                    self.record(
+                        &key_id,
+                        provider_id,
+                        &parsed.model,
+                        Usage::default(),
+                        0,
+                        "error",
+                        started,
+                        provider_micros,
+                    )
+                    .await;
+                    return Outcome::BadRequest(m);
+                }
                 Err(e) => {
-                    tracing::error!(error = %e.to_string(), "exact token count failed");
-                    return Outcome::BackendError(e.to_string());
+                    // The only place this is logged. `count_refusal` logs 401
+                    // and 403 because those name a credential, but a 429, a 529
+                    // or a refused connection would otherwise reach the operator
+                    // as a bare 502 with the reason recorded nowhere: the
+                    // Anthropic response mapper does not log its Upstream arm.
+                    tracing::warn!(error = %e, "pre-flight token count failed upstream");
+                    // UPSTREAM, not backend. The count is a round trip to the
+                    // provider, so a failure here means the provider failed, and
+                    // calling it a backend error sent an operator to look at
+                    // Valkey and Postgres while the actual fault was upstream.
+                    // The status follows the classification: 502, not 503.
+                    //
+                    // Recorded as `error` with zero cost, like every other
+                    // terminal decision. Nothing was reserved and nothing was
+                    // forwarded, so there is no charge, but a provider whose
+                    // count endpoint is down for an hour must not look like an
+                    // hour in which no requests arrived.
+                    self.record(
+                        &key_id,
+                        provider_id,
+                        &parsed.model,
+                        Usage::default(),
+                        0,
+                        "error",
+                        started,
+                        provider_micros,
+                    )
+                    .await;
+                    return Outcome::Upstream(e.to_string());
                 }
             }
         } else {
@@ -584,7 +694,16 @@ impl GatewayCore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn record(
+    /// `pub(crate)` because the streaming routes in `app.rs` run their own
+    /// admission rather than going through [`Self::evaluate`], and a refusal
+    /// that never reaches the ledger is a refusal nobody can see afterwards.
+    ///
+    /// Counts the decision as well as recording it, but note that this is NOT
+    /// the only place a ledger row is written: [`Settlement`] writes its own,
+    /// and counts there for the same reason. A metrics feature hooked only here
+    /// reports refusals and never reports a single successful request, which is
+    /// how this shipped the first time.
+    pub(crate) async fn record(
         &self,
         key_id: &str,
         provider: &str,
@@ -602,6 +721,7 @@ impl GatewayCore {
                 .saturating_sub(provider_micros),
         )
         .unwrap_or(i64::MAX);
+        self.metrics.observe(decision, cost_micros);
         self.usage
             .record(UsageEvent {
                 key_id,
@@ -636,6 +756,12 @@ impl GatewayCore {
 pub struct Settlement {
     budgets: Arc<dyn BudgetBackend>,
     usage: Arc<dyn UsageSink>,
+    /// Counted HERE as well as in `GatewayCore::record`, because this guard
+    /// writes its ledger row directly rather than going through that method.
+    /// Every request that gets past reservation settles through here, so a
+    /// metrics feature that only hooked `record` counted refusals and nothing
+    /// else: `allowed` and the cost total sat permanently at zero.
+    metrics: Arc<Metrics>,
     reservation: Option<Reservation>,
     reserved_micros: i64,
     key_id: String,
@@ -658,6 +784,7 @@ impl Settlement {
         Self {
             budgets: core.budgets.clone(),
             usage: core.usage.clone(),
+            metrics: core.metrics.clone(),
             reservation: Some(reservation),
             reserved_micros,
             key_id,
@@ -687,6 +814,11 @@ impl Settlement {
         overhead_micros: i64,
     ) {
         if let Some(r) = self.reservation.take() {
+            // Counted immediately after the take, before any await. `commit` is
+            // a cancel point on the buffered path, and a request cancelled there
+            // would otherwise be missing from both the counter and the ledger.
+            // The counter is the cheaper of the two to keep honest.
+            self.metrics.observe(decision, actual_micros);
             self.budgets.commit(&r, actual_micros).await;
             self.usage
                 .record(UsageEvent {
@@ -712,6 +844,11 @@ impl Drop for Settlement {
         // `error` so the ledger says plainly that this figure was assumed rather
         // than measured.
         if let Some(r) = self.reservation.take() {
+            // Counted before the runtime check, and synchronously. These are
+            // atomics, so they need no runtime, and a drop during shutdown is
+            // exactly the case where the spawned ledger write may never happen:
+            // the counter is then the only trace that the request existed.
+            self.metrics.observe("estimated", self.reserved_micros);
             // Only spawn if a runtime is present. `tokio::spawn` panics without one,
             // and a panic in a destructor risks a process abort; during runtime
             // shutdown the reservation simply stays held in the budget backend
@@ -944,6 +1081,7 @@ mod tests {
             )])),
             providers,
             admission_exact: false,
+            metrics: Arc::new(Metrics::default()),
         };
         (core, generated.plaintext)
     }
@@ -956,6 +1094,11 @@ mod tests {
         Hang,
         NotDelivered,
         MaybeBilled,
+        /// The pre-flight count could not be answered. Only reachable under
+        /// `exact` admission, and it happens BEFORE any reservation.
+        CountUnavailable,
+        /// The provider refused the count: the caller's body is wrong.
+        CountRefused,
     }
 
     #[async_trait]
@@ -984,6 +1127,34 @@ mod tests {
                 StubBehaviour::MaybeBilled => Err(ProviderError::MeteringFailed(
                     "timed out waiting for response".to_owned(),
                 )),
+                // These fail at the count, so forward is never reached. Panic
+                // rather than return: reaching here would mean admission
+                // continued past a failed count, which is the hole `exact`
+                // exists to close.
+                StubBehaviour::CountUnavailable | StubBehaviour::CountRefused => {
+                    panic!(
+                        "forward reached on a count-failing stub. Either admission continued \
+                         past a failed count, which is the hole `exact` exists to close, or \
+                         the test forgot to set admission_exact"
+                    )
+                }
+            }
+        }
+
+        async fn count_input_tokens(
+            &self,
+            _rest_path: &str,
+            _body: &str,
+            _parsed: &crate::provider::ParsedRequest,
+        ) -> Result<u64, ProviderError> {
+            match self.0 {
+                StubBehaviour::CountUnavailable => {
+                    Err(ProviderError::Upstream("count endpoint 503".to_owned()))
+                }
+                StubBehaviour::CountRefused => Err(ProviderError::BadRequest(
+                    "messages: at least one message is required".to_owned(),
+                )),
+                _ => Ok(10),
             }
         }
     }
@@ -1049,6 +1220,153 @@ mod tests {
         // billed and the reservation is released in full.
         assert_eq!(events[0].cost_micros, 0);
         assert_eq!(events[0].decision, "error");
+    }
+
+    /// The pre-flight count is a round trip to the PROVIDER, so a failure there
+    /// is the provider's, not Tollgate's. It was reported as a backend error at
+    /// 503, which sent an operator to look at Valkey and Postgres while the
+    /// actual fault was upstream. Nothing was reserved and nothing forwarded, so
+    /// the request must also be recorded at zero cost rather than not at all: a
+    /// provider whose count endpoint is down for an hour must not look like an
+    /// hour in which no requests arrived.
+    #[tokio::test]
+    async fn an_unanswerable_pre_flight_count_is_an_upstream_failure() {
+        let (mut core, key, sink) = core_with_stub(StubBehaviour::CountUnavailable);
+        core.admission_exact = true;
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+
+        let out = core.evaluate("mock", "generate", &header(&key), body).await;
+        assert!(
+            matches!(out, Outcome::Upstream(_)),
+            "a failed count is an upstream failure, not a backend one"
+        );
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1, "the attempt must still be recorded");
+        assert_eq!(events[0].decision, "error");
+        assert_eq!(
+            events[0].cost_micros, 0,
+            "nothing was reserved and nothing forwarded, so nothing is charged"
+        );
+    }
+
+    /// The other half: the provider ANSWERED and refused. That is the caller's
+    /// body being wrong, so it must be a 400. Reporting it as 502 makes an SDK
+    /// retry a request that can never succeed, turning a client bug into three
+    /// round trips and a provider outage in the logs.
+    #[tokio::test]
+    async fn a_refused_pre_flight_count_is_the_callers_fault() {
+        let (mut core, key, sink) = core_with_stub(StubBehaviour::CountRefused);
+        core.admission_exact = true;
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+
+        let out = core.evaluate("mock", "generate", &header(&key), body).await;
+        match out {
+            Outcome::BadRequest(m) => assert!(
+                m.contains("at least one message"),
+                "the provider's own reason must reach the caller, got {m}"
+            ),
+            Outcome::Upstream(m) => {
+                panic!("a refusal must not read as an outage: {m}")
+            }
+            _ => panic!("expected BadRequest"),
+        }
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, "error");
+        assert_eq!(events[0].cost_micros, 0);
+    }
+
+    /// The test that should have existed first.
+    ///
+    /// `/metrics` shipped counting nothing that succeeds, because the counters
+    /// were hooked into `GatewayCore::record` while every settled request writes
+    /// its row through `Settlement` instead. A unit test on `Metrics::observe`
+    /// passed the whole time: it proved the function worked, not that anything
+    /// called it. So this asserts through `evaluate`, and ties the counter to
+    /// the ledger row rather than to a number typed into the test.
+    #[tokio::test]
+    async fn a_settled_request_moves_the_counters_and_the_ledger_together() {
+        let (core, key) = core_with_key();
+        let sink = Arc::new(MemUsageSink::new());
+        let core = GatewayCore {
+            usage: sink.clone(),
+            ..core
+        };
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":16}"#;
+
+        let out = core.evaluate("mock", "generate", &header(&key), body).await;
+        assert!(matches!(out, Outcome::Allowed { .. }), "should be allowed");
+
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        // Or the equality below holds trivially at zero and proves nothing.
+        assert!(events[0].cost_micros > 0, "the fixture must cost something");
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!(
+            load(&core.metrics.allowed),
+            1,
+            "an allowed request must be counted, not just recorded"
+        );
+        assert_eq!(
+            load(&core.metrics.cost_micros),
+            u64::try_from(events[0].cost_micros).unwrap(),
+            "the cost counter and the ledger row must agree"
+        );
+        assert_eq!(load(&core.metrics.rejected_budget), 0);
+    }
+
+    /// The Drop guard writes its own ledger row too, so it needs its own count.
+    /// A cancelled request that vanished from `/metrics` would make an incident
+    /// look like a drop in traffic rather than a rise in cancellations.
+    #[tokio::test]
+    async fn a_cancelled_request_is_counted_as_estimated() {
+        let (core, key, _sink) = core_with_stub(StubBehaviour::Hang);
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            core.evaluate("mock", "generate", &header(&key), body),
+        )
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            core.metrics.estimated.load(Ordering::Relaxed),
+            1,
+            "a cancelled request charges its reservation and must be counted"
+        );
+        assert_eq!(core.metrics.allowed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn every_decision_lands_in_a_counter() {
+        let m = Metrics::default();
+        m.observe("allowed", 100);
+        m.observe("estimated", 50);
+        m.observe("rejected_budget", 0);
+        m.observe("unpriced", 0);
+        m.observe("error", 0);
+        // Not a decision this code writes today. It must still be counted.
+        m.observe("rejected_policy", 0);
+        m.observe_unauthenticated();
+
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!(load(&m.allowed), 1);
+        assert_eq!(load(&m.estimated), 1);
+        assert_eq!(load(&m.rejected_budget), 1);
+        assert_eq!(load(&m.unpriced), 1);
+        assert_eq!(load(&m.errors), 2, "an unknown decision falls to errors");
+        assert_eq!(load(&m.unauthenticated), 1);
+        assert_eq!(load(&m.cost_micros), 150, "only settled cost accumulates");
+
+        // A negative cost cannot happen, and if it ever did it must not wrap the
+        // counter into something that reads as an enormous rate.
+        m.observe("allowed", -1);
+        assert_eq!(load(&m.cost_micros), 150);
     }
 
     #[tokio::test]

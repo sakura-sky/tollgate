@@ -7,14 +7,24 @@
 #   _REGION         e.g. australia-southeast1
 #   _AR_REPO        Artifact Registry repo name, e.g. tollgate
 #
-# The image is tagged with both the short SHA and `latest`. Tag promotion
-# (e.g. attaching `staging` / `prod`) is handled by a separate Cloud Deploy
-# pipeline.
+# The image is tagged with the short SHA only. `latest` used to be pushed
+# alongside it, which made every deploy that referenced it irreproducible: the
+# same name resolves to a different image after the next build, so a rollback
+# has nothing fixed to roll back to. Tag promotion (e.g. attaching `staging` /
+# `prod`) is handled by a separate Cloud Deploy pipeline, so nothing here
+# needed a floating tag in the first place.
+#
+# This file is an image build path, not a release gate. It runs fmt, clippy and
+# tests so a broken tree does not become an image, but the gates that decide
+# whether a build may ship (`cargo audit` and REUSE licence compliance) live in
+# .github/workflows/ci.yml. Do not read a green Cloud Build as a release
+# sign-off, and if a gate is added there, decide deliberately whether it also
+# belongs here.
 
 steps:
   # ---- 1. Cargo fmt --------------------------------------------------------
   - id: fmt
-    name: rust:1.85-slim-bookworm
+    name: rust:1.88-slim-bookworm
     entrypoint: bash
     args:
       - -ec
@@ -24,27 +34,28 @@ steps:
 
   # ---- 2. Clippy -----------------------------------------------------------
   - id: clippy
-    name: rust:1.85-slim-bookworm
+    name: rust:1.88-slim-bookworm
     waitFor: ["fmt"]
     entrypoint: bash
     args:
       - -ec
       - |
         rustup component add clippy
-        apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+        # No pkg-config/libssl-dev: TLS is rustls over ring and nothing in
+        # Cargo.lock links OpenSSL, so installing them only slowed the step.
         cargo clippy --all-targets --locked -- -D warnings
 
   # ---- 3. Tests ------------------------------------------------------------
   # Unit and in-process tests run here. Integration tests that need Postgres
   # or Valkey run against Cloud Build-provided service containers.
   - id: test
-    name: rust:1.85-slim-bookworm
+    name: rust:1.88-slim-bookworm
     waitFor: ["clippy"]
     entrypoint: bash
     args:
       - -ec
       - |
-        apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
+        # Same as the clippy step: no OpenSSL development packages are needed.
         cargo test --locked --all-targets
 
   # ---- 4. Build container image -------------------------------------------
@@ -54,22 +65,22 @@ steps:
     args:
       - build
       - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:$SHORT_SHA
-      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:latest
       - --build-arg=SQLX_OFFLINE=true
       - .
 
   # ---- 5. Push to Artifact Registry ---------------------------------------
+  # The immutable tag by name, not `push --all-tags`: --all-tags pushes every
+  # local tag on that repository, which is how a floating tag creeps back in
+  # after somebody adds one to the build step.
   - id: push
     name: gcr.io/cloud-builders/docker
     waitFor: ["build-image"]
     args:
       - push
-      - --all-tags
-      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:$SHORT_SHA
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:$SHORT_SHA
-  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/tollgate:latest
 
 options:
   logging: CLOUD_LOGGING_ONLY

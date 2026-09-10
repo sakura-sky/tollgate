@@ -100,6 +100,11 @@ fn preload() -> Preloaded {
         prices,
         providers,
         admission_exact: false,
+        // The demo counts its own decisions in `DemoState` for the console it
+        // ships, so this set is unread. It exists because the core requires it,
+        // and leaving it unshared keeps the demo's numbers and `serve`'s from
+        // being confused for each other.
+        metrics: Arc::new(crate::gateway::Metrics::default()),
     };
 
     Preloaded {
@@ -281,8 +286,16 @@ async fn ready() -> impl IntoResponse {
     Json(json!({"status": "ready", "mode": "demo"}))
 }
 
-/// Prometheus text-format metrics for scraping (SRE monitoring). Production
-/// exposes the same series backed by Redis/Postgres counters.
+/// Prometheus text-format metrics for the demo console.
+///
+/// NOT the same series `serve` exposes, and a dashboard built here will not
+/// transfer. This counts by walking the in-memory usage log (only
+/// `unauthenticated` is an atomic), has no `estimated`
+/// decision, accumulates cost only on `allowed`, and exports budget SPEND
+/// gauges. `serve` counts every decision including `estimated`, and exports no
+/// spend, because a scrape there deliberately touches neither Postgres nor
+/// Valkey. The demo can afford spend gauges precisely because everything it
+/// knows is already in memory.
 async fn metrics(State(state): State<Arc<DemoState>>) -> impl IntoResponse {
     let events = state.usage.snapshot();
     let (mut allowed, mut rejected, mut errors, mut unpriced, mut cost) =

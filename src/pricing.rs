@@ -33,9 +33,12 @@
 //! ```
 //!
 //! i.e. each side is `tokens × (price per million) ÷ one million`, rounded to
-//! the nearest micro, then summed. Token counts come from
-//! `Provider::parse_usage` (Gemini `usageMetadata`, Anthropic `usage`), so the
-//! same table costs every provider uniformly and one budget can span them.
+//! the nearest micro, then summed. Token counts are produced inside each
+//! adapter's `forward`, by the free functions `parse_anthropic_usage`,
+//! `parse_vertex_usage` and `parse_openai_usage` in `providers.rs` (Anthropic
+//! `usage`, Gemini `usageMetadata`, OpenAI `usage`). Each normalises its
+//! provider's shape into the same `Usage`, so the same table costs every
+//! provider uniformly and one budget can span them.
 //!
 //! Prices live in the `model_prices` table (see migration 0002) with
 //! `effective_from`/`effective_to`, so historical usage is always costed at the

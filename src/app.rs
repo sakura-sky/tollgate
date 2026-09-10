@@ -28,6 +28,7 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
@@ -39,7 +40,7 @@ use crate::backends::{
 use crate::budget::{Budget, RequestCtx, Scope};
 use crate::config::Config;
 use crate::gateway::{
-    GatewayCore, KeyStore, ReserveError, Settlement, UsageSink, outcome_response,
+    GatewayCore, KeyStore, Metrics, ReserveError, Settlement, UsageSink, outcome_response,
 };
 use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
 use crate::provider::{MockProvider, Provider, ProviderError};
@@ -87,6 +88,9 @@ struct CoreParts {
     redis: ConnectionManager,
     /// So the budget backend can rebuild a counter Valkey has lost.
     ledger: Arc<dyn SpendLedger>,
+    /// Held HERE, not in the core, because the core is rebuilt every reload
+    /// tick and counters that reset every fifteen seconds are worse than none.
+    metrics: Arc<Metrics>,
 }
 
 impl CoreParts {
@@ -104,6 +108,7 @@ impl CoreParts {
             prices: Arc::new(prices),
             providers: self.providers.clone(),
             admission_exact: self.admission_exact,
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -365,6 +370,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         admission_exact,
         redis: redis.clone(),
         ledger: Arc::new(PgSpendLedger::new(db.clone())),
+        metrics: Arc::new(Metrics::default()),
     };
 
     let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
@@ -536,6 +542,25 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
     local
         .merge(proxied)
         .with_state(state)
+        // Applied around the routes, so it sees a panic from anywhere inside
+        // them, including from a dependency. `TraceLayer` sits outside it and is
+        // unaffected. A panic on one request for one key must fail that request,
+        // not the process: this gateway is the thing standing between every
+        // client and its provider, so a total outage is the most expensive
+        // failure it has. The binary is built to unwind rather than abort for
+        // exactly this reason.
+        //
+        // The response body is fixed text. A panic message can carry anything
+        // that was in scope, so it is logged and never returned.
+        .layer(CatchPanicLayer::custom(|_| {
+            tracing::error!("a request panicked; failing that request, not the process");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("x-tollgate-reason", "backend_error")],
+                Json(json!({"error": "internal error"})),
+            )
+                .into_response()
+        }))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -628,6 +653,46 @@ async fn anthropic_messages(
         .evaluate("anthropic", "messages", &headers, &body)
         .await;
     anthropic_outcome_response(outcome)
+}
+
+/// Record a refusal that happened BEFORE the request was forwarded, on a
+/// streaming route.
+///
+/// The streaming routes run their own admission rather than going through
+/// [`GatewayCore::evaluate`], and they used to record nothing at all for a
+/// refusal. An hour of budget denials, or of a provider's count endpoint being
+/// down, read as an hour in which no requests arrived: the ledger is the only
+/// place a refused request is visible, since there is no metric for it either.
+///
+/// Zero cost on every one of these, because nothing was reserved and nothing was
+/// forwarded. The decision words are the ones the buffered path already uses for
+/// the same situations, so the two agree rather than inventing a third
+/// vocabulary for streams.
+///
+/// A parse failure is deliberately NOT recorded, matching `evaluate`: the
+/// request never resolved to a model, and a caller looping on a malformed body
+/// would otherwise fill the ledger with rows that describe their bug rather than
+/// this deployment's spend.
+async fn record_stream_refusal(
+    core: &GatewayCore,
+    key_id: &str,
+    provider: &str,
+    model: &str,
+    decision: &str,
+    started: Instant,
+    provider_micros: u128,
+) {
+    core.record(
+        key_id,
+        provider,
+        model,
+        Usage::default(),
+        0,
+        decision,
+        started,
+        provider_micros,
+    )
+    .await;
 }
 
 /// An Anthropic-shaped error, so SDK exception classes resolve correctly.
@@ -800,6 +865,16 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
     };
 
     let Some(price) = core.prices.lookup("anthropic", &parsed.model).cloned() else {
+        record_stream_refusal(
+            &core,
+            &key_id,
+            "anthropic",
+            &parsed.model,
+            "unpriced",
+            started,
+            0,
+        )
+        .await;
         return anthropic_error_reason(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -825,13 +900,36 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
         match counted {
             Ok(n) => n,
             Err(e) => {
-                tracing::error!(error = %e.to_string(), "exact token count failed");
-                return anthropic_error_reason(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "api_error",
-                    "backend_error",
-                    "gateway temporarily unavailable",
-                );
+                // Upstream, not backend: the count is a round trip to the
+                // provider. Matches the buffered path in `GatewayCore::evaluate`,
+                // including the split between a provider that REFUSED the count
+                // (the caller's body is wrong, 400) and one that could not answer
+                // (502).
+                // warn, not error: a `BadRequest` here is the caller's malformed
+                // body, and a client looping on its own bug must not fill the
+                // operator's error budget. The genuinely alarming cases, a
+                // rejected credential, are logged at ERROR by `count_refusal`.
+                tracing::warn!(error = %e.to_string(), "pre-flight token count failed");
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "error",
+                    started,
+                    provider_micros,
+                )
+                .await;
+                return match e {
+                    ProviderError::BadRequest(m) => {
+                        anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
+                    }
+                    _ => anthropic_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "pre-flight token count failed upstream",
+                    ),
+                };
             }
         }
     } else {
@@ -857,6 +955,16 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
         match core.budgets.reserve(&ctx, reserve_micros).await {
             Ok(r) => r,
             Err(ReserveError::Denied(d)) => {
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "rejected_budget",
+                    started,
+                    provider_micros,
+                )
+                .await;
                 return anthropic_error(
                     StatusCode::PAYMENT_REQUIRED,
                     "permission_error",
@@ -865,6 +973,16 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             }
             Err(ReserveError::Backend(m)) => {
                 tracing::error!(error = %m, "budget backend error on stream reserve");
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "error",
+                    started,
+                    provider_micros,
+                )
+                .await;
                 return anthropic_error_reason(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
@@ -1004,6 +1122,16 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     };
 
     let Some(price) = core.prices.lookup("openai", &parsed.model).cloned() else {
+        record_stream_refusal(
+            &core,
+            &key_id,
+            "openai",
+            &parsed.model,
+            "unpriced",
+            started,
+            0,
+        )
+        .await;
         return openai_error(
             StatusCode::BAD_REQUEST,
             "unpriced",
@@ -1033,6 +1161,16 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         match core.budgets.reserve(&ctx, reserve_micros).await {
             Ok(r) => r,
             Err(ReserveError::Denied(d)) => {
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "openai",
+                    &parsed.model,
+                    "rejected_budget",
+                    started,
+                    0,
+                )
+                .await;
                 return openai_error(
                     StatusCode::PAYMENT_REQUIRED,
                     "budget_exceeded",
@@ -1041,6 +1179,8 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
             }
             Err(ReserveError::Backend(m)) => {
                 tracing::error!(error = %m, "budget backend error on stream reserve");
+                record_stream_refusal(&core, &key_id, "openai", &parsed.model, "error", started, 0)
+                    .await;
                 return openai_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "backend_error",
@@ -1652,19 +1792,75 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
     .into_response()
 }
 
-/// Minimal Prometheus endpoint. Per-request counters are added with a metrics
-/// layer in a later change; the ledger in Postgres is the system of record.
-async fn metrics() -> impl IntoResponse {
+/// Prometheus exposition.
+///
+/// Everything here is read from process memory. A scrape deliberately does not
+/// touch Postgres or Valkey: putting the observability path on the same
+/// dependencies as the money path means an outage takes away the instrument you
+/// would use to see it. The consequence is that budget SPEND is not exported,
+/// because the authoritative figures live in those two stores. `/console/usage`
+/// and `/console/budgets` serve that, and they are honest about querying.
+///
+/// Counters are process-lifetime and reset on restart, which is what Prometheus
+/// expects. `tollgate_budget_limit_micros` is a gauge read from the live config,
+/// so it follows a hot-reloaded budget change without a restart.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    use std::fmt::Write as _;
+
+    let core = state.core.load_full();
+    let m = &core.metrics;
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+
+    let mut body = String::with_capacity(1024);
+    body.push_str(
+        "# HELP tollgate_up 1 if the gateway is serving.\n\
+         # TYPE tollgate_up gauge\n\
+         tollgate_up 1\n\
+         # HELP tollgate_requests_total Terminal request decisions since start.\n\
+         # TYPE tollgate_requests_total counter\n",
+    );
+    for (decision, value) in [
+        ("allowed", load(&m.allowed)),
+        ("estimated", load(&m.estimated)),
+        ("rejected_budget", load(&m.rejected_budget)),
+        ("unpriced", load(&m.unpriced)),
+        ("error", load(&m.errors)),
+        ("unauthenticated", load(&m.unauthenticated)),
+    ] {
+        let _ = writeln!(
+            body,
+            "tollgate_requests_total{{decision=\"{decision}\"}} {value}"
+        );
+    }
+    let _ = write!(
+        body,
+        "# HELP tollgate_cost_micros_total Settled cost since start, in currency micros.\n\
+         # TYPE tollgate_cost_micros_total counter\n\
+         tollgate_cost_micros_total {}\n\
+         # HELP tollgate_budget_limit_micros Configured limit per budget.\n\
+         # TYPE tollgate_budget_limit_micros gauge\n",
+        load(&m.cost_micros),
+    );
+    for b in state.budgets.load_full().iter() {
+        // Scope and period as labels, so a dashboard can show one budget's
+        // ceiling next to the spend the console reports for it.
+        let _ = writeln!(
+            body,
+            "tollgate_budget_limit_micros{{scope=\"{}\",period=\"{}\",hard_stop=\"{}\"}} {}",
+            b.scope,
+            b.period.as_str(),
+            b.hard_stop,
+            b.limit_micros,
+        );
+    }
+
     (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        "# HELP tollgate_up 1 if the gateway is serving.\n\
-         # TYPE tollgate_up gauge\n\
-         tollgate_up 1\n"
-            .to_owned(),
+        body,
     )
 }
 

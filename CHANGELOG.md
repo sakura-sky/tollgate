@@ -5,7 +5,99 @@ SPDX-FileCopyrightText: 2026 Andrew Stevens
 
 # Changelog
 
-Notable changes per release. Dates are the tag date.
+Notable changes per release.
+
+## v0.2.3
+
+Telling the caller whose fault a refusal is, and leaving a trace of it.
+
+### Fixed
+
+- A failure of the pre-flight token count under `exact` admission is now reported
+  as an upstream error (`502`, `upstream_error`) rather than a backend one
+  (`503`, `backend_error`). The count is a round trip to the provider, so the old
+  labelling sent an operator to look at Valkey and Postgres while the fault was
+  upstream. Buffered and streaming paths agree.
+- A count endpoint that REFUSES the request now surfaces as a `400`, not a `502`.
+  Both count adapters discarded the HTTP status, so a body the provider rejected
+  as malformed was reported as a provider outage, and SDKs retried it three times
+  before surfacing what was really a client bug.
+- Refusals made before forwarding now reach the ledger, at zero cost, on the
+  streaming routes as well as the buffered one. Streaming previously recorded
+  nothing for a refusal at all, so an hour of budget denials, unpriced models, or
+  a provider's count endpoint being down read as an hour in which no requests
+  arrived, and the ledger is the only place a refused request is visible. The
+  decision words match the buffered path: `unpriced`, `rejected_budget`, `error`.
+  A parse failure is still not recorded on either path, since the request never
+  resolved to a model.
+- Vertex `:countTokens` is sent an allowlisted body rather than the caller's
+  `generateContent` body unchanged. Verified against live Vertex: the endpoint
+  rejects `safetySettings`, `labels`, `toolConfig` and `cachedContent` with a
+  400, and an SDK-built body routinely carries `safetySettings`, so `exact`
+  admission on Vertex refused every request. It accepts and counts `contents`,
+  `systemInstruction`, `tools` and `generationConfig`, which is what is now sent.
+- Structured-output requests on Vertex were going to be under-reserved. A
+  `responseSchema` lives inside `generationConfig` and is counted as prompt
+  material (live: 1 token bare, 51 with a small four-property schema attached),
+  so the count has to include it. `system_instruction` in Google's snake-case
+  spelling is now read as well as the camelCase form, for the same reason:
+  missing it drops the system prompt from the reservation while the request
+  still carries it.
+
+### Changed
+
+- **Outbound TLS now trusts the image's CA store rather than a bundle compiled
+  into the binary.** This follows from moving to `reqwest` 0.13, whose rustls
+  feature uses the platform verifier. Trust rotates when you rebase instead of
+  needing a rebuild, and a private CA installed in the image is honoured, so a
+  TLS-inspecting egress proxy works where it previously could not. The reverse
+  is now also true: an image without CA certificates cannot reach any provider.
+  The distroless runtime image ships them.
+- **The minimum supported Rust version is 1.88**, up from 1.85. The old floor
+  was holding the `redis` client five minor versions back, since 1.2.3 onward
+  require 1.88, so every dependabot update to the client that talks to the
+  budget store had to be rejected. The client itself is unchanged in this
+  release; the bump is what makes updating it possible.
+- **A panic fails its request instead of the process.** The release profile no
+  longer sets `panic = "abort"`, and a catch-panic layer turns a panic into a
+  `500` for the request that caused it. Previously a panic anywhere, including
+  inside a dependency and on one request for one key, took the whole gateway
+  down. Symbols are kept (`strip = "debuginfo"`) so an abort is diagnosable.
+- **The dev compose file binds Postgres and Valkey to loopback.** They were
+  published on every interface, which on a laptop on an untrusted network is an
+  open database and an open unauthenticated Valkey. If you were reaching either
+  from another host, that stops working on purpose.
+- **Cloud Build no longer pushes a `:latest` tag.** A mutable tag makes a deploy
+  irreproducible. A Cloud Deploy target referencing `:latest` needs repointing
+  at the immutable tag.
+- **`valkey_shard_count` now refuses any value but 1**, and the Terraform
+  provider list no longer requires `google-beta`, which nothing used. An
+  existing tfvars setting more than one shard will fail `plan`: budget counter
+  keys are not hash-tagged, so a multi-shard Valkey refuses the reserve script
+  with `CROSSSLOT` rather than scaling anything.
+- The `redis` client is built without its default features, keeping only what
+  the Lua reserve and settle paths need.
+
+### Added
+
+- **The audit trail is written.** `audit_log` has existed since migration 0002
+  with append-only triggers, and nothing wrote to it, so key issuance,
+  revocation, budget changes and price changes left no record beyond their
+  effect. All four now append a row. The principal is the OS user and host the
+  command ran as: enough to correlate a change with a shell history, not a claim
+  that anyone was authenticated, and `SECURITY.md` says so rather than implying
+  otherwise. No secret is recorded.
+- **`/metrics` reports something.** `serve` previously exposed `tollgate_up`
+  alone, so anyone who built a dashboard found nothing to put on it. It now
+  exports
+  `tollgate_requests_total` by decision, `tollgate_cost_micros_total`, and
+  `tollgate_budget_limit_micros` per configured budget. A scrape reads process
+  memory only: exporting spend would put the observability path on the same
+  Postgres and Valkey that fail during the incident you are trying to see.
+- CI runs the Valkey enforcement battery against a real server. Those tests cover
+  the Lua that actually reserves and settles budgets, and until now were run only
+  by hand, so nothing stopped the enforcement path regressing between releases.
+  They stay `#[ignore]`d, so a developer without a server is not blocked.
 
 ## v0.2.2
 
@@ -82,6 +174,11 @@ Upgrading from v0.2.0 requires migration 0010.
   logs a possible under-charge on the streaming path as well as the buffered one.
 - A price row whose own multiples are stranded against a zero threshold is warned
   about on every config reload.
+- An Anthropic stream that reports an error before generating anything is charged
+  its reserved prompt leg rather than its full worst-case reservation. Restricted
+  to Anthropic, which has a pre-generation signal; on the OpenAI path a client
+  that disconnects before the terminal usage chunk is indistinguishable from one
+  that never started, so every abnormal end there still charges the reservation.
 
 ### Upgrading
 

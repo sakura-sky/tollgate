@@ -21,9 +21,11 @@
 //! a database leak alone cannot verify keys. argon2id is reserved for the future
 //! console's human-password login.
 
-// KeyInit provides `new_from_slice`. In hmac 0.12 it came in via `Mac`; the
-// 0.13 line (digest 0.11) requires importing it explicitly.
-use hmac::{Hmac, KeyInit, Mac};
+// `Mac` carries `new_from_slice` on the 0.12 line (digest 0.10). The 0.13 line
+// moved it to a `KeyInit` that has to be imported separately, so this import is
+// the one thing that has to change if the crate generation moves. It is pinned
+// to 0.12 deliberately: see the comment on the dependency in Cargo.toml.
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;

@@ -87,6 +87,25 @@ resource "google_cloud_run_v2_service" "gateway" {
         value = "tollgate"
       }
 
+      # Provider configuration, supplied by the operator.
+      #
+      # Every provider defaults to DISABLED, so a module applied without this
+      # produces a gateway that serves health, metrics and the console and
+      # refuses every proxied request. That is the fail-closed default and it is
+      # deliberate, but it surprises people on a first apply, so `var.provider_env`
+      # exists to make enabling one an explicit act rather than a code edit.
+      #
+      # Put secrets in Secret Manager and reference them the way the database URL
+      # and the pepper are referenced above. Do not put an API key in tfvars: it
+      # lands in state, and state is not a secret store.
+      dynamic "env" {
+        for_each = var.provider_env
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
       startup_probe {
         http_get {
           path = "/healthz"

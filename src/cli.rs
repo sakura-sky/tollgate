@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use sqlx::Row;
 
 use crate::config::Config;
@@ -335,6 +336,72 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
+/// Who the process believes ran this command.
+///
+/// SELF-ASSERTED, and the audit trail says so. The CLI authenticates nobody: it
+/// holds the database URL and the pepper, so anyone who can run it is already
+/// trusted by everything downstream. This records the OS user and host so a
+/// change can be correlated with a shell history or a bastion log, not so it can
+/// be relied on against someone who edited their own environment.
+///
+/// The control that actually binds is who can reach the database and read the
+/// secrets, which is the role split in docs/OPERATIONS.md.
+fn cli_principal() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_owned());
+    // HOSTNAME is a bash SHELL variable, not an exported one, so it is absent
+    // from the environment of anything a human runs from a terminal, which is
+    // most uses of this CLI. Containers do export it, so relying on it alone
+    // reads correctly in production and records `@unknown` on the laptop where
+    // the change was actually made. Fall back to the kernel's answer.
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("cli:{user}@{host}")
+}
+
+/// Append one row to the audit trail, in the SAME transaction as the change it
+/// describes.
+///
+/// Not best effort. The first version logged a failure and carried on, on the
+/// reasoning that the change had already committed so failing the command would
+/// mislead the operator. That reasoning only holds outside a transaction, and it
+/// leaned on someone alerting on a log line emitted to the stderr of a CLI run
+/// on a laptop, which reaches no alerting pipeline anyone has. Inside the
+/// transaction the objection disappears: if the audit insert fails, the change
+/// genuinely did not apply, the error names `audit_log`, and "no privileged
+/// change without a trail row" is an invariant rather than a hope.
+///
+/// Takes the transaction rather than the pool so the caller cannot accidentally
+/// get the old behaviour back by passing something else.
+///
+/// `metadata` must never carry a secret. Key plaintext, the pepper, and provider
+/// credentials are not written here, and there is no path that would put them in
+/// scope: `admin key issue` passes the key's id and label, never the key.
+async fn record_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    action: &str,
+    resource: &str,
+    metadata: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (principal, action, resource, metadata) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(cli_principal())
+    .bind(action)
+    .bind(resource)
+    .bind(metadata)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("writing the audit row for {action}; the change was rolled back"))?;
+    Ok(())
+}
+
 async fn admin_migrate(cfg: &Config) -> Result<()> {
     tracing::info!("running database migrations");
     let pool = crate::db::build_pool(&cfg.database).await?;
@@ -357,14 +424,25 @@ async fn admin_key_revoke(cfg: &Config, key: &str) -> Result<()> {
         .map(|(p, _)| p)
         .unwrap_or_else(|_| key.to_owned());
     let pool = crate::db::build_pool(&cfg.database).await?;
+    let mut tx = pool.begin().await.context("begin transaction")?;
     let n = sqlx::query(
         "UPDATE api_keys SET revoked_at = NOW() WHERE prefix = $1 AND revoked_at IS NULL",
     )
     .bind(&prefix)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .context("revoking api key")?
     .rows_affected();
+    if n > 0 {
+        // Only on an actual revocation. Recording a no-op would fill the trail
+        // with rows that describe nothing having happened.
+        record_audit(&mut tx, "key.revoke", &prefix, json!({})).await?;
+    }
+    tx.commit().await.context("commit transaction")?;
+    // AFTER the commit, and this is the direction that matters most. Printing
+    // "revoked" and then failing to commit tells someone a compromised key is
+    // dead while it is still live, and the error on stderr is easy to miss under
+    // a success line on stdout.
     if n == 0 {
         println!("no active key with prefix {prefix}");
     } else {
@@ -389,15 +467,30 @@ async fn admin_key_issue(cfg: &Config, label: &str) -> Result<()> {
     let hasher = crate::apikey::KeyHasher::new(cfg.security.api_key_pepper.clone().into_bytes());
     let key = hasher.generate();
     let pool = crate::db::build_pool(&cfg.database).await?;
+    let mut tx = pool.begin().await.context("begin transaction")?;
     let id: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO api_keys (key_hash, prefix, label) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(&key.key_hash)
     .bind(&key.prefix)
     .bind(label)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .context("inserting api key")?;
+    // The id and the label, never the key. The trail records that a key was
+    // issued and which one, so a later revocation can be tied to it; anyone who
+    // could read the plaintext from here could read it from the terminal it was
+    // just printed to.
+    record_audit(
+        &mut tx,
+        "key.issue",
+        &id.to_string(),
+        json!({ "label": label, "prefix": key.prefix }),
+    )
+    .await?;
+    tx.commit().await.context("commit transaction")?;
+    // Printed only after the commit. A key shown to an operator that was then
+    // rolled back is a key they will store and never be able to use.
     println!("API key issued (store it now; it is not recoverable):");
     println!("  key: {}", key.plaintext);
     println!("  id:  {id}");
@@ -476,6 +569,21 @@ async fn admin_budget_set(
     .execute(&mut *tx)
     .await
     .context("inserting budget")?;
+    // A budget change is the most consequential thing this CLI does: it is the
+    // number that decides what may be spent, and nothing else in the system
+    // records who moved it. In the same transaction, so the change and its trail
+    // row commit together or not at all.
+    record_audit(
+        &mut tx,
+        "budget.set",
+        scope,
+        json!({
+            "period": period,
+            "limit_micros": limit_micros,
+            "hard_stop": hard_stop,
+        }),
+    )
+    .await?;
     tx.commit().await.context("commit transaction")?;
 
     println!(
@@ -588,7 +696,28 @@ async fn admin_price_set(
     .execute(&mut *tx)
     .await
     .context("inserting price")?;
+
+    // A price change silently re-values every future request on that model, and
+    // the `model_prices` table keeps the old row (superseded by `effective_to`)
+    // without recording who replaced it or when they decided to. In the same
+    // transaction as the re-price.
+    record_audit(
+        &mut tx,
+        "price.set",
+        &format!("{provider}/{model}"),
+        json!({
+            "input_per_1m_micros": input,
+            "output_per_1m_micros": output,
+            "cache_read_per_1m_micros": cache_read,
+            "cache_write_per_1m_micros": cache_write,
+            "long_context_threshold_tokens": lc_threshold,
+            "long_context_input_permille": lc_input,
+            "long_context_output_permille": lc_output,
+        }),
+    )
+    .await?;
     tx.commit().await.context("commit transaction")?;
+
     let show = |v: Option<i64>| {
         v.map_or_else(
             || "unset (conservative fallback applies)".to_owned(),
@@ -716,6 +845,21 @@ mod tests {
         assert!(resolve_long_context_intent(Some(200_000), Some(2_000_000), None, 0).is_err());
         assert!(resolve_long_context_intent(Some(200_000), None, Some(500), 0).is_err());
         assert!(resolve_long_context_intent(Some(200_000), None, Some(2_000_000), 0).is_err());
+    }
+
+    #[test]
+    fn the_audit_principal_is_shaped_so_it_cannot_be_mistaken_for_an_identity() {
+        // The `cli:` prefix is load-bearing. A bare username in an audit trail
+        // reads like an authenticated identity, and this one is taken from the
+        // environment by a process that authenticates nobody. The prefix says
+        // which it is, at the point someone is reading the row.
+        let p = cli_principal();
+        assert!(p.starts_with("cli:"), "got {p}");
+        assert!(p.contains('@'), "principal should carry user and host: {p}");
+        // Never empty, whatever the environment is missing: a blank principal
+        // would violate the NOT NULL and fail the insert, turning a missing
+        // environment variable into a lost audit row.
+        assert!(p.len() > "cli:@".len(), "got {p}");
     }
 
     #[test]

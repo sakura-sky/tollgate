@@ -19,7 +19,10 @@
 //!
 //! This in-memory implementation is the demo backend and the behavioural
 //! oracle; production runs the identical check-and-increment as a single Redis
-//! Lua script. A mandatory `global` budget is the backstop: a request that
+//! Lua script. A `global` budget is the recommended backstop, not an enforced
+//! one: nothing refuses to start without it, and its absence is only logged by
+//! the reload task. What IS enforced is that a request matching no budget at
+//! all is denied. A request that
 //! matches no budget is rejected, never allowed (no fail-open by omission).
 
 use std::collections::HashMap;
@@ -62,7 +65,7 @@ impl Period {
 /// What a budget applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
-    /// The whole deployment (mandatory backstop).
+    /// The whole deployment. The recommended backstop, not an enforced one.
     Global,
     /// One API key, by id.
     ApiKey(String),
@@ -263,7 +266,7 @@ impl Budgets {
     ///
     /// # Errors
     /// Returns [`BudgetDenied`] if a hard budget would be exceeded, or if no
-    /// budget applies at all (the mandatory-backstop rule).
+    /// budget applies at all: unbudgeted means refused, never allowed.
     pub fn try_reserve(
         &self,
         ctx: &RequestCtx<'_>,

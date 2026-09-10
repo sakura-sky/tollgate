@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Andrew Stevens
+#
+# Keeps a local `cargo audit` honest: without this file a developer running it
+# by hand sees a finding CI does not, concludes the gate is broken or the repo
+# is vulnerable, and learns to ignore it. A gate people learn to ignore is worse
+# than no gate.
+
+[advisories]
+# RUSTSEC-2023-0071, the rsa "Marvin" timing sidechannel. No fixed release
+# exists. Ignored because the code never compiles into the binary: `rsa` has
+# exactly one reverse dependency in Cargo.lock, `sqlx-mysql`, which is an
+# optional dependency of sqlx that no enabled feature turns on. The `mysql`
+# feature is off, and every other reference to it uses weak activation
+# (`sqlx-mysql?/...`), which cannot enable an optional dependency.
+#
+# This justification dies the moment anyone adds `mysql` to the sqlx feature
+# list in Cargo.toml. Re-verify by reading rsa's reverse dependencies out of
+# Cargo.lock; `cargo tree -i rsa` exits non-zero for a lockfile-only package and
+# looks like a broken command rather than an answer.
+ignore = ["RUSTSEC-2023-0071"]
+
+[output]
+# Match CI, which runs with --deny warnings. Unmaintained, unsound and yanked
+# findings are the early ones, worth acting on while moving off the crate is
+# still cheap.
+deny = ["warnings"]

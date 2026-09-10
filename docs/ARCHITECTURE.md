@@ -21,16 +21,17 @@ flowchart TB
   end
 
   subgraph state["State"]
-    pg[("Postgres<br/>keys · budgets · prices<br/>usage ledger (partitioned) · audit (unused)")]
+    pg[("Postgres<br/>keys · budgets · prices<br/>usage ledger (partitioned) · audit")]
     vk[("Valkey<br/>budget counters (hot path)")]
   end
 
   prov["Anthropic / Vertex / OpenAI-compatible upstream"]
 
-  app -->|"x-tollgate-key"| router --> core
+  app -->|"x-tollgate-key<br/>Bearer, or x-api-key"| router --> core
   ops --> console
   core -->|"verify key"| pg
   core <-->|"reserve / settle (atomic Lua)"| vk
+  pg -.->|"rebuild a counter Valkey lost"| vk
   core -->|"append usage"| pg
   core -->|"forward"| prov
   console -->|"read"| pg
@@ -56,25 +57,37 @@ sequenceDiagram
   T->>T: parse key, HMAC-SHA256 verify (constant time)
   Note over T: unknown provider/model -> 400 (fail closed)
   T->>T: price by token (integer micros)
+  Note over T: unpriced model -> record, then 400 (fail closed)
   opt admission = exact
     T->>P: pre-flight count_tokens
+    Note over T,P: a failed count is UPSTREAM (502), never a backend error;<br/>a 400/413/422 from it is the caller's body (400)
   end
   T->>V: reserve worst-case cost (atomic check + incr)
+  opt counter absent (flush, failover, eviction, new period)
+    V-->>T: refused: this counter has no history
+    T->>DB: sum this period's spend
+    T->>V: rebuild counter (stamped), retry once
+  end
   alt would exceed a hard cap
     T->>DB: record decision = rejected_budget
-    T-->>C: 402 Payment Required (never reaches provider)
+    T-->>C: 402 + x-tollgate-reason: budget_exceeded
   else within budget
     T->>P: forward request
     P-->>T: response + usage
     T->>V: settle reservation to actual cost
     T->>DB: append usage row (cost, tokens, overhead)
-    T-->>C: 200 + cost + x-tollgate-overhead-us
+    T-->>C: 200 (buffered: + x-tollgate-cost, x-tollgate-overhead-us)
   end
 ```
 
 Budgets that apply to a request are its API key, the provider, the model, and the
-mandatory global backstop; every applicable hard cap is checked before the
-forward. A request that matches no budget is denied, never allowed (fail closed).
+global backstop; every applicable hard cap is checked before the forward. A
+request that matches no budget at all is denied, never allowed (fail closed).
+That is the only thing enforcement requires: a deployment holding only a per-key
+budget serves normally, so the global budget is a strongly recommended backstop
+rather than a mandatory one. Its absence is logged at WARN by the config-reload
+task, which means it is never reported at all with
+`TOLLGATE_RELOAD__INTERVAL=0s`.
 
 ## Data model
 
@@ -120,8 +133,10 @@ erDiagram
 
 `usage_events` is append-only (triggers reject UPDATE, DELETE, and TRUNCATE) and
 monthly range-partitioned so retention can drop old partitions without violating
-immutability. `audit_log` exists with the same append-only triggers, but nothing
-in this release writes to it, so privileged CLI actions are not audited.
+immutability. `audit_log` carries the same append-only triggers and records privileged CLI
+actions: `key.issue`, `key.revoke`, `budget.set` and `price.set`. Its `principal`
+is the OS user and host the command ran as, which correlates a change with a
+shell history rather than authenticating anybody; see `SECURITY.md`.
 
 ## Money and enforcement invariants
 
