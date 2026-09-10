@@ -33,7 +33,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::apikey::KeyHasher;
 use crate::backends::{
-    PgKeyStore, PgUsageSink, RedisBudgetBackend, budget_spent, load_budgets, load_prices,
+    PgKeyStore, PgSpendLedger, PgUsageSink, RedisBudgetBackend, SpendLedger, budget_spent,
+    load_budgets, load_prices,
 };
 use crate::budget::{Budget, RequestCtx, Scope};
 use crate::config::Config;
@@ -84,6 +85,8 @@ struct CoreParts {
     providers: HashMap<String, Arc<dyn Provider>>,
     admission_exact: bool,
     redis: ConnectionManager,
+    /// So the budget backend can rebuild a counter Valkey has lost.
+    ledger: Arc<dyn SpendLedger>,
 }
 
 impl CoreParts {
@@ -92,7 +95,11 @@ impl CoreParts {
             hasher: self.hasher.clone(),
             dummy_hash: self.dummy_hash.clone(),
             keys: self.keys.clone(),
-            budgets: Arc::new(RedisBudgetBackend::new(self.redis.clone(), budgets)),
+            budgets: Arc::new(RedisBudgetBackend::new(
+                self.redis.clone(),
+                budgets,
+                self.ledger.clone(),
+            )),
             usage: self.usage.clone(),
             prices: Arc::new(prices),
             providers: self.providers.clone(),
@@ -155,6 +162,26 @@ pub async fn serve(cfg: Config) -> Result<()> {
     long_context
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
+    // A deployment-wide multiple against a threshold of zero re-rates nothing
+    // and, because the under-charge warning needs a threshold to test against,
+    // logs nothing either: the operator sees a 2x in their environment and gets
+    // neither the charge nor a signal that it is inert. Refused here rather than
+    // warned, matching `admin price set`, which refuses the same pair on a row.
+    //
+    // Deliberately NOT part of `validate()`. A per-model tier resolves to this
+    // same shape whenever a model is disabled with `--long-context-threshold 0`
+    // and inherits the deployment multiples, and that is a working
+    // configuration, not a mistake.
+    if long_context.has_stranded_uplift() {
+        anyhow::bail!(
+            "invalid billing config: TOLLGATE_BILLING__LONG_CONTEXT_MULTIPLE_PERMILLE or \
+             __LONG_CONTEXT_OUTPUT_MULTIPLE_PERMILLE is above 1000, but \
+             __LONG_CONTEXT_THRESHOLD_TOKENS is 0, so no request is ever re-rated and \
+             none is logged as a possible under-charge either. Set a threshold (e.g. \
+             200000), or leave both multiples at 1000 to keep the warning without the \
+             re-rating"
+        );
+    }
 
     let prices = load_prices(&db, cache_fallback, long_context)
         .await
@@ -337,6 +364,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         providers,
         admission_exact,
         redis: redis.clone(),
+        ledger: Arc::new(PgSpendLedger::new(db.clone())),
     };
 
     let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
@@ -405,10 +433,20 @@ fn spawn_reload_task(
                     continue;
                 }
             };
+            // A price book loads whole or not at all, and one unusable row keeps
+            // the PREVIOUS book rather than swapping in a partial one. Dropping
+            // just the bad model would make its requests unpriced, which the
+            // gateway refuses anyway, so the partial book buys nothing and costs
+            // every other model a silent change of price mid-flight. At boot the
+            // same failure is fatal: there is no previous book to keep.
             let prices = match load_prices(&db, cache_fallback, long_context).await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(error = %e, "config reload: prices query failed; keeping current");
+                    tracing::warn!(
+                        error = %e,
+                        "config reload: prices failed to load; keeping current. \
+                         Every model is still priced as it was before this cycle"
+                    );
                     continue;
                 }
             };
@@ -593,10 +631,45 @@ async fn anthropic_messages(
 }
 
 /// An Anthropic-shaped error, so SDK exception classes resolve correctly.
+///
+/// The BODY carries Anthropic's error vocabulary, because the SDK maps it to an
+/// exception class. The `x-tollgate-reason` HEADER carries Tollgate's, the same
+/// on every route, because that is what an operator alerts on. They are not the
+/// same word: a budget refusal is `permission_error` to the SDK and
+/// `budget_exceeded` to the operator.
 fn anthropic_error(status: StatusCode, kind: &str, message: &str) -> Response {
+    anthropic_error_reason(status, kind, default_reason_for(kind), message)
+}
+
+/// Tollgate's reason for an Anthropic error kind, where the two correspond.
+///
+/// Only for kinds used one way in this file. Two refusals do NOT correspond and
+/// must call [`anthropic_error_reason`] directly: an unpriced model is an
+/// `invalid_request_error` to the SDK but `unpriced` to an operator, and a
+/// backend failure is an `api_error` but `backend_error`. If you use one of
+/// these kinds for a new reason, do not reach for this function.
+fn default_reason_for(kind: &str) -> &'static str {
+    match kind {
+        "authentication_error" => "unauthenticated",
+        "permission_error" => "budget_exceeded",
+        "api_error" => "upstream_error",
+        "invalid_request_error" | "not_found_error" => "bad_request",
+        // Anything new. Listed above rather than left to fall through, so that
+        // adding a kind is a decision rather than an accident.
+        _ => "bad_request",
+    }
+}
+
+/// As [`anthropic_error`], with the operator-facing reason stated explicitly.
+fn anthropic_error_reason(
+    status: StatusCode,
+    kind: &str,
+    reason: &'static str,
+    message: &str,
+) -> Response {
     (
         status,
-        [("x-tollgate-reason", kind.to_owned())],
+        [("x-tollgate-reason", reason)],
         Json(json!({"type": "error", "error": {"type": kind, "message": message}})),
     )
         .into_response()
@@ -630,9 +703,10 @@ fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
         Outcome::BadRequest(m) => {
             anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
         }
-        Outcome::Unpriced { provider, model } => anthropic_error(
+        Outcome::Unpriced { provider, model } => anthropic_error_reason(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
+            "unpriced",
             &format!("no price configured for {provider}/{model}"),
         ),
         Outcome::BudgetDenied(d) => anthropic_error(
@@ -644,9 +718,10 @@ fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
                 format_micros(d.limit_micros)
             ),
         ),
-        Outcome::BackendError(_) => anthropic_error(
+        Outcome::BackendError(_) => anthropic_error_reason(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
+            "backend_error",
             "gateway backend unavailable",
         ),
         Outcome::Upstream(_) => {
@@ -698,9 +773,10 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
     let started = Instant::now();
     let core = state.core.load_full();
     let Some(provider) = state.anthropic.clone() else {
-        return anthropic_error(
+        return anthropic_error_reason(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
+            "backend_error",
             "anthropic upstream is not configured",
         );
     };
@@ -724,9 +800,10 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
     };
 
     let Some(price) = core.prices.lookup("anthropic", &parsed.model).cloned() else {
-        return anthropic_error(
+        return anthropic_error_reason(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
+            "unpriced",
             &format!("no price configured for anthropic/{}", parsed.model),
         );
     };
@@ -749,9 +826,10 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             Ok(n) => n,
             Err(e) => {
                 tracing::error!(error = %e.to_string(), "exact token count failed");
-                return anthropic_error(
+                return anthropic_error_reason(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
+                    "backend_error",
                     "gateway temporarily unavailable",
                 );
             }
@@ -787,9 +865,10 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             }
             Err(ReserveError::Backend(m)) => {
                 tracing::error!(error = %m, "budget backend error on stream reserve");
-                return anthropic_error(
+                return anthropic_error_reason(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
+                    "backend_error",
                     "gateway temporarily unavailable",
                 );
             }
@@ -1343,6 +1422,7 @@ fn stream_settlement(
                     provider = %price.provider,
                     model = %price.model,
                     prompt_tokens = usage.threshold_prompt_tokens(),
+                    classes_overlap = usage.classes_overlap,
                     "streamed prompt exceeds the long-context threshold and no tier is \
                      configured for this model; if it re-rates long requests, this is an \
                      UNDER-charge. Set it with `admin price set --long-context-threshold \
@@ -1625,6 +1705,96 @@ async fn shutdown_signal(grace: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `x-tollgate-reason` is what an operator alerts on, so it must mean the
+    /// same thing on every route. It did not: the Anthropic path emitted the
+    /// SDK's error kind, so a budget refusal on `/v1/messages` reported
+    /// `permission_error` while the same refusal on `/v1/chat/completions`
+    /// reported `budget_exceeded`. An alert keyed on the latter silently missed
+    /// every Claude refusal.
+    ///
+    /// The body keeps Anthropic's vocabulary, because the SDK maps it to an
+    /// exception class. Only the header is shared.
+    #[tokio::test]
+    async fn the_refusal_reason_header_is_the_same_word_on_every_route() {
+        use crate::budget::BudgetDenied;
+
+        let denied = || {
+            crate::gateway::Outcome::BudgetDenied(BudgetDenied {
+                scope: "api_key:x".to_owned(),
+                period: "monthly",
+                limit_micros: 1_000,
+                spent_micros: 1_000,
+                cost_micros: 1,
+            })
+        };
+        let unpriced = || crate::gateway::Outcome::Unpriced {
+            provider: "anthropic".to_owned(),
+            model: "m".to_owned(),
+        };
+        let reason = |r: &Response| {
+            r.headers()
+                .get("x-tollgate-reason")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<missing>")
+                .to_owned()
+        };
+
+        // Every refusal, on every one of the three response shapes: the native
+        // Anthropic envelope, the OpenAI envelope, and the legacy enveloped
+        // route. A route that sets the header on some refusals and not others is
+        // worse than one that never sets it, because the alert built on it looks
+        // like it covers the deployment.
+        /// One refusal: a label, the reason every route must report for it, and
+        /// a way to make a fresh `Outcome` (the response mappers consume it, so
+        /// each of the three routes needs its own).
+        type Case = (&'static str, &'static str, fn() -> crate::gateway::Outcome);
+
+        let cases: Vec<Case> = vec![
+            ("unauthenticated", "unauthenticated", || {
+                crate::gateway::Outcome::Unauthenticated
+            }),
+            ("bad request", "bad_request", || {
+                crate::gateway::Outcome::BadRequest("nope".to_owned())
+            }),
+            ("unpriced", "unpriced", unpriced),
+            ("budget", "budget_exceeded", denied),
+            ("backend", "backend_error", || {
+                crate::gateway::Outcome::BackendError("valkey down".to_owned())
+            }),
+            ("upstream", "upstream_error", || {
+                crate::gateway::Outcome::Upstream("502 from provider".to_owned())
+            }),
+        ];
+
+        for (label, want, make) in cases {
+            for (route, got) in [
+                ("/v1/messages", reason(&anthropic_outcome_response(make()))),
+                (
+                    "/v1/chat/completions",
+                    reason(&openai_outcome_response(make())),
+                ),
+                (
+                    "/v1/{provider}/{path}",
+                    reason(&crate::gateway::outcome_response(make())),
+                ),
+            ] {
+                assert_eq!(got, want, "{label} refusal on {route}");
+            }
+        }
+
+        // The BODY must not follow the header. An SDK resolves its exception
+        // class from `error.type`, so unifying that too would be a breaking
+        // change dressed up as consistency.
+        let body = axum::body::to_bytes(anthropic_outcome_response(denied()).into_body(), 65_536)
+            .await
+            .expect("body reads");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            v["error"]["type"], "permission_error",
+            "the Anthropic body must keep Anthropic's vocabulary"
+        );
+    }
 
     #[test]
     fn scan_sse_detects_usage_split_across_chunk_boundaries() {

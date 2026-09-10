@@ -79,6 +79,21 @@ pub struct ModelPrice {
     /// forget to apply it.
     #[serde(default)]
     pub long_context: LongContextTier,
+    /// True when this model's OWN row set an UPLIFT, meaning a multiple above
+    /// 1.0x, rather than inheriting one from the deployment default.
+    ///
+    /// Needed to tell apart tiers that resolve to the same shape but mean
+    /// opposite things. A model deliberately disabled with
+    /// `--long-context-threshold 0` inherits the deployment multiples and looks
+    /// exactly like a row whose own multiples have been stranded against a zero
+    /// threshold. Only the second is a misconfiguration, and warning about the
+    /// first on every reload, every fifteen seconds by default, would drown the
+    /// signal the warning exists to carry.
+    ///
+    /// "Uplift" rather than "set" because a row is allowed to write an explicit
+    /// 1.0x, which is a deliberate no-op and has nothing to strand.
+    #[serde(default)]
+    pub long_context_uplift_from_row: bool,
 }
 
 /// Token usage for a single request, normalised across providers by the
@@ -113,9 +128,13 @@ pub struct Usage {
     /// True only on an upstream whose cache convention is unverified, where the
     /// adapter deliberately bills the full prompt AND the cached count because
     /// it cannot know whether they are disjoint. The billing is right, but the
-    /// classes then sum to more than the provider's own prompt, so anything
-    /// asking "how big was this prompt" must not add them up. See
-    /// [`Usage::threshold_prompt_tokens`].
+    /// classes may then sum to more than the provider's own prompt.
+    ///
+    /// Nothing on the money path branches on this: sizing resolves upward on
+    /// every path, exactly as billing does, and an earlier version that sized
+    /// downward here is described in [`Usage::threshold_prompt_tokens`]. It is
+    /// kept, and serialised, because a persisted usage record otherwise cannot
+    /// say whether its prompt classes were a measurement or a double bill.
     #[serde(default)]
     pub classes_overlap: bool,
 }
@@ -178,26 +197,27 @@ impl Usage {
             .saturating_add(self.cache_write_tokens)
     }
 
-    /// How large the provider's own prompt was, for deciding whether it crossed
-    /// a size threshold.
+    /// How large the prompt was, for deciding whether it crossed a size
+    /// threshold.
     ///
-    /// Not the same as [`Self::total_prompt_tokens`], which is what we BILL. On
-    /// an unverified upstream the classes overlap by design, so the billed total
-    /// exceeds the real prompt: a 150k prompt with 100k cached bills as 250k.
-    /// Using the billed total to test a 200k threshold would re-rate a request
-    /// the provider itself never tiered, inventing a charge on top of an already
-    /// conservative one.
+    /// The same as [`Self::total_prompt_tokens`], and deliberately so even where
+    /// the classes overlap.
+    ///
+    /// The tempting alternative on an unverified upstream is to take the larger
+    /// class rather than the sum: a 150k prompt reporting 100k cached bills as
+    /// 250k, and testing a 200k threshold against that re-rates a request the
+    /// provider may never have tiered. But "unverified" means precisely that we
+    /// do not know whether the cached count sits INSIDE the prompt or beside it.
+    /// If it sits beside it, the real prompt IS the sum, and taking the larger
+    /// class under-sizes the request and skips a tier the provider applied: an
+    /// under-charge, on exactly the requests this feature exists to catch.
+    ///
+    /// So it resolves upward, the same way BILLING already resolves on that
+    /// path. An earlier version billed conservatively and sized optimistically,
+    /// which is the worst of both.
     #[must_use]
     pub fn threshold_prompt_tokens(&self) -> u64 {
-        if self.classes_overlap {
-            // The classes cover the same tokens, so the larger is the prompt.
-            self.input_tokens.max(
-                self.cache_read_tokens
-                    .saturating_add(self.cache_write_tokens),
-            )
-        } else {
-            self.total_prompt_tokens()
-        }
+        self.total_prompt_tokens()
     }
 
     /// Mark the prompt classes as overlapping rather than partitioning.
@@ -311,6 +331,63 @@ impl Default for LongContextTier {
 const TIER_RESERVE_GUARD_PERMILLE: u64 = 950;
 
 impl LongContextTier {
+    /// Resolve one model's stored columns against the deployment default, field
+    /// by field.
+    ///
+    /// Per-field rather than all-or-nothing so an operator can set just the
+    /// threshold for a model and inherit the multiples, or vice versa.
+    ///
+    /// The single definition of that rule. `admin price set` prints the tier a
+    /// re-price will produce, and it has to print what the LOADER will build,
+    /// not its own reading of the same columns: two copies of a resolution rule
+    /// drifting apart is how the long-context default came to be on in
+    /// production while every test said it was off.
+    ///
+    /// A stored multiple below 1.0x is clamped rather than honoured. The CLI
+    /// refuses one outright; this is the backstop for a row that reached the
+    /// database another way, and a long request must never cost less than a
+    /// short one.
+    #[must_use]
+    pub fn resolve_row(
+        threshold: Option<i64>,
+        input_permille: Option<i32>,
+        output_permille: Option<i32>,
+        fallback: Self,
+    ) -> Self {
+        Self {
+            threshold_tokens: threshold
+                .map_or(fallback.threshold_tokens, |v| u64::try_from(v).unwrap_or(0)),
+            multiple_permille: input_permille.map_or(fallback.multiple_permille, |v| {
+                u32::try_from(v).unwrap_or(1_000).max(1_000)
+            }),
+            output_multiple_permille: output_permille
+                .map_or(fallback.output_multiple_permille, |v| {
+                    u32::try_from(v).unwrap_or(1_000).max(1_000)
+                }),
+        }
+    }
+
+    /// Whether this tier asks for an uplift that no threshold will ever apply.
+    ///
+    /// Checked on the DEPLOYMENT default at boot, not on a resolved per-model
+    /// tier. A model deliberately disabled with `--long-context-threshold 0`
+    /// resolves to exactly this shape by inheriting the deployment multiples,
+    /// and refusing that would take the whole price book down for a
+    /// configuration that is working as intended.
+    ///
+    /// The deployment default has no such excuse. Nothing inherits into it, so
+    /// an uplift against a zero threshold there can only be a mistake, and it is
+    /// a mistake in the under-charging direction: no request is re-rated, and
+    /// because `is_unpriced_long_context` needs a threshold to test against, no
+    /// request is even logged as a possible under-charge. The operator would see
+    /// a multiple in their environment and no signal anywhere that it does
+    /// nothing. `admin price set` already refuses the same pair on a row.
+    #[must_use]
+    pub fn has_stranded_uplift(&self) -> bool {
+        self.threshold_tokens == 0
+            && (self.multiple_permille > 1_000 || self.output_multiple_permille > 1_000)
+    }
+
     /// Whether this tier does anything at all.
     #[must_use]
     fn configured(&self) -> bool {
@@ -488,14 +565,6 @@ impl CacheRateFallback {
     }
 }
 
-/// Divide a micros-scaled numerator (`Σ tokens × price_per_1M`) by one million,
-/// rounding half-up to the nearest micro.
-///
-/// The `i128` intermediate cannot overflow for any `u64` token count times `i64`
-/// price. As a last resort the result saturates into `i64` rather than wrapping,
-/// but callers MUST reject implausible token counts upstream (see the metering
-/// layer) so saturation never actually occurs on the money path.
-#[must_use]
 /// Divide a numerator of `Σ tokens × price_per_1M × permille` by one million and
 /// a further thousand, rounding half-up to the nearest micro.
 ///
@@ -505,6 +574,13 @@ impl CacheRateFallback {
 /// differs from a single rounding by up to a micro, and truncation runs in the
 /// cheap direction. A tier that does not apply passes a multiple of 1000, so
 /// the arithmetic is identical for an ordinary request.
+///
+/// The `i128` intermediate cannot overflow for any `u64` token count times `i64`
+/// price times a multiple in range. As a last resort the result saturates into
+/// `i64` rather than wrapping, but callers MUST reject implausible token counts
+/// upstream (see the metering layer) so saturation never occurs on the money
+/// path.
+#[must_use]
 fn round_scaled_to_micros(numerator: i128) -> i64 {
     const SCALE: i128 = TOKENS_PER_MILLION * 1_000;
     let rounded = numerator.saturating_add(SCALE / 2) / SCALE;
@@ -535,6 +611,7 @@ impl ModelPrice {
             cache_write_per_1m_micros: CacheRateFallback::apply(input, fb.write_permille),
             cache_rates_are_fallback: true,
             long_context: LongContextTier::default(),
+            long_context_uplift_from_row: false,
         }
     }
 
@@ -573,23 +650,16 @@ impl ModelPrice {
     /// threshold for a model and inherit the multiples, or vice versa.
     #[must_use]
     pub fn with_long_context_row(
-        self,
+        mut self,
         threshold: Option<i64>,
         input_permille: Option<i32>,
         output_permille: Option<i32>,
         fallback: LongContextTier,
     ) -> Self {
-        let tier = LongContextTier {
-            threshold_tokens: threshold
-                .map_or(fallback.threshold_tokens, |v| u64::try_from(v).unwrap_or(0)),
-            multiple_permille: input_permille.map_or(fallback.multiple_permille, |v| {
-                u32::try_from(v).unwrap_or(1_000).max(1_000)
-            }),
-            output_multiple_permille: output_permille
-                .map_or(fallback.output_multiple_permille, |v| {
-                    u32::try_from(v).unwrap_or(1_000).max(1_000)
-                }),
-        };
+        self.long_context_uplift_from_row =
+            input_permille.is_some_and(|v| v > 1_000) || output_permille.is_some_and(|v| v > 1_000);
+        let tier =
+            LongContextTier::resolve_row(threshold, input_permille, output_permille, fallback);
         self.with_long_context(tier)
     }
 
@@ -684,8 +754,28 @@ impl ModelPrice {
         // this sees the COUNTED prompt while settlement sees the REPORTED one,
         // and a request that straddles the line would otherwise flip a 1x
         // reservation into a 2x settlement.
+        //
+        // The size tested must match the size SETTLEMENT will test. On an
+        // upstream whose cache convention is unverified the adapter bills the
+        // prompt on two legs, so `Usage::threshold_prompt_tokens` resolves
+        // upward to the sum, which is up to twice the counted prompt. Testing
+        // the counted prompt here against a five percent guard band cannot cover
+        // a factor-of-two sizing gap: a 150k prompt reporting 100k cached sizes
+        // as 250k at settle, crosses a 200k threshold the reservation never saw,
+        // and settles at the full multiple against a 1x reservation.
+        //
+        // So size the same way the RATE already does: `reserve_prompt_rate`
+        // charges the sum of both legs under this profile, and the sizing
+        // assumes the same worst case. It over-reserves an unverified upstream
+        // between half the threshold and the threshold, which is released at
+        // settle.
         let tier = self.long_context;
-        let (prompt_m, output_m) = if tier.reserve_applies_to(prompt_tokens) {
+        let reserve_size = if profile.may_double_bill_prompt {
+            prompt_tokens.saturating_mul(2)
+        } else {
+            prompt_tokens
+        };
+        let (prompt_m, output_m) = if tier.reserve_applies_to(reserve_size) {
             (
                 i128::from(tier.multiple_permille),
                 i128::from(tier.output_multiple_permille),
@@ -693,10 +783,17 @@ impl ModelPrice {
         } else {
             (1_000, 1_000)
         };
-        let prompt =
-            i128::from(prompt_tokens) * i128::from(self.reserve_prompt_rate(profile)) * prompt_m;
-        let output =
-            i128::from(max_output_tokens) * i128::from(self.output_per_1m_micros) * output_m;
+        // saturating_mul, matching the cost path. The per-mille factor is what
+        // makes overflow reachable here at all: tokens times rate cannot exceed
+        // i128 on its own, but tokens times rate times a multiple of up to 10x
+        // can. A wrapped negative would floor to a 1-micro reservation, which is
+        // the cheap direction.
+        let prompt = i128::from(prompt_tokens)
+            .saturating_mul(i128::from(self.reserve_prompt_rate(profile)))
+            .saturating_mul(prompt_m);
+        let output = i128::from(max_output_tokens)
+            .saturating_mul(i128::from(self.output_per_1m_micros))
+            .saturating_mul(output_m);
         round_scaled_to_micros(prompt.saturating_add(output))
     }
 }
@@ -969,21 +1066,137 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_prompt_classes_do_not_inflate_the_threshold() {
-        // On an unverified upstream the prompt is billed on BOTH legs, so the
-        // classes overlap: a 150k prompt with 100k cached BILLS as 250k. Testing
-        // a 200k threshold against the billed total would re-rate a request the
-        // provider itself never tiered, inventing a charge on top of an already
-        // conservative one.
+    fn a_double_billed_prompt_is_sized_for_the_tier_it_will_settle_at() {
+        // Where the prompt bills on two legs, it also SIZES as two legs: the
+        // settlement resolves the threshold against the sum of the classes, so a
+        // counted prompt at 60% of the threshold can settle at 120% of it. Five
+        // percent of guard band cannot cover a factor of two, so the reservation
+        // has to assume the same worst case the rate already assumes.
+        let p = ModelPrice::new("openai", "m", 1_000_000, 5_000_000)
+            .with_long_context(tier(200_000, 2_000, 1_500));
+
+        let doubled = p.reserve_micros(120_000, 1_000, profile(false, true));
+        let disjoint = p.reserve_micros(120_000, 1_000, profile(false, false));
+
+        // The disjoint profile is nowhere near the band at 120k and reserves 1x.
+        assert_eq!(disjoint, 120_000 + 5_000);
+        // The double-billing profile sizes at 240k, over the threshold, so both
+        // legs carry their multiple. The rate is doubled by the profile too.
+        assert_eq!(doubled, 120_000 * 2 * 2 + 5_000 * 3 / 2);
+        // And that reservation covers the settlement it was sized for.
+        let settled = p.cost_micros(Usage::with_cache(120_000, 1_000, 120_000, 0));
+        assert!(
+            settled <= doubled,
+            "settle {settled} exceeded reserve {doubled}"
+        );
+    }
+
+    #[test]
+    fn per_model_tier_falls_back_field_by_field() {
+        let deployment = tier(200_000, 2_000, 1_500);
+        let base = || ModelPrice::new("p", "m", 1_000_000, 1_000_000);
+
+        // Nothing set on the row: inherit the deployment tier whole.
+        let inherited = base().with_long_context_row(None, None, None, deployment);
+        assert_eq!(inherited.long_context, deployment);
+
+        // Per FIELD, not all-or-nothing, so a model can take just the threshold
+        // and inherit the multiples, or the reverse.
+        let partial = base().with_long_context_row(Some(500_000), None, None, deployment);
+        assert_eq!(partial.long_context.threshold_tokens, 500_000);
+        assert_eq!(partial.long_context.multiple_permille, 2_000);
+        assert_eq!(partial.long_context.output_multiple_permille, 1_500);
+
+        let only_output = base().with_long_context_row(None, None, Some(1_250), deployment);
+        assert_eq!(only_output.long_context.threshold_tokens, 200_000);
+        assert_eq!(only_output.long_context.output_multiple_permille, 1_250);
+
+        // An explicit zero threshold on the row disables tiering for THIS model
+        // while other models keep the deployment default, which is the whole
+        // reason the columns exist.
+        let disabled = base().with_long_context_row(Some(0), None, None, deployment);
+        assert!(!disabled.long_context.applies_to(10_000_000));
+        assert_eq!(disabled.cost_micros(Usage::new(1_000_000, 0)), 1_000_000);
+
+        // A negative or nonsense stored value floors rather than wrapping into a
+        // huge multiple.
+        let bad = base().with_long_context_row(Some(-1), Some(-5), Some(-5), deployment);
+        assert_eq!(bad.long_context.threshold_tokens, 0);
+        assert_eq!(bad.long_context.multiple_permille, 1_000);
+
+        // Inherited multiples must be distinguishable from row-set ones, or a
+        // model deliberately disabled with `--long-context-threshold 0` looks
+        // identical to a misconfiguration and gets warned about on every reload.
+        assert!(!disabled.long_context_uplift_from_row, "inherited");
+        let explicit = base().with_long_context_row(Some(0), Some(2_000), None, deployment);
+        assert!(explicit.long_context_uplift_from_row, "set on the row");
+
+        // An explicit 1.0x is a deliberate no-op, not a stranded uplift: there
+        // is nothing for the inert-tier warning to be about. Without this, a
+        // disable written as `--long-context-threshold 0
+        // --long-context-input-permille 1000` would warn every reload about an
+        // output multiple that came from the DEPLOYMENT, not the row.
+        let no_op = base().with_long_context_row(Some(0), Some(1_000), None, deployment);
+        assert!(!no_op.long_context_uplift_from_row, "1.0x strands nothing");
+    }
+
+    #[test]
+    fn a_deployment_uplift_with_no_threshold_is_stranded() {
+        // Refused at boot. It re-rates nothing, and because the under-charge
+        // warning needs a threshold to test against it logs nothing either, so
+        // the operator sees a 2x configured and gets no signal at all.
+        assert!(tier(0, 2_000, 1_000).has_stranded_uplift());
+        assert!(tier(0, 1_000, 1_500).has_stranded_uplift());
+
+        // A threshold with no uplift is the documented opt-in posture: warn
+        // about long requests, do not re-rate them.
+        assert!(!tier(200_000, 1_000, 1_000).has_stranded_uplift());
+        // Nothing configured at all is fine.
+        assert!(!tier(0, 1_000, 1_000).has_stranded_uplift());
+        // A working tier is obviously fine.
+        assert!(!tier(200_000, 2_000, 1_500).has_stranded_uplift());
+
+        // The same shape on a RESOLVED per-model tier is a model deliberately
+        // disabled, inheriting the deployment multiples. It must not be refused,
+        // which is why this check is not part of `validate()`.
+        let deployment = tier(200_000, 2_000, 1_500);
+        let disabled = ModelPrice::new("p", "m", 1_000_000, 1_000_000).with_long_context_row(
+            Some(0),
+            None,
+            None,
+            deployment,
+        );
+        assert!(disabled.long_context.has_stranded_uplift());
+        assert!(disabled.long_context.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unverified_upstream_sizes_its_prompt_upward() {
+        // On an unverified upstream the prompt is billed on BOTH legs, because
+        // we do not know whether the cached count sits inside the prompt or
+        // beside it. The threshold must resolve the same way, upward.
+        //
+        // Taking the larger class instead would under-size a genuinely disjoint
+        // report (150k fresh + 100k cached IS a 250k prompt) and skip a tier the
+        // provider applied: an under-charge on exactly the requests this feature
+        // exists to catch. An earlier version billed conservatively and sized
+        // optimistically, which is the worst of both.
         let overlapping = Usage::with_cache(150_000, 100, 100_000, 0).with_overlapping_classes();
-        assert_eq!(overlapping.total_prompt_tokens(), 250_000, "billed as");
-        assert_eq!(overlapping.threshold_prompt_tokens(), 150_000, "sized as");
+        assert_eq!(overlapping.total_prompt_tokens(), 250_000);
+        assert_eq!(
+            overlapping.threshold_prompt_tokens(),
+            250_000,
+            "sizing must not be more optimistic than billing"
+        );
 
         let p = ModelPrice::new("openai", "m", 1_000_000, 1_000_000)
             .with_long_context(tier(200_000, 2_000, 2_000));
-        // Disjoint classes summing to the same 250k DO cross the threshold.
         let disjoint = Usage::with_cache(150_000, 100, 100_000, 0);
-        assert!(p.cost_micros(disjoint) > p.cost_micros(overlapping));
+        assert_eq!(
+            p.cost_micros(disjoint),
+            p.cost_micros(overlapping),
+            "the overlap flag must not change what a request costs"
+        );
     }
 
     #[test]

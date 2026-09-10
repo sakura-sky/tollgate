@@ -5,7 +5,8 @@
 //!
 //! Configuration is layered: defaults → optional `tollgate.toml` file →
 //! environment variables prefixed with `TOLLGATE_`. Nested fields use double
-//! underscores, e.g. `TOLLGATE_HTTP__PORT=8080`.
+//! underscores, e.g. `TOLLGATE_HTTP__BIND=0.0.0.0:8080`. A variable that matches
+//! no field is ignored silently, so a typo is a setting that never applies.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

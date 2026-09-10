@@ -154,12 +154,14 @@ async fn gateway(
             state.unauthenticated.fetch_add(1, Ordering::Relaxed);
             (
                 StatusCode::UNAUTHORIZED,
+                [("x-tollgate-reason", "unauthenticated")],
                 Json(json!({"error": "invalid or missing API key", "header": KEY_HEADER})),
             )
                 .into_response()
         }
         Outcome::BadRequest(m) => (
             StatusCode::BAD_REQUEST,
+            [("x-tollgate-reason", "bad_request")],
             Json(json!({"error": format!("invalid request body: {m}")})),
         )
             .into_response(),
@@ -188,6 +190,7 @@ async fn gateway(
             .into_response(),
         Outcome::BackendError(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
+            [("x-tollgate-reason", "backend_error")],
             Json(json!({"error": "gateway temporarily unavailable"})),
         )
             .into_response(),
@@ -195,6 +198,7 @@ async fn gateway(
             tracing::warn!(detail = %m, "upstream provider error");
             (
                 StatusCode::BAD_GATEWAY,
+                [("x-tollgate-reason", "upstream_error")],
                 Json(json!({"error": "upstream provider error"})),
             )
                 .into_response()

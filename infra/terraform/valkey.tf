@@ -39,13 +39,28 @@ resource "google_memorystore_instance" "cache" {
   }
 
   # Append-only persistence so budget counters survive a node restart. The
-  # ledger in Postgres is still the system of record (reconciled on boot), but
-  # AOF avoids a cold cache and a reconcile storm on every restart.
+  # ledger in Postgres is still the system of record, and the gateway rebuilds
+  # any counter it finds missing, but AOF avoids paying for that rebuild on
+  # every restart.
   persistence_config {
     mode = "AOF"
     aof_config {
       append_fsync = "EVERY_SEC"
     }
+  }
+
+  # Budget counters carry a 40-day expiry, which makes every one of them an
+  # eviction candidate under any volatile-* policy. Evicting one is not a cache
+  # miss: it is a budget losing its record of the period. The gateway now
+  # detects that and rebuilds the counter from the ledger, so the failure mode
+  # is a Postgres query per affected budget rather than silent overspend, but
+  # under memory pressure that can mean a query per budget per request.
+  #
+  # noeviction turns that into a write error the operator can see and alert on,
+  # instead of a quiet tax on the hot path. Do not share this instance with a
+  # workload that wants LRU behaviour.
+  engine_configs = {
+    "maxmemory-policy" = "noeviction"
   }
 
   # Unlike Cloud SQL (deletion_protection = true), the cache carries no durable

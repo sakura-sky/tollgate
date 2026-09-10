@@ -86,8 +86,15 @@ pub enum BudgetCommand {
         /// Spend ceiling in the deployment's currency (e.g. dollars).
         #[arg(long)]
         limit: f64,
-        /// If false, breach only notifies (soft cap) rather than rejecting.
-        #[arg(long, default_value_t = true)]
+        /// `--hard-stop false` makes this a soft cap: spend is still counted
+        /// against it and a breach is logged at WARN, but no request is
+        /// refused. Defaults to true.
+        ///
+        /// Takes a value rather than being a bare flag. A bare `bool` here is a
+        /// presence flag, so `--hard-stop false` was an error and absence gave
+        /// true: soft caps existed in the schema and in the enforcement code and
+        /// could not be created.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         hard_stop: bool,
     },
 }
@@ -121,7 +128,9 @@ pub enum PriceCommand {
         #[arg(long, conflicts_with = "cache_write_per_1m")]
         clear_cache_write: bool,
         /// Prompt tokens above which THIS model re-rates the whole request.
-        /// Omit to carry forward; 0 disables tiering for this model.
+        /// Omit to carry forward. 0 disables tiering for this model and drops
+        /// any multiples it carried; use --clear-long-context instead to send it
+        /// back to the deployment default.
         #[arg(long)]
         long_context_threshold: Option<u64>,
         /// Multiple applied to prompt rates above the threshold, per-mille
@@ -155,6 +164,103 @@ enum RateChange {
     Carry,
     Set(i64),
     Clear,
+}
+
+/// The long-context flags as given on one `admin price set`.
+#[derive(Clone, Copy)]
+struct LongContextFlags {
+    threshold: Option<u64>,
+    input_permille: Option<u32>,
+    output_permille: Option<u32>,
+    clear: bool,
+}
+
+/// Decide what long-context columns a re-price writes, given the flags and what
+/// the superseded row held.
+///
+/// Values carry forward unless explicitly set or cleared, for the same reason
+/// the cache rates do: the common operation is bumping a base rate, and silently
+/// dropping a model's tier there would under-charge every long request on it.
+///
+/// An explicit threshold of 0 is the documented per-model disable, and drops any
+/// CARRIED multiples with it. Without that, a model that had ever been given a
+/// multiple could not be disabled at all: the carried multiple would resolve
+/// against the zero threshold and be refused as inert, and
+/// `--clear-long-context` conflicts with the threshold flag, so no single
+/// command is left. Multiples passed EXPLICITLY alongside a zero threshold are
+/// still refused downstream, because that pair is a contradiction rather than a
+/// leftover.
+///
+/// Extracted from the write path so it can be tested without a database.
+fn carry_long_context(
+    flags: LongContextFlags,
+    carried: (Option<i64>, Option<i32>, Option<i32>),
+) -> (Option<i64>, Option<i32>, Option<i32>) {
+    if flags.clear {
+        return (None, None, None);
+    }
+    let (carried_threshold, carried_in, carried_out) = carried;
+    let disabling = flags.threshold == Some(0);
+    (
+        flags
+            .threshold
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .or(carried_threshold),
+        flags
+            .input_permille
+            .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
+            .or(if disabling { None } else { carried_in }),
+        flags
+            .output_permille
+            .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
+            .or(if disabling { None } else { carried_out }),
+    )
+}
+
+/// Check that a long-context tier about to be written will actually do
+/// something, and is in range. Returns the tier that will result.
+///
+/// Extracted from the write path so it can be tested: the branching lives in a
+/// function that needs a database otherwise, which is how the first version of
+/// this check shipped with the wrong resolution rule and nothing to catch it.
+///
+/// The threshold resolves the SAME way the price loader resolves it: this
+/// model's column if set, else the deployment default. Treating an absent column
+/// as zero refuses a perfectly good configuration, since inheriting the
+/// deployment threshold is exactly what the per-field fallback is for.
+///
+/// # Errors
+/// Refuses multiples that no threshold will ever apply to (they would do nothing
+/// AND suppress the under-charge warning, so a long request bills flat with no
+/// signal at all), and any value out of range.
+fn resolve_long_context_intent(
+    threshold: Option<i64>,
+    input_permille: Option<i32>,
+    output_permille: Option<i32>,
+    deployment_threshold: u64,
+) -> Result<crate::pricing::LongContextTier> {
+    let effective_threshold =
+        threshold.map_or(deployment_threshold, |v| u64::try_from(v).unwrap_or(0));
+    let sets_multiple =
+        input_permille.is_some_and(|v| v > 1_000) || output_permille.is_some_and(|v| v > 1_000);
+    if sets_multiple && effective_threshold == 0 {
+        bail!(
+            "long-context multiples were given but no threshold applies to this model: \
+             neither --long-context-threshold nor the deployment default \
+             (TOLLGATE_BILLING__LONG_CONTEXT_THRESHOLD_TOKENS) is set. They would do \
+             nothing AND suppress the under-charge warning, so a long request would \
+             bill flat with no signal. Pass --long-context-threshold (e.g. 200000)."
+        );
+    }
+    let tier = crate::pricing::LongContextTier {
+        threshold_tokens: effective_threshold,
+        multiple_permille: u32::try_from(input_permille.unwrap_or(1_000)).unwrap_or(1_000),
+        output_multiple_permille: u32::try_from(output_permille.unwrap_or(1_000)).unwrap_or(1_000),
+    };
+    // Checked here so an out-of-range value is a clear message rather than a raw
+    // constraint violation from Postgres.
+    tier.validate().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(tier)
 }
 
 impl RateChange {
@@ -437,24 +543,15 @@ async fn admin_price_set(
     });
     let cache_read = RateChange::resolve(cache_read_per_1m, clear_cache_read, carried_read)?;
     let cache_write = RateChange::resolve(cache_write_per_1m, clear_cache_write, carried_write)?;
-    // Carried forward unless explicitly set or cleared, for the same reason the
-    // cache rates are: the common operation is bumping a base rate, and silently
-    // dropping a model's tier there would under-charge every long request on it.
-    let (lc_threshold, lc_input, lc_output) = if clear_long_context {
-        (None, None, None)
-    } else {
-        (
-            long_context_threshold
-                .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
-                .or(carried_thr),
-            long_context_input_permille
-                .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
-                .or(carried_in),
-            long_context_output_permille
-                .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
-                .or(carried_out),
-        )
-    };
+    let (lc_threshold, lc_input, lc_output) = carry_long_context(
+        LongContextFlags {
+            threshold: long_context_threshold,
+            input_permille: long_context_input_permille,
+            output_permille: long_context_output_permille,
+            clear: clear_long_context,
+        },
+        (carried_thr, carried_in, carried_out),
+    );
     // Refuse a tier that would be inert. Multiples against a zero or absent
     // threshold do nothing AND suppress the under-charge warning, so a long
     // request bills flat with no signal, which is the one direction this proxy
@@ -465,28 +562,12 @@ async fn admin_price_set(
     // as zero here would refuse a perfectly good configuration, because
     // inheriting the deployment threshold is exactly what the per-field fallback
     // is for.
-    let deployment_threshold = cfg.billing.long_context_tier().threshold_tokens;
-    let effective_threshold =
-        lc_threshold.map_or(deployment_threshold, |v| u64::try_from(v).unwrap_or(0));
-    let sets_multiple = lc_input.is_some_and(|v| v > 1_000) || lc_output.is_some_and(|v| v > 1_000);
-    if sets_multiple && effective_threshold == 0 {
-        bail!(
-            "long-context multiples were given but no threshold applies to this model: \
-             neither --long-context-threshold nor the deployment default \
-             (TOLLGATE_BILLING__LONG_CONTEXT_THRESHOLD_TOKENS) is set. They would do \
-             nothing AND suppress the under-charge warning, so a long request would \
-             bill flat with no signal. Pass --long-context-threshold (e.g. 200000)."
-        );
-    }
-    // Validate the pair before the INSERT, so an out-of-range value is a clear
-    // message rather than a raw constraint violation.
-    crate::pricing::LongContextTier {
-        threshold_tokens: effective_threshold,
-        multiple_permille: u32::try_from(lc_input.unwrap_or(1_000)).unwrap_or(1_000),
-        output_multiple_permille: u32::try_from(lc_output.unwrap_or(1_000)).unwrap_or(1_000),
-    }
-    .validate()
-    .map_err(|e| anyhow::anyhow!(e))?;
+    resolve_long_context_intent(
+        lc_threshold,
+        lc_input,
+        lc_output,
+        cfg.billing.long_context_tier().threshold_tokens,
+    )?;
     sqlx::query(
         "INSERT INTO model_prices \
          (provider, model, input_per_1m_micros, output_per_1m_micros, \
@@ -527,5 +608,182 @@ async fn admin_price_set(
              input rate, which OVER-charges cache reads (often by around 10x)."
         );
     }
+    // Print the tier this model will actually run with, resolved the way the
+    // price loader resolves it. The columns alone do not say: a NULL inherits
+    // the deployment default, and an explicit threshold of 0 drops multiples the
+    // row was carrying. An operator who cannot see the result of a re-price
+    // cannot tell a tier that applies from one that silently does nothing, which
+    // is the failure this whole feature exists to make visible.
+    let deployment = cfg.billing.long_context_tier();
+    let resolved =
+        crate::pricing::LongContextTier::resolve_row(lc_threshold, lc_input, lc_output, deployment);
+    // Marked per FIELD, because they resolve per field: setting only the input
+    // multiple leaves the output one inherited, and a single marker covering
+    // both would say the inherited one came from this row.
+    let from = |set: bool| if set { "" } else { "*" };
+    if resolved.threshold_tokens == 0 {
+        println!("  long context  no tier: this model is never re-rated for length");
+    } else if resolved.multiple_permille > 1_000 || resolved.output_multiple_permille > 1_000 {
+        println!(
+            "  long context  above {}{} prompt tokens: input x{}{}, output x{}{}",
+            resolved.threshold_tokens,
+            from(lc_threshold.is_some()),
+            format_permille(resolved.multiple_permille),
+            from(lc_input.is_some()),
+            format_permille(resolved.output_multiple_permille),
+            from(lc_output.is_some()),
+        );
+    } else {
+        println!(
+            "  long context  above {}{} prompt tokens: NOT re-rated (both multiples \
+             are 1.0x), and a prompt that large is logged as a possible under-charge",
+            resolved.threshold_tokens,
+            from(lc_threshold.is_some()),
+        );
+    }
+    // This command resolves against ITS OWN environment. Run somewhere the
+    // gateway's TOLLGATE_BILLING__* settings are not set and every inherited
+    // field above is a guess about a different process, so say which values were
+    // used rather than letting the line read as a promise.
+    if lc_threshold.is_none() || lc_input.is_none() || lc_output.is_none() {
+        println!(
+            "                * inherited from this shell's deployment default \
+             (threshold {}, input x{}, output x{}); it must match the environment \
+             `tollgate serve` runs with",
+            deployment.threshold_tokens,
+            format_permille(deployment.multiple_permille),
+            format_permille(deployment.output_multiple_permille),
+        );
+    }
     Ok(())
+}
+
+/// Render a per-mille multiple as a decimal, for display only.
+fn format_permille(permille: u32) -> String {
+    let whole = permille / 1_000;
+    let frac = permille % 1_000;
+    if frac == 0 {
+        format!("{whole}")
+    } else {
+        format!("{whole}.{frac:03}")
+            .trim_end_matches('0')
+            .to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The combinations that decide whether a tier is written, is inert, or is
+    /// refused. Walked explicitly because the first version of this check used
+    /// the wrong resolution rule and there was nothing to catch it: the logic
+    /// sat inside a function that needs a database.
+    #[test]
+    fn long_context_intent_resolves_the_threshold_like_the_loader_does() {
+        // Multiples set explicitly alongside a threshold: allowed.
+        let t = resolve_long_context_intent(Some(200_000), Some(2_000), Some(1_500), 0).unwrap();
+        assert_eq!(t.threshold_tokens, 200_000);
+        assert_eq!(t.multiple_permille, 2_000);
+        assert_eq!(t.output_multiple_permille, 1_500);
+
+        // Multiples with NO row threshold, but the deployment has one: allowed,
+        // inheriting it. Treating an absent column as zero here would refuse a
+        // configuration that works, which is what an earlier version did.
+        let t = resolve_long_context_intent(None, Some(2_000), None, 200_000).unwrap();
+        assert_eq!(t.threshold_tokens, 200_000);
+
+        // Multiples with no threshold anywhere: REFUSED. They would do nothing
+        // and would also suppress the under-charge warning, so a long request
+        // bills flat with no signal at all.
+        assert!(resolve_long_context_intent(None, Some(2_000), None, 0).is_err());
+
+        // An explicit zero threshold beats a deployment default, and refuses.
+        assert!(resolve_long_context_intent(Some(0), Some(2_000), None, 200_000).is_err());
+
+        // No multiples at all is always fine: that is just a normal re-price.
+        assert!(resolve_long_context_intent(None, None, None, 0).is_ok());
+        assert!(resolve_long_context_intent(Some(0), None, None, 0).is_ok());
+
+        // A no-op multiple is not "setting" one, so it is not refused.
+        assert!(resolve_long_context_intent(None, Some(1_000), Some(1_000), 0).is_ok());
+    }
+
+    #[test]
+    fn long_context_intent_rejects_out_of_range_multiples() {
+        // Caught here rather than as a raw Postgres constraint violation.
+        assert!(resolve_long_context_intent(Some(200_000), Some(500), None, 0).is_err());
+        assert!(resolve_long_context_intent(Some(200_000), Some(2_000_000), None, 0).is_err());
+        assert!(resolve_long_context_intent(Some(200_000), None, Some(500), 0).is_err());
+        assert!(resolve_long_context_intent(Some(200_000), None, Some(2_000_000), 0).is_err());
+    }
+
+    #[test]
+    fn permille_renders_as_the_multiple_an_operator_typed() {
+        assert_eq!(format_permille(1_000), "1");
+        assert_eq!(format_permille(1_500), "1.5");
+        assert_eq!(format_permille(2_000), "2");
+        assert_eq!(format_permille(1_250), "1.25");
+        assert_eq!(format_permille(1_001), "1.001");
+    }
+
+    fn flags(
+        threshold: Option<u64>,
+        input_permille: Option<u32>,
+        output_permille: Option<u32>,
+        clear: bool,
+    ) -> LongContextFlags {
+        LongContextFlags {
+            threshold,
+            input_permille,
+            output_permille,
+            clear,
+        }
+    }
+
+    #[test]
+    fn disabling_one_model_drops_the_multiples_it_carried() {
+        // The per-model disable the docs promise:
+        //   admin price set --long-context-threshold 0
+        // on a model that already carries multiples. Those multiples cannot
+        // apply to a zero threshold, so carrying them forward would produce a
+        // combination the inertness check refuses, and since
+        // --clear-long-context conflicts with the threshold flag there would be
+        // no single command that disables the model at all.
+        let carried = (Some(200_000_i64), Some(2_000_i32), Some(1_500_i32));
+        let (thr, inp, out) = carry_long_context(flags(Some(0), None, None, false), carried);
+        assert_eq!(thr, Some(0), "the explicit zero is written, not inherited");
+        assert_eq!(inp, None);
+        assert_eq!(out, None);
+        // And the result is one the write path accepts.
+        let tier = resolve_long_context_intent(thr, inp, out, 200_000).unwrap();
+        assert_eq!(tier.threshold_tokens, 0);
+        assert!(!tier.applies_to(u64::MAX), "nothing re-rates on this model");
+    }
+
+    #[test]
+    fn a_normal_reprice_still_carries_the_tier() {
+        // Only an explicit zero drops the multiples. A plain rate bump, or a
+        // threshold change, keeps them: dropping a tier silently there would
+        // under-charge every long request on the model.
+        let carried = (Some(200_000_i64), Some(2_000_i32), Some(1_500_i32));
+        assert_eq!(
+            carry_long_context(flags(None, None, None, false), carried),
+            carried
+        );
+        assert_eq!(
+            carry_long_context(flags(Some(400_000), None, None, false), carried),
+            (Some(400_000), Some(2_000), Some(1_500))
+        );
+        // An explicit multiple alongside the zero threshold is a contradiction,
+        // not a leftover, so it survives to be refused downstream.
+        let (thr, inp, _) = carry_long_context(flags(Some(0), Some(2_000), None, false), carried);
+        assert_eq!((thr, inp), (Some(0), Some(2_000)));
+        assert!(resolve_long_context_intent(thr, inp, None, 200_000).is_err());
+        // --clear-long-context still wipes the row and inherits the deployment.
+        assert_eq!(
+            carry_long_context(flags(None, None, None, true), carried),
+            (None, None, None)
+        );
+    }
 }

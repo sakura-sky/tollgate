@@ -28,7 +28,23 @@ Out of scope:
 - Issues that require physical access to a deployed instance.
 - Bugs in upstream dependencies (`axum`, `sqlx`, `tokio`, etc.) - please report those to the relevant project. We're happy to coordinate if a vendored fix is needed in the meantime.
 - Findings in the operator's own GCP configuration that are outside what the Terraform module installs.
-- Denial-of-service via resource exhaustion in unconfigured deployments where token budgets / rate limits have not been set.
+- Denial-of-service via resource exhaustion in unconfigured deployments where token budgets have not been set. Note that Tollgate ships no rate limiter of its own, by design: deploy it behind one.
+
+## Threat model
+
+What the design assumes, so you can tell whether it matches yours.
+
+**A deployment is one trust boundary.** Any valid API key can read the whole deployment's budgets and usage through `/console` and the `/console/*` endpoints, including the labels and spend of every other key. Budget *enforcement* is per key; visibility is not. If your keys belong to parties who should not see each other's spend, run separate deployments. Per-tenant scoping is an Enterprise-edition concern, not an open-source-core one.
+
+**The pepper protects against a database read, and nothing else.** API keys are stored as HMAC-SHA256 digests under a server-side pepper held outside the database, so an attacker who reads `api_keys` cannot derive usable keys without also holding the pepper. An attacker who has both, or who has the running process's environment, has everything.
+
+**Rotating the pepper invalidates every issued key at once.** There is no dual-pepper verification window, so a rotation is a full re-issue, not a rolling one. Plan it as an outage.
+
+**Tollgate refuses to start without a real pepper.** A pepper shorter than 16 bytes, or the placeholder value shipped in `.env.example`, is rejected at boot rather than accepted with a warning. Starting with an ephemeral pepper would make every already-issued key fail to verify while the service still reported healthy: a silent, total auth outage.
+
+**The ledger is append-only against accident, not against its owner.** Triggers reject `UPDATE` and `DELETE`, but the table owner can disable a trigger or drop a partition, and retention depends on that. The control that matters is the role split described in [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
+
+**Privileged CLI actions are not audited.** An `audit_log` table exists with the same append-only triggers, and nothing writes to it in this release. Key issuance, revocation, budget changes and price changes leave no record in the database beyond their effect.
 
 ## Disclosure
 

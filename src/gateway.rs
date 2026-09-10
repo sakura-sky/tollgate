@@ -143,13 +143,19 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             })),
         )
             .into_response(),
+        // Every refusal carries `x-tollgate-reason`, in the same vocabulary the
+        // Anthropic and OpenAI routes use. An operator alerts on the header, so
+        // a route that sets it on some refusals and not others is worse than one
+        // that never sets it: the alert looks like it covers the deployment.
         Outcome::Unauthenticated => (
             StatusCode::UNAUTHORIZED,
+            [("x-tollgate-reason", "unauthenticated")],
             Json(json!({"error": "invalid or missing API key", "header": KEY_HEADER})),
         )
             .into_response(),
         Outcome::BadRequest(m) => (
             StatusCode::BAD_REQUEST,
+            [("x-tollgate-reason", "bad_request")],
             Json(json!({"error": format!("invalid request body: {m}")})),
         )
             .into_response(),
@@ -183,6 +189,7 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             .into_response(),
         Outcome::BackendError(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
+            [("x-tollgate-reason", "backend_error")],
             Json(json!({"error": "gateway temporarily unavailable"})),
         )
             .into_response(),
@@ -192,6 +199,7 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             tracing::warn!(detail = %m, "upstream provider error");
             (
                 StatusCode::BAD_GATEWAY,
+                [("x-tollgate-reason", "upstream_error")],
                 Json(json!({"error": "upstream provider error"})),
             )
                 .into_response()
@@ -492,11 +500,13 @@ impl GatewayCore {
             tracing::warn!(
                 provider = provider_id,
                 model = %parsed.model,
-                // The size the PROVIDER saw, which is what the threshold tests.
-                // Logging the billed total instead would print a number above
-                // the threshold next to a warning that did not fire, on any
-                // upstream whose prompt classes overlap.
+                // The size the threshold was tested against, which is the sum of
+                // the prompt classes. On an upstream whose cache convention is
+                // unverified that sum counts a cached token twice, so this can
+                // exceed the prompt the provider actually saw: the same upward
+                // resolution the BILLING uses there, for the same reason.
                 prompt_tokens = resp.usage.threshold_prompt_tokens(),
+                classes_overlap = resp.usage.classes_overlap,
                 "prompt exceeds the long-context threshold and no tier is configured \
                  for this model; if it re-rates long requests, this is an \
                  UNDER-charge. Set it with `admin price set --long-context-threshold \

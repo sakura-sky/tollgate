@@ -21,11 +21,11 @@ flowchart TB
   end
 
   subgraph state["State"]
-    pg[("Postgres<br/>keys · budgets · prices<br/>usage ledger (partitioned) · audit")]
+    pg[("Postgres<br/>keys · budgets · prices<br/>usage ledger (partitioned) · audit (unused)")]
     vk[("Valkey<br/>budget counters (hot path)")]
   end
 
-  prov["Anthropic / Vertex"]
+  prov["Anthropic / Vertex / OpenAI-compatible upstream"]
 
   app -->|"x-tollgate-key"| router --> core
   ops --> console
@@ -52,7 +52,7 @@ sequenceDiagram
   participant DB as Postgres
   participant V as Valkey
   participant P as Provider
-  C->>T: POST /v1/{provider}/{path}
+  C->>T: POST /v1/messages | /v1/chat/completions | /v1/{provider}/{path}
   T->>T: parse key, HMAC-SHA256 verify (constant time)
   Note over T: unknown provider/model -> 400 (fail closed)
   T->>T: price by token (integer micros)
@@ -101,6 +101,11 @@ erDiagram
     text model
     bigint input_per_1m_micros
     bigint output_per_1m_micros
+    bigint cache_read_per_1m_micros "nullable, inherits deployment default"
+    bigint cache_write_per_1m_micros "nullable, inherits deployment default"
+    bigint long_context_threshold_tokens "nullable, inherits deployment default"
+    integer long_context_input_permille "nullable, inherits deployment default"
+    integer long_context_output_permille "nullable, inherits deployment default"
     timestamptz effective_to "null = current"
   }
   usage_events {
@@ -115,7 +120,8 @@ erDiagram
 
 `usage_events` is append-only (triggers reject UPDATE, DELETE, and TRUNCATE) and
 monthly range-partitioned so retention can drop old partitions without violating
-immutability. `audit_log` is likewise append-only.
+immutability. `audit_log` exists with the same append-only triggers, but nothing
+in this release writes to it, so privileged CLI actions are not audited.
 
 ## Money and enforcement invariants
 

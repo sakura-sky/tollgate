@@ -127,19 +127,47 @@ pub struct RequestCtx<'a> {
 #[derive(Debug, Clone)]
 pub struct Reservation {
     entries: Vec<(String, i64)>,
+    /// The seed generation each counter carried when this reservation was
+    /// taken, positionally matching `entries`. Empty for backends that cannot
+    /// lose a counter, such as the in-memory one.
+    ///
+    /// A counter rebuilt from the ledger is not the counter this reservation
+    /// was taken against: the rebuilt figure already accounts for everything the
+    /// ledger knows, and this reservation is not in it. Settling against the new
+    /// counter would subtract a reservation it never held, which for a typical
+    /// request is a negative delta, so the counter would end up UNDER the truth
+    /// by the whole reserved amount and stay there until the next restart.
+    /// Carrying the generation lets settle recognise that and decline.
+    generations: Vec<i64>,
 }
 
 impl Reservation {
     /// Build a reservation from counter-key/amount pairs (used by backends).
     #[must_use]
     pub fn from_entries(entries: Vec<(String, i64)>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            generations: Vec::new(),
+        }
+    }
+
+    /// Attach the seed generations observed at reserve time.
+    #[must_use]
+    pub fn with_generations(mut self, generations: Vec<i64>) -> Self {
+        self.generations = generations;
+        self
     }
 
     /// The (counter key, reserved micros) pairs this reservation holds.
     #[must_use]
     pub fn entries(&self) -> &[(String, i64)] {
         &self.entries
+    }
+
+    /// The seed generations observed at reserve time, or empty.
+    #[must_use]
+    pub fn generations(&self) -> &[i64] {
+        &self.generations
     }
 }
 
@@ -288,9 +316,23 @@ impl Budgets {
             // saturating: a soft budget is incremented every request and never
             // limit-checked, so its counter could otherwise overflow.
             *counter = counter.saturating_add(reserve_micros);
+            // Counted but never refused. Say so, or a soft cap is a cap that
+            // does nothing AND reports nothing.
+            if !b.hard_stop && *counter > b.limit_micros {
+                tracing::warn!(
+                    scope = %b.scope,
+                    period = b.period.as_str(),
+                    limit_micros = b.limit_micros,
+                    spent_micros = *counter,
+                    "soft budget exceeded; the request was NOT refused because this budget \
+                     was created with `--hard-stop false`"
+                );
+            }
             entries.push((key, reserve_micros));
         }
-        Ok(Reservation { entries })
+        // No generations: this backend keeps its counters in process memory, so
+        // a counter cannot vanish and be rebuilt underneath a live reservation.
+        Ok(Reservation::from_entries(entries))
     }
 
     /// Settle a reservation to the actual cost, releasing (or claiming) the

@@ -1292,10 +1292,11 @@ fn parse_openai_usage(v: &Value, semantics: CacheSemantics) -> Usage {
 
     let mut usage = Usage::with_cache(fresh, output, cached, 0);
     // On an unverified upstream the prompt is billed on BOTH legs, so the
-    // classes overlap rather than partitioning the prompt. Anything asking how
-    // large the prompt actually was must not add them up: a 150k prompt with
-    // 100k cached bills as 250k, and testing a 200k size threshold against that
-    // would re-rate a request the provider itself never tiered.
+    // classes overlap rather than partitioning the prompt. Recorded on the usage
+    // rather than acted on: sizing resolves upward here as billing does, since
+    // "unverified" means we do not know that the cached count sits inside the
+    // prompt, and if it sits beside it the real prompt IS the sum. The flag
+    // exists so a persisted record can say which of the two it was.
     if matches!(semantics, CacheSemantics::Unverified) {
         usage = usage.with_overlapping_classes();
     }
@@ -2576,6 +2577,52 @@ mod tests {
         .unwrap();
         let u = parse_openai_usage(&v, CacheSemantics::Unverified);
         assert!(!u.suspect);
+        let settled = p.cost_micros(u);
+        assert!(
+            settled <= reserved,
+            "settle {settled} exceeded reserve {reserved}"
+        );
+    }
+
+    #[test]
+    fn openai_unverified_settles_within_its_reservation_across_a_tier() {
+        // The same guarantee where a long-context tier is configured and the
+        // request sits between half the threshold and the threshold.
+        //
+        // This is the shape that broke: the counted prompt is 150k, below the
+        // 200k threshold and below the reservation's guard band, but the
+        // unverified adapter bills the prompt on both legs so settlement sizes
+        // it at 250k and re-rates the whole request. The reservation has to size
+        // on the same worst case the RATE already assumes, or the settlement
+        // clears it by the full multiple and walks a hard cap.
+        let p = crate::pricing::ModelPrice::new("openai", "m", 3_000_000, 15_000_000)
+            .with_cache_rates(
+                Some(300_000),
+                None,
+                crate::pricing::CacheRateFallback::default(),
+            )
+            .with_long_context(crate::pricing::LongContextTier {
+                threshold_tokens: 200_000,
+                multiple_permille: 2_000,
+                output_multiple_permille: 2_000,
+            });
+        let profile = crate::pricing::PromptReserveProfile {
+            can_cache_write: false,
+            may_double_bill_prompt: true,
+        };
+        let reserved = p.reserve_micros(150_000, 1_000, profile);
+
+        let v: Value = serde_json::from_str(
+            r#"{"usage":{"prompt_tokens":150000,"prompt_tokens_details":{"cached_tokens":100000},
+                "completion_tokens":1000,"total_tokens":151000}}"#,
+        )
+        .unwrap();
+        let u = parse_openai_usage(&v, CacheSemantics::Unverified);
+        assert!(!u.suspect, "this shape is costable, not a guess");
+        assert!(
+            u.threshold_prompt_tokens() > 200_000,
+            "the double-billed prompt is what settlement sizes on"
+        );
         let settled = p.cost_micros(u);
         assert!(
             settled <= reserved,
