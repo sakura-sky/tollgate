@@ -95,7 +95,7 @@ tokio-stream = "0.1"
 # crates and leaves one SHA-256 implementation in the binary instead of two. The
 # newer generation is fine, but this is API-key verification, and the line with
 # a decade of field exposure is the better default for that.
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 subtle = "2"
 rand = "0.8"
