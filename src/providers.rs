@@ -971,6 +971,17 @@ impl TokenSource {
     }
 }
 
+/// Vertex API host for a location. Regional endpoints are
+/// `{region}-aiplatform.googleapis.com`, but the `global` location (the only one
+/// serving some newer Gemini models) has no regional prefix.
+fn vertex_host(location: &str) -> String {
+    if location == "global" {
+        "aiplatform.googleapis.com".to_owned()
+    } else {
+        format!("{location}-aiplatform.googleapis.com")
+    }
+}
+
 /// Adapter for Vertex AI (Gemini) `generateContent`.
 pub struct VertexProvider {
     http: reqwest::Client,
@@ -1146,7 +1157,8 @@ impl Provider for VertexProvider {
         let path = safe_rest_path(rest_path)?;
         let token = self.tokens.token(&self.http).await?;
         let url = format!(
-            "https://{loc}-aiplatform.googleapis.com/v1/projects/{proj}/locations/{loc}/{path}",
+            "https://{host}/v1/projects/{proj}/locations/{loc}/{path}",
+            host = vertex_host(&self.location),
             loc = self.location,
             proj = self.project,
         );
@@ -1177,7 +1189,8 @@ impl Provider for VertexProvider {
         let model = extract_vertex_model(rest_path).unwrap_or_else(|| parsed.model.clone());
         let token = self.tokens.token(&self.http).await?;
         let url = format!(
-            "https://{loc}-aiplatform.googleapis.com/v1/projects/{proj}/locations/{loc}/publishers/google/models/{model}:countTokens",
+            "https://{host}/v1/projects/{proj}/locations/{loc}/publishers/google/models/{model}:countTokens",
+            host = vertex_host(&self.location),
             loc = self.location,
             proj = self.project,
         );
@@ -1533,7 +1546,8 @@ impl OpenAiProvider {
         static_token: String,
     ) -> Self {
         let base_url = format!(
-            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
+            "https://{host}/v1/projects/{project}/locations/{location}/endpoints/openapi",
+            host = vertex_host(location),
         );
         Self {
             tokens: TokenSource::new(static_token),
@@ -1789,6 +1803,15 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_host_has_no_prefix_for_global() {
+        assert_eq!(vertex_host("global"), "aiplatform.googleapis.com");
+        assert_eq!(
+            vertex_host("us-central1"),
+            "us-central1-aiplatform.googleapis.com"
+        );
+    }
 
     fn anthropic_test_provider() -> AnthropicProvider {
         AnthropicProvider::new(
