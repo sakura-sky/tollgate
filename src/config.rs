@@ -144,6 +144,8 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
     #[serde(with = "humantime_serde")]
     pub acquire_timeout: Duration,
+    #[serde(default)]
+    pub auto_migrate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +176,7 @@ impl Default for Config {
                 url: "postgres://tollgate:tollgate@127.0.0.1:5432/tollgate".to_string(),
                 max_connections: 10,
                 acquire_timeout: Duration::from_secs(5),
+                auto_migrate: false,
             },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379".to_string(),

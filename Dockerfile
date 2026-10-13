@@ -31,6 +31,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY migrations ./migrations
+COPY assets ./assets
 COPY LICENSE ./LICENSE
 
 RUN cargo build --release --locked --bin tollgate

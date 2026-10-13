@@ -81,6 +81,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let db = crate::db::build_pool(&cfg.database).await?;
     let redis = build_redis(&cfg.redis.url).await?;
 
+    if cfg.database.auto_migrate {
+        tracing::info!("running database migrations");
+        crate::db::run_migrations(&db).await?;
+    }
+
     // Load budget config and prices from Postgres into the core.
     let budgets = load_budgets(&db).await.context("loading budgets")?;
     let prices = load_prices(&db).await.context("loading model prices")?;
