@@ -13,7 +13,7 @@ Thanks for your interest in contributing. This document covers what to expect wh
 1. **Open an issue first** for anything beyond a typo or trivial fix. Describe the problem, the proposed approach, and any alternatives considered. This avoids wasted work.
 2. **Fork and branch** off `main`. Use a descriptive branch name (e.g. `feat/budgets-soft-warn`, `fix/redis-reconnect`).
 3. **Keep PRs focused.** One logical change per PR. Refactors that move a lot of code should be separate from behaviour changes.
-4. **Follow the existing style.** Run the dev loop in [`DEVELOPMENT.md`](./DEVELOPMENT.md) - `cargo fmt --all`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` - and make sure all three are clean before opening the PR.
+4. **Follow the existing style.** Run the dev loop in [`DEVELOPMENT.md`](./DEVELOPMENT.md) - `cargo fmt --all`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked --all-targets` - and make sure all three are clean before opening the PR.
 
 ## Commit conventions
 

@@ -10,7 +10,16 @@ resource "google_cloud_run_v2_service" "gateway" {
 
   template {
     service_account = google_service_account.runtime.email
-    timeout         = "60s"
+
+    # Must exceed every timeout Tollgate enforces for itself, or the platform
+    # cuts the request first and Tollgate never gets to settle it. Streams run
+    # to 15 minutes, a buffered provider call to 10 (TOLLGATE_PROVIDERS__
+    # REQUEST_TIMEOUT), so 16 minutes leaves Tollgate's own guards to fire.
+    #
+    # This was 60s, which predates streaming: every stream was killed by Cloud
+    # Run at one minute, and because the cut happened outside the process the
+    # reservation was charged in full as `estimated` rather than settled.
+    timeout = "960s"
 
     scaling {
       min_instance_count = var.cloud_run_min_instances
@@ -76,6 +85,25 @@ resource "google_cloud_run_v2_service" "gateway" {
       env {
         name  = "TOLLGATE_TELEMETRY__SERVICE_NAME"
         value = "tollgate"
+      }
+
+      # Provider configuration, supplied by the operator.
+      #
+      # Every provider defaults to DISABLED, so a module applied without this
+      # produces a gateway that serves health, metrics and the console and
+      # refuses every proxied request. That is the fail-closed default and it is
+      # deliberate, but it surprises people on a first apply, so `var.provider_env`
+      # exists to make enabling one an explicit act rather than a code edit.
+      #
+      # Put secrets in Secret Manager and reference them the way the database URL
+      # and the pepper are referenced above. Do not put an API key in tfvars: it
+      # lands in state, and state is not a secret store.
+      dynamic "env" {
+        for_each = var.provider_env
+        content {
+          name  = env.key
+          value = env.value
+        }
       }
 
       startup_probe {

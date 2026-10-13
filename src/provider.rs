@@ -26,6 +26,11 @@ pub struct ParsedRequest {
     /// The maximum output the request may produce (used to reserve the worst
     /// case so a request cannot overshoot its budget).
     pub max_output_tokens: u64,
+    /// Whether THIS request could cause a cache write, which bills above the
+    /// input rate. Adapters that can report writes at all set this from the
+    /// request body, so a request that cannot write is not reserved as if it
+    /// could. Defaults false; erring toward true only over-reserves.
+    pub may_cache_write: bool,
 }
 
 /// A provider response: upstream status, JSON body to return, and parsed usage.
@@ -41,8 +46,21 @@ pub struct ProviderResponse {
 pub enum ProviderError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// The call failed BEFORE the provider could have served it: connect, DNS or
+    /// TLS failure, or a failure building or authorising the request. Nothing was
+    /// billed upstream, so the reservation is released in full.
     #[error("upstream provider error: {0}")]
     Upstream(String),
+    /// The request may have reached the provider and been billed, but the result
+    /// could not be metered: a timeout after the request was sent, a transport
+    /// error mid-response, or a 2xx whose body will not parse.
+    ///
+    /// Releasing the reservation here would under-charge a request the provider
+    /// is invoicing, so the caller charges the reservation instead and records
+    /// the row as `estimated`. Over-charging visibly beats under-charging
+    /// silently.
+    #[error("metering failed: {0}")]
+    MeteringFailed(String),
 }
 
 /// A backend Tollgate can proxy to.
@@ -82,6 +100,41 @@ pub trait Provider: Send + Sync {
         parsed: &ParsedRequest,
     ) -> Result<u64, ProviderError> {
         Ok(parsed.estimated_input_tokens)
+    }
+
+    /// Whether this adapter can ever report `cache_write_tokens > 0`.
+    ///
+    /// This gates the worst-case reservation. A cache write can cost more than
+    /// fresh input (up to 2x), so where writes are possible the reservation has
+    /// to assume the whole prompt might be written, or a request could settle
+    /// above what it reserved and overshoot a hard cap.
+    ///
+    /// It must stay false where writes are impossible. Because an unpriced write
+    /// class always resolves to a fallback above the input rate, reserving at
+    /// the write rate unconditionally would inflate EVERY reservation on EVERY
+    /// model, including adapters that never report writes, and start refusing
+    /// traffic that previously fit under the same budget.
+    fn can_report_cache_write(&self) -> bool {
+        false
+    }
+
+    /// The prompt-side worst case THIS request can produce, used to size the
+    /// reservation.
+    ///
+    /// The default ANDs the adapter's capability with the per-request flag, so a
+    /// request that cannot cause a cache write is not reserved as though it
+    /// could. Keeping the conjunction here rather than in each adapter means a
+    /// future write-capable adapter has to actively override to get it wrong.
+    /// Adapters that can bill a prompt token on more than one leg must override
+    /// and preserve that conjunction.
+    fn prompt_reserve_profile(
+        &self,
+        parsed: &ParsedRequest,
+    ) -> crate::pricing::PromptReserveProfile {
+        crate::pricing::PromptReserveProfile {
+            can_cache_write: self.can_report_cache_write() && parsed.may_cache_write,
+            may_double_bill_prompt: false,
+        }
     }
 }
 
@@ -129,6 +182,7 @@ impl Provider for MockProvider {
             model: b.model,
             estimated_input_tokens: Self::estimate_input_tokens(&b.prompt),
             max_output_tokens: b.max_output_tokens,
+            may_cache_write: false,
         })
     }
 

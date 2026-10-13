@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Andrew Stevens
 #
 # Narrated end-to-end demo of Tollgate, zero infrastructure required.
-# Boots `tollgate demo` (in-memory, mock provider), issues a demo key with a
-# small per-key budget, sends requests until the budget hard-stops, and shows
+# Boots `tollgate demo` (in-memory, mock provider), which creates a demo key and
+# its budgets in-process and prints the key; the script greps that key out of the
+# server's output, sends requests until the per-key budget hard-stops, and shows
 # the spend ledger. No Postgres, Redis, or cloud credentials needed.
 #
 # Usage:  ./scripts/demo.sh

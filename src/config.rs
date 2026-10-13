@@ -5,7 +5,8 @@
 //!
 //! Configuration is layered: defaults → optional `tollgate.toml` file →
 //! environment variables prefixed with `TOLLGATE_`. Nested fields use double
-//! underscores, e.g. `TOLLGATE_HTTP__PORT=8080`.
+//! underscores, e.g. `TOLLGATE_HTTP__BIND=0.0.0.0:8080`. A variable that matches
+//! no field is ignored silently, so a typo is a setting that never applies.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,8 +58,29 @@ pub struct ReloadConfig {
     pub interval: Duration,
 }
 
+fn default_provider_timeout() -> Duration {
+    Duration::from_secs(600)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersConfig {
+    /// Total time allowed for one BUFFERED upstream call.
+    ///
+    /// Separate from `http.request_timeout`, which bounds Tollgate's own local
+    /// routes, because the two want opposite values. A console query should
+    /// finish in seconds; a non-streaming LLM sends no headers at all until
+    /// generation completes, so a large response legitimately takes minutes and
+    /// looks identical to a hang until it arrives.
+    ///
+    /// Sharing one knob meant either cutting off real responses or leaving the
+    /// local routes effectively unbounded. When this expires the request is
+    /// treated as POSSIBLY BILLED and charged its reservation, because the
+    /// provider may well have generated a full response we never read.
+    ///
+    /// Streaming ignores this: it is bounded by the idle and max-duration
+    /// guards instead, since a stream is expected to be long-lived.
+    #[serde(with = "humantime_serde", default = "default_provider_timeout")]
+    pub request_timeout: Duration,
     /// How input tokens are counted for the pre-forward budget reservation:
     /// `fast` (over-estimate from body size, no extra call, lowest latency) or
     /// `exact` (a pre-flight token-count call to the provider). Both settle to
@@ -118,6 +140,83 @@ pub struct BillingConfig {
     /// ISO 4217 currency code for all amounts (display only; the money path is
     /// currency-agnostic integer micros). Single currency per deployment.
     pub currency: String,
+    /// Multiple of a model's input rate used to price cache-READ tokens when the
+    /// operator has not set a rate, in integer PER-MILLE (1000 = 1.0x). Integer
+    /// so no float touches the money path. Must be at least 1000: a lower value
+    /// would guess DOWNWARD on a rate nobody supplied, which under-charges
+    /// silently. Real read rates are well below the input rate, so the default
+    /// deliberately over-charges until a real rate is configured.
+    #[serde(default = "default_cache_read_permille")]
+    pub cache_read_fallback_permille: u32,
+    /// As above for cache-WRITE tokens. The default covers the most expensive
+    /// real write rate observed (2x the input rate for a long-TTL entry).
+    #[serde(default = "default_cache_write_permille")]
+    pub cache_write_fallback_permille: u32,
+    /// Prompt size above which providers commonly re-rate the WHOLE request.
+    /// Zero disables long-context re-rating entirely.
+    #[serde(default = "default_long_context_threshold")]
+    pub long_context_threshold_tokens: u64,
+    /// Multiple applied to the prompt legs above that threshold, in per-mille.
+    ///
+    /// A price is one rate per class and cannot express a rate that changes with
+    /// size, so without this a large request is UNDER-charged by the tier
+    /// multiple, and under-charging is the one direction this product may never
+    /// err in. Same posture as the unpriced-cache-class fallback: an unmodelled
+    /// dimension costs more, not less.
+    #[serde(default = "default_long_context_permille")]
+    pub long_context_multiple_permille: u32,
+    /// Multiple applied to the OUTPUT rate above the threshold, per-mille.
+    ///
+    /// Separate from the prompt multiple because real tiers move the two by
+    /// different amounts (commonly 2x input, 1.5x output). Re-rating only the
+    /// prompt still under-charges the output leg of every long request.
+    #[serde(default = "default_long_context_output_permille")]
+    pub long_context_output_multiple_permille: u32,
+}
+
+fn default_long_context_output_permille() -> u32 {
+    crate::pricing::LongContextTier::default().output_multiple_permille
+}
+
+// Delegated to the pricing type so there is ONE source of truth. These were
+// separate constants and drifted immediately: the pricing default said 1000
+// (off) while this said 2000, so every deployment ran at 2x above the threshold
+// while the tests, README and commit message all said the feature was off. The
+// tests passed because they build prices through `ModelPrice::new`, which reads
+// the pricing default; production goes through config, which read this one.
+fn default_long_context_threshold() -> u64 {
+    crate::pricing::LongContextTier::default().threshold_tokens
+}
+fn default_long_context_permille() -> u32 {
+    crate::pricing::LongContextTier::default().multiple_permille
+}
+
+fn default_cache_read_permille() -> u32 {
+    1_000
+}
+fn default_cache_write_permille() -> u32 {
+    2_000
+}
+
+impl BillingConfig {
+    /// The cache-rate fallback these settings describe.
+    #[must_use]
+    pub fn cache_rate_fallback(&self) -> crate::pricing::CacheRateFallback {
+        crate::pricing::CacheRateFallback {
+            read_permille: self.cache_read_fallback_permille,
+            write_permille: self.cache_write_fallback_permille,
+        }
+    }
+
+    /// The long-context tier these settings describe.
+    #[must_use]
+    pub fn long_context_tier(&self) -> crate::pricing::LongContextTier {
+        crate::pricing::LongContextTier {
+            threshold_tokens: self.long_context_threshold_tokens,
+            multiple_permille: self.long_context_multiple_permille,
+            output_multiple_permille: self.long_context_output_multiple_permille,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,11 +287,17 @@ impl Default for Config {
             },
             billing: BillingConfig {
                 currency: "USD".to_string(),
+                cache_read_fallback_permille: default_cache_read_permille(),
+                cache_write_fallback_permille: default_cache_write_permille(),
+                long_context_threshold_tokens: default_long_context_threshold(),
+                long_context_multiple_permille: default_long_context_permille(),
+                long_context_output_multiple_permille: default_long_context_output_permille(),
             },
             security: SecurityConfig {
                 api_key_pepper: String::new(),
             },
             providers: ProvidersConfig {
+                request_timeout: default_provider_timeout(),
                 admission: "fast".to_string(),
                 enable_mock: false,
                 vertex: VertexConfig {
@@ -236,5 +341,43 @@ impl Config {
         }
         figment = figment.merge(Env::prefixed("TOLLGATE_").split("__"));
         figment.extract().context("loading configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config defaults and the pricing defaults must agree.
+    ///
+    /// They drifted the moment they were separate constants: pricing said the
+    /// long-context multiple was 1.0x (off) while config said 2.0x, so every
+    /// deployment silently doubled the cost of any prompt above the threshold,
+    /// on every model including ones that bill flat, while the test suite,
+    /// README and commit message all reported the feature as off. The tests did
+    /// not catch it because they build prices through `ModelPrice::new`, which
+    /// reads the pricing default; only production reads the config default.
+    #[test]
+    fn config_billing_defaults_match_the_pricing_defaults() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.billing.long_context_tier(),
+            crate::pricing::LongContextTier::default(),
+            "config default must not diverge from the pricing default"
+        );
+        assert_eq!(
+            cfg.billing.cache_rate_fallback(),
+            crate::pricing::CacheRateFallback::default(),
+            "config default must not diverge from the pricing default"
+        );
+    }
+
+    /// Whatever the defaults are, they must be valid, or a fresh deployment
+    /// fails to boot on config it never chose.
+    #[test]
+    fn default_billing_config_passes_its_own_validation() {
+        let cfg = Config::default();
+        assert!(cfg.billing.cache_rate_fallback().validate().is_ok());
+        assert!(cfg.billing.long_context_tier().validate().is_ok());
     }
 }

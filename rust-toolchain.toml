@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Andrew Stevens
 
+# Keep this in step with `rust-version` in Cargo.toml. A toolchain pinned below
+# the manifest's MSRV makes CI reject dependency updates the manifest allows,
+# which is how `redis` sat five minor versions behind: 1.2.3 onward need 1.88.
 [toolchain]
-channel = "1.85"
+channel = "1.88"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

@@ -9,33 +9,51 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::Utc;
+use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::apikey::KeyHasher;
 use crate::backends::{
-    PgKeyStore, PgUsageSink, RedisBudgetBackend, budget_spent, load_budgets, load_prices,
+    PgKeyStore, PgSpendLedger, PgUsageSink, RedisBudgetBackend, SpendLedger, budget_spent,
+    load_budgets, load_prices,
 };
-use crate::budget::{Budget, Scope};
+use crate::budget::{Budget, RequestCtx, Scope};
 use crate::config::Config;
-use crate::gateway::{GatewayCore, KeyStore, UsageSink, outcome_response};
-use crate::pricing::{PriceBook, format_micros};
-use crate::provider::{MockProvider, Provider};
+use crate::gateway::{
+    GatewayCore, KeyStore, Metrics, ReserveError, Settlement, UsageSink, outcome_response,
+};
+use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
+use crate::provider::{MockProvider, Provider, ProviderError};
+use crate::providers::{CacheSemantics, OpenAiProvider, stream_requested, usage_from_sse_data};
 use crate::routes::health;
+
+/// Cap the SSE line-reassembly buffer so an upstream that never emits a newline
+/// cannot grow it without bound.
+const MAX_SSE_LINE_BUFFER: usize = 1024 * 1024;
+/// Idle timeout: abort a stream if no upstream chunk arrives within this window.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard cap on total stream duration.
+const STREAM_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -47,6 +65,14 @@ pub struct AppState {
     /// Current budget config, swapped in lockstep with the core, for the
     /// read-only console endpoints.
     pub budgets: Arc<ArcSwap<Vec<Budget>>>,
+    /// Typed handle to the OpenAI upstream adapter for the streaming path (the
+    /// buffered path uses it via the provider map). None when disabled. Upstream
+    /// config is static, so this is built once and not hot-reloaded.
+    pub openai: Option<Arc<OpenAiProvider>>,
+    /// Typed handle to the Anthropic adapter, for the same reason: the streaming
+    /// path needs `forward_stream` and the stream meter, which the `dyn Provider`
+    /// map cannot expose.
+    pub anthropic: Option<Arc<crate::providers::AnthropicProvider>>,
 }
 
 /// The immutable parts of a [`GatewayCore`], reused every time the core is rebuilt
@@ -60,6 +86,11 @@ struct CoreParts {
     providers: HashMap<String, Arc<dyn Provider>>,
     admission_exact: bool,
     redis: ConnectionManager,
+    /// So the budget backend can rebuild a counter Valkey has lost.
+    ledger: Arc<dyn SpendLedger>,
+    /// Held HERE, not in the core, because the core is rebuilt every reload
+    /// tick and counters that reset every fifteen seconds are worse than none.
+    metrics: Arc<Metrics>,
 }
 
 impl CoreParts {
@@ -68,27 +99,98 @@ impl CoreParts {
             hasher: self.hasher.clone(),
             dummy_hash: self.dummy_hash.clone(),
             keys: self.keys.clone(),
-            budgets: Arc::new(RedisBudgetBackend::new(self.redis.clone(), budgets)),
+            budgets: Arc::new(RedisBudgetBackend::new(
+                self.redis.clone(),
+                budgets,
+                self.ledger.clone(),
+            )),
             usage: self.usage.clone(),
             prices: Arc::new(prices),
             providers: self.providers.clone(),
             admission_exact: self.admission_exact,
+            metrics: self.metrics.clone(),
         }
     }
 }
 
+/// Refuse to serve against a database that is behind this binary.
+///
+/// Migrations are applied by an explicit `admin migrate`, so a deploy can easily
+/// start a new binary against an old schema. That failure is silent and
+/// dangerous rather than loud: the usage sink is best-effort and logs-and-drops
+/// on error, so every ledger row would vanish while Valkey counters kept
+/// enforcing and everything looked healthy. A later cache flush then rebuilds
+/// those counters from an under-counted ledger and permits overspend.
+///
+/// Fail closed, like every other unknown in this system.
+async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
+    // A brand new database has no migrations table at all, which is simply
+    // "nothing applied" rather than an error worth surfacing differently.
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let missing: Vec<String> = crate::db::MIGRATOR
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .map(|m| format!("{} ({})", m.version, m.description))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "database schema is behind this binary; {} migration(s) not applied: {}. \
+             Run `tollgate admin migrate` before starting. Refusing to serve: the usage \
+             ledger would silently fail to record spend against an older schema.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     let db = crate::db::build_pool(&cfg.database).await?;
+    ensure_schema_current(&db).await?;
     let redis = build_redis(&cfg.redis.url).await?;
 
-    if cfg.database.auto_migrate {
-        tracing::info!("running database migrations");
-        crate::db::run_migrations(&db).await?;
-    }
+    // Fail closed at boot on a fallback multiple that would price an unpriced
+    // cache class below the model's own input rate. That is the same fail-open
+    // the nullable rate columns exist to prevent, just moved into config.
+    let cache_fallback = cfg.billing.cache_rate_fallback();
+    cache_fallback
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
 
     // Load budget config and prices from Postgres into the core.
     let budgets = load_budgets(&db).await.context("loading budgets")?;
-    let prices = load_prices(&db).await.context("loading model prices")?;
+    let long_context = cfg.billing.long_context_tier();
+    long_context
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
+    // A deployment-wide multiple against a threshold of zero re-rates nothing
+    // and, because the under-charge warning needs a threshold to test against,
+    // logs nothing either: the operator sees a 2x in their environment and gets
+    // neither the charge nor a signal that it is inert. Refused here rather than
+    // warned, matching `admin price set`, which refuses the same pair on a row.
+    //
+    // Deliberately NOT part of `validate()`. A per-model tier resolves to this
+    // same shape whenever a model is disabled with `--long-context-threshold 0`
+    // and inherits the deployment multiples, and that is a working
+    // configuration, not a mistake.
+    if long_context.has_stranded_uplift() {
+        anyhow::bail!(
+            "invalid billing config: TOLLGATE_BILLING__LONG_CONTEXT_MULTIPLE_PERMILLE or \
+             __LONG_CONTEXT_OUTPUT_MULTIPLE_PERMILLE is above 1000, but \
+             __LONG_CONTEXT_THRESHOLD_TOKENS is 0, so no request is ever re-rated and \
+             none is logged as a possible under-charge either. Set a threshold (e.g. \
+             200000), or leave both multiples at 1000 to keep the warning without the \
+             re-rating"
+        );
+    }
+
+    let prices = load_prices(&db, cache_fallback, long_context)
+        .await
+        .context("loading model prices")?;
     tracing::info!(
         budgets = budgets.len(),
         priced_models = prices.len(),
@@ -132,25 +234,39 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // including provider credentials (e.g. Anthropic's x-api-key), to another
     // host. Treat any 3xx as an upstream error instead.
     let http = reqwest::Client::builder()
-        .timeout(cfg.http.request_timeout)
+        // The PROVIDER timeout, not the local-route one. A non-streaming LLM
+        // sends no headers until generation finishes, so this has to allow for a
+        // full large response.
+        .timeout(cfg.providers.request_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building HTTP client")?;
+
+    // Streaming client for the OpenAI SSE relay: NO total request timeout (a total
+    // deadline would sever long streams mid-body), only a connect timeout.
+    // Redirects stay disabled (credential protection). Per-read idle timeout and a
+    // max stream duration are enforced by the relay task.
+    let stream_http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building streaming HTTP client")?;
 
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     if cfg.providers.enable_mock {
         providers.insert("mock".to_owned(), Arc::new(MockProvider));
     }
+    let mut anthropic_handle: Option<Arc<crate::providers::AnthropicProvider>> = None;
     if cfg.providers.anthropic.enabled {
-        providers.insert(
-            "anthropic".to_owned(),
-            Arc::new(crate::providers::AnthropicProvider::new(
-                http.clone(),
-                cfg.providers.anthropic.api_key.clone(),
-                cfg.providers.anthropic.base_url.clone(),
-                cfg.providers.anthropic.version.clone(),
-            )),
-        );
+        let arc = Arc::new(crate::providers::AnthropicProvider::new(
+            http.clone(),
+            stream_http.clone(),
+            cfg.providers.anthropic.api_key.clone(),
+            cfg.providers.anthropic.base_url.clone(),
+            cfg.providers.anthropic.version.clone(),
+        ));
+        providers.insert("anthropic".to_owned(), arc.clone() as Arc<dyn Provider>);
+        anthropic_handle = Some(arc);
     }
     if cfg.providers.vertex.enabled {
         providers.insert(
@@ -163,9 +279,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
             )),
         );
     }
+    let mut openai_handle: Option<Arc<crate::providers::OpenAiProvider>> = None;
     if cfg.providers.openai.enabled {
         let oc = &cfg.providers.openai;
-        let provider: Arc<dyn Provider> = match oc.upstream.as_str() {
+        let p = match oc.upstream.as_str() {
             "vertex" => {
                 if cfg.providers.vertex.project.is_empty()
                     || cfg.providers.vertex.location.is_empty()
@@ -175,12 +292,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
                          TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
                     );
                 }
-                Arc::new(crate::providers::OpenAiProvider::vertex(
+                crate::providers::OpenAiProvider::vertex(
                     http.clone(),
+                    stream_http.clone(),
                     &cfg.providers.vertex.project,
                     &cfg.providers.vertex.location,
                     cfg.providers.vertex.access_token.clone(),
-                ))
+                )
             }
             "custom" => {
                 // An empty key would make the adapter fall back to the GCP
@@ -191,17 +309,43 @@ pub async fn serve(cfg: Config) -> Result<()> {
                          TOLLGATE_PROVIDERS__OPENAI__BASE_URL and __API_KEY"
                     );
                 }
-                Arc::new(crate::providers::OpenAiProvider::custom(
+                // Anthropic's OpenAI-compatible endpoint reports NO prompt-cache
+                // tokens: its token-details fields are documented as always
+                // empty and caching is unsupported there. Pointing the OpenAI
+                // adapter at it would silently under-count every cached Claude
+                // request, and no tripwire on our side can detect data the
+                // upstream never sends. Use /v1/messages instead.
+                //
+                // A host compare, so it is a lint rather than a guarantee: it
+                // cannot see a CNAME, an egress proxy, or a gateway fronting
+                // Anthropic. It catches the obvious mistake.
+                if let Some(host) = reqwest::Url::parse(&oc.base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_lowercase()))
+                {
+                    if host == "anthropic.com" || host.ends_with(".anthropic.com") {
+                        anyhow::bail!(
+                            "refusing to use {host} as an OpenAI-compatible upstream: that \
+                             endpoint reports no prompt-cache tokens, so every cached request \
+                             would be silently under-counted. Enable the anthropic provider \
+                             and use /v1/messages instead."
+                        );
+                    }
+                }
+                crate::providers::OpenAiProvider::custom(
                     http.clone(),
+                    stream_http.clone(),
                     oc.base_url.clone(),
                     oc.api_key.clone(),
-                ))
+                )
             }
             other => anyhow::bail!(
                 "TOLLGATE_PROVIDERS__OPENAI__UPSTREAM must be 'vertex' or 'custom' (got {other:?})"
             ),
         };
-        providers.insert("openai".to_owned(), provider);
+        let arc = Arc::new(p);
+        providers.insert("openai".to_owned(), arc.clone() as Arc<dyn Provider>);
+        openai_handle = Some(arc);
     }
     let admission = cfg.providers.admission.to_ascii_lowercase();
     if admission != "fast" && admission != "exact" {
@@ -225,6 +369,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         providers,
         admission_exact,
         redis: redis.clone(),
+        ledger: Arc::new(PgSpendLedger::new(db.clone())),
+        metrics: Arc::new(Metrics::default()),
     };
 
     let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
@@ -241,6 +387,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
             core.clone(),
             budgets_view.clone(),
             cfg.reload.interval,
+            cache_fallback,
+            long_context,
         );
         tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
     }
@@ -250,6 +398,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         redis,
         core,
         budgets: budgets_view,
+        openai: openai_handle,
+        anthropic: anthropic_handle,
     };
     let app = router(state, cfg.http.request_timeout);
 
@@ -274,6 +424,8 @@ fn spawn_reload_task(
     core: Arc<ArcSwap<GatewayCore>>,
     budgets_view: Arc<ArcSwap<Vec<Budget>>>,
     interval: Duration,
+    cache_fallback: crate::pricing::CacheRateFallback,
+    long_context: crate::pricing::LongContextTier,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -287,10 +439,20 @@ fn spawn_reload_task(
                     continue;
                 }
             };
-            let prices = match load_prices(&db).await {
+            // A price book loads whole or not at all, and one unusable row keeps
+            // the PREVIOUS book rather than swapping in a partial one. Dropping
+            // just the bad model would make its requests unpriced, which the
+            // gateway refuses anyway, so the partial book buys nothing and costs
+            // every other model a silent change of price mid-flight. At boot the
+            // same failure is fatal: there is no previous book to keep.
+            let prices = match load_prices(&db, cache_fallback, long_context).await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(error = %e, "config reload: prices query failed; keeping current");
+                    tracing::warn!(
+                        error = %e,
+                        "config reload: prices failed to load; keeping current. \
+                         Every model is still priced as it was before this cycle"
+                    );
                     continue;
                 }
             };
@@ -338,20 +500,67 @@ fn spawn_maintenance_task(db: PgPool, window: Duration) {
 }
 
 pub fn router(state: AppState, request_timeout: Duration) -> Router {
-    Router::new()
+    // Local routes: bounded by the HTTP timeout, because nothing else bounds
+    // them. They do their own work and should never run long.
+    let local = Router::new()
         .route("/healthz", get(health::live))
         .route("/readyz", get(health::ready))
         .route("/metrics", get(metrics))
         .route("/console", get(console))
         .route("/console/budgets", get(console_budgets))
         .route("/console/usage", get(console_usage))
-        .route("/v1/chat/completions", post(openai_chat))
-        .route("/v1/{provider}/{*rest}", post(gateway))
-        .with_state(state)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::SERVICE_UNAVAILABLE,
             request_timeout,
-        ))
+        ));
+
+    // Proxy routes: deliberately NOT under that layer.
+    //
+    // The layer's clock starts at the request head, while the provider client's
+    // starts later, after auth, parse and reserve. Applying the same duration to
+    // both means the layer always wins, and tower-http cancels the handler
+    // future rather than letting the provider call fail on its own terms. That
+    // matters because a non-streaming LLM sends no headers until generation
+    // finishes, so any response slower than the timeout, which large outputs
+    // routinely are, was cancelled mid-flight.
+    //
+    // A cancelled handler is now caught by the Settlement guard, so it no longer
+    // strands a reservation, but it would still turn every slow-but-successful
+    // request into a 503 charged at its reservation. These routes carry their
+    // own bounds instead: the buffered client's request timeout, and the
+    // streaming path's idle and max-duration guards.
+    let proxied = Router::new()
+        .route("/v1/chat/completions", post(openai_chat))
+        // Native Anthropic, at the path the SDK and LiteLLM actually use.
+        .route("/v1/messages", post(anthropic_messages))
+        // Everything else under /v1/messages/ (count_tokens, batches) would
+        // otherwise fall into the catch-all as provider "messages" and write an
+        // unpriced ledger row per call. Refuse explicitly.
+        .route("/v1/messages/{*rest}", post(anthropic_messages_unsupported))
+        .route("/v1/{provider}/{*rest}", post(gateway));
+
+    local
+        .merge(proxied)
+        .with_state(state)
+        // Applied around the routes, so it sees a panic from anywhere inside
+        // them, including from a dependency. `TraceLayer` sits outside it and is
+        // unaffected. A panic on one request for one key must fail that request,
+        // not the process: this gateway is the thing standing between every
+        // client and its provider, so a total outage is the most expensive
+        // failure it has. The binary is built to unwind rather than abort for
+        // exactly this reason.
+        //
+        // The response body is fixed text. A panic message can carry anything
+        // that was in scope, so it is logged and never returned.
+        .layer(CatchPanicLayer::custom(|_| {
+            tracing::error!("a request panicked; failing that request, not the process");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("x-tollgate-reason", "backend_error")],
+                Json(json!({"error": "internal error"})),
+            )
+                .into_response()
+        }))
         .layer(TraceLayer::new_for_http())
 }
 
@@ -366,16 +575,1010 @@ async fn gateway(
     outcome_response(outcome)
 }
 
+/// Sub-paths of `/v1/messages` that Tollgate does not meter.
+///
+/// `count_tokens` is free but unmetered, and `batches` bills asynchronously in a
+/// way no per-request ledger row can capture. Without this they fall into the
+/// catch-all as provider "messages" and write an unpriced row per call.
+async fn anthropic_messages_unsupported() -> Response {
+    anthropic_error(
+        StatusCode::NOT_FOUND,
+        "not_found_error",
+        "only /v1/messages is proxied; batches and count_tokens are not metered",
+    )
+}
+
+/// Native Anthropic Messages endpoint, at the path the Anthropic SDK and LiteLLM
+/// actually use.
+///
+/// The pre-existing `/v1/anthropic/messages` route cannot serve a native client:
+/// the SDK appends `/v1/messages` to its base URL (so that route becomes
+/// `/v1/anthropic/v1/messages` and is refused), the key arrives as `x-api-key`
+/// which the gateway did not read, and successes come back wrapped in a
+/// `{"response": ..., "tollgate": ...}` envelope the SDK cannot parse. That route
+/// and its envelope are left untouched for existing users; this is the one to
+/// point a real client at.
+///
+/// Claude is served natively rather than by translating OpenAI requests, because
+/// Anthropic's own OpenAI-compatible endpoint does not report prompt-cache tokens
+/// at all: routing through it would silently under-count every cached request.
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    // Accept `x-api-key` as a Tollgate key on THIS ROUTE ONLY, by rewriting it
+    // into the header the gateway already reads. Widening `presented_key`
+    // instead would quietly accept it on /console/* and every other route.
+    let mut headers = headers;
+    if !headers.contains_key(crate::gateway::KEY_HEADER) {
+        if let Some(v) = headers.get("x-api-key").cloned() {
+            headers.insert(crate::gateway::KEY_HEADER, v);
+        }
+    }
+
+    // A beta can change the billing rate: the 1M-context beta bills input above
+    // 200k tokens at twice standard, which one input rate cannot express. Refuse
+    // what we cannot meter rather than forwarding it.
+    for v in headers.get_all("anthropic-beta") {
+        let Ok(s) = v.to_str() else {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "malformed anthropic-beta header",
+            );
+        };
+        if let Some(unknown) = crate::providers::unknown_anthropic_beta(s) {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!(
+                    "anthropic-beta '{unknown}' is not supported: a beta can change the \
+                     per-token rate, which a single configured price cannot express"
+                ),
+            );
+        }
+    }
+
+    // The service tier is pinned in the adapter's forward, not here, so the
+    // legacy /v1/anthropic/messages route gets it too.
+    let wants_stream = serde_json::from_str::<Value>(&body)
+        .map(|v| stream_requested(&v))
+        .unwrap_or(false);
+    if wants_stream {
+        return anthropic_messages_stream(state, headers, body).await;
+    }
+    let core = state.core.load_full();
+    let outcome = core
+        .evaluate("anthropic", "messages", &headers, &body)
+        .await;
+    anthropic_outcome_response(outcome)
+}
+
+/// Record a refusal that happened BEFORE the request was forwarded, on a
+/// streaming route.
+///
+/// The streaming routes run their own admission rather than going through
+/// [`GatewayCore::evaluate`], and they used to record nothing at all for a
+/// refusal. An hour of budget denials, or of a provider's count endpoint being
+/// down, read as an hour in which no requests arrived: the ledger is the only
+/// place a refused request is visible, since there is no metric for it either.
+///
+/// Zero cost on every one of these, because nothing was reserved and nothing was
+/// forwarded. The decision words are the ones the buffered path already uses for
+/// the same situations, so the two agree rather than inventing a third
+/// vocabulary for streams.
+///
+/// A parse failure is deliberately NOT recorded, matching `evaluate`: the
+/// request never resolved to a model, and a caller looping on a malformed body
+/// would otherwise fill the ledger with rows that describe their bug rather than
+/// this deployment's spend.
+async fn record_stream_refusal(
+    core: &GatewayCore,
+    key_id: &str,
+    provider: &str,
+    model: &str,
+    decision: &str,
+    started: Instant,
+    provider_micros: u128,
+) {
+    core.record(
+        key_id,
+        provider,
+        model,
+        Usage::default(),
+        0,
+        decision,
+        started,
+        provider_micros,
+    )
+    .await;
+}
+
+/// An Anthropic-shaped error, so SDK exception classes resolve correctly.
+///
+/// The BODY carries Anthropic's error vocabulary, because the SDK maps it to an
+/// exception class. The `x-tollgate-reason` HEADER carries Tollgate's, the same
+/// on every route, because that is what an operator alerts on. They are not the
+/// same word: a budget refusal is `permission_error` to the SDK and
+/// `budget_exceeded` to the operator.
+fn anthropic_error(status: StatusCode, kind: &str, message: &str) -> Response {
+    anthropic_error_reason(status, kind, default_reason_for(kind), message)
+}
+
+/// Tollgate's reason for an Anthropic error kind, where the two correspond.
+///
+/// Only for kinds used one way in this file. Two refusals do NOT correspond and
+/// must call [`anthropic_error_reason`] directly: an unpriced model is an
+/// `invalid_request_error` to the SDK but `unpriced` to an operator, and a
+/// backend failure is an `api_error` but `backend_error`. If you use one of
+/// these kinds for a new reason, do not reach for this function.
+fn default_reason_for(kind: &str) -> &'static str {
+    match kind {
+        "authentication_error" => "unauthenticated",
+        "permission_error" => "budget_exceeded",
+        "api_error" => "upstream_error",
+        "invalid_request_error" | "not_found_error" => "bad_request",
+        // Anything new. Listed above rather than left to fall through, so that
+        // adding a kind is a decision rather than an accident.
+        _ => "bad_request",
+    }
+}
+
+/// As [`anthropic_error`], with the operator-facing reason stated explicitly.
+fn anthropic_error_reason(
+    status: StatusCode,
+    kind: &str,
+    reason: &'static str,
+    message: &str,
+) -> Response {
+    (
+        status,
+        [("x-tollgate-reason", reason)],
+        Json(json!({"type": "error", "error": {"type": kind, "message": message}})),
+    )
+        .into_response()
+}
+
+/// Map an [`Outcome`] to a native Anthropic response: the upstream body verbatim
+/// on success, Anthropic's error envelope on refusal.
+fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
+    use crate::gateway::Outcome;
+    match outcome {
+        Outcome::Allowed {
+            status,
+            body,
+            cost_micros,
+            overhead_micros,
+            ..
+        } => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            [
+                ("x-tollgate-cost", format_micros(cost_micros)),
+                ("x-tollgate-overhead-us", overhead_micros.to_string()),
+            ],
+            Json(body),
+        )
+            .into_response(),
+        Outcome::Unauthenticated => anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid or missing API key",
+        ),
+        Outcome::BadRequest(m) => {
+            anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
+        }
+        Outcome::Unpriced { provider, model } => anthropic_error_reason(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unpriced",
+            &format!("no price configured for {provider}/{model}"),
+        ),
+        Outcome::BudgetDenied(d) => anthropic_error(
+            StatusCode::PAYMENT_REQUIRED,
+            "permission_error",
+            &format!(
+                "budget exhausted: {} of {} spent",
+                format_micros(d.spent_micros),
+                format_micros(d.limit_micros)
+            ),
+        ),
+        Outcome::BackendError(_) => anthropic_error_reason(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "backend_error",
+            "gateway backend unavailable",
+        ),
+        Outcome::Upstream(_) => {
+            anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error")
+        }
+    }
+}
+
 /// OpenAI-compatible Chat Completions endpoint. Routes to the `openai` provider
 /// (which fronts Vertex's OpenAI endpoint or a custom upstream) through the same
 /// reserve-then-settle enforcement, and returns the upstream's OpenAI body
 /// verbatim so OpenAI clients, LiteLLM, and ADK agents work unchanged.
+///
+/// Streaming (`stream: true`) is dispatched to [`openai_chat_stream`], which
+/// relays the upstream SSE and meters usage from the terminal chunk. Buffered
+/// requests run the shared [`GatewayCore::evaluate`] flow unchanged.
 async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    // Peek whether the client asked for streaming. A body that does not parse is
+    // treated as non-streaming so the buffered path returns a proper OpenAI error
+    // envelope (rather than opening an event-stream for a malformed request).
+    let wants_stream = serde_json::from_str::<Value>(&body)
+        .map(|v| stream_requested(&v))
+        .unwrap_or(false);
+    if wants_stream {
+        return openai_chat_stream(state, headers, body).await;
+    }
     let core = state.core.load_full();
     let outcome = core
         .evaluate("openai", "chat/completions", &headers, &body)
         .await;
     openai_outcome_response(outcome)
+}
+
+/// Streaming path for `/v1/messages`.
+///
+/// Mirrors the OpenAI streaming path, with two deliberate differences.
+///
+/// Exact admission is HONOURED here rather than refused. The OpenAI path refuses
+/// it because that adapter has no real token counter and would silently fall back
+/// to the estimate. Anthropic has `count_tokens`, on the same body that gets
+/// forwarded, so refusing would punish exactly the operators who chose strictness.
+///
+/// Metering uses the Anthropic meter, not the OpenAI one, because Anthropic's
+/// usage is not terminal: `message_start` carries a placeholder `output_tokens:
+/// 1`, and an error event arrives on an otherwise-healthy 200 stream followed by
+/// a normal close. Treating transport EOF as success would settle a failed
+/// stream on one output token.
+async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
+    let started = Instant::now();
+    let core = state.core.load_full();
+    let Some(provider) = state.anthropic.clone() else {
+        return anthropic_error_reason(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "backend_error",
+            "anthropic upstream is not configured",
+        );
+    };
+
+    let Some(key_id) = core.authenticate(&headers).await else {
+        return anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid or missing API key",
+        );
+    };
+
+    let parsed = match provider.parse_streaming("messages", &body) {
+        Ok(p) => p,
+        Err(ProviderError::BadRequest(m)) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m);
+        }
+        Err(ProviderError::Upstream(_) | ProviderError::MeteringFailed(_)) => {
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error");
+        }
+    };
+
+    let Some(price) = core.prices.lookup("anthropic", &parsed.model).cloned() else {
+        record_stream_refusal(
+            &core,
+            &key_id,
+            "anthropic",
+            &parsed.model,
+            "unpriced",
+            started,
+            0,
+        )
+        .await;
+        return anthropic_error_reason(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "unpriced",
+            &format!("no price configured for anthropic/{}", parsed.model),
+        );
+    };
+
+    // Exact admission counts the SAME body that is forwarded, so reserved and
+    // enforced cannot drift.
+    //
+    // The count is a round trip to the provider, so its duration is PROVIDER
+    // time, not gateway overhead. Without subtracting it the console reports
+    // ~240ms of "Tollgate overhead" for what is almost entirely Anthropic,
+    // against ~4ms on the other paths.
+    let mut provider_micros: u128 = 0;
+    let input_tokens = if core.admission_exact {
+        let c0 = Instant::now();
+        let counted = provider
+            .count_input_tokens("messages", &body, &parsed)
+            .await;
+        provider_micros += c0.elapsed().as_micros();
+        match counted {
+            Ok(n) => n,
+            Err(e) => {
+                // Upstream, not backend: the count is a round trip to the
+                // provider. Matches the buffered path in `GatewayCore::evaluate`,
+                // including the split between a provider that REFUSED the count
+                // (the caller's body is wrong, 400) and one that could not answer
+                // (502).
+                // warn, not error: a `BadRequest` here is the caller's malformed
+                // body, and a client looping on its own bug must not fill the
+                // operator's error budget. The genuinely alarming cases, a
+                // rejected credential, are logged at ERROR by `count_refusal`.
+                tracing::warn!(error = %e.to_string(), "pre-flight token count failed");
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "error",
+                    started,
+                    provider_micros,
+                )
+                .await;
+                return match e {
+                    ProviderError::BadRequest(m) => {
+                        anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
+                    }
+                    _ => anthropic_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "pre-flight token count failed upstream",
+                    ),
+                };
+            }
+        }
+    } else {
+        parsed.estimated_input_tokens
+    };
+
+    let reserve_profile = provider.prompt_reserve_profile(&parsed);
+    let reserve_micros = price
+        .reserve_micros(input_tokens, parsed.max_output_tokens, reserve_profile)
+        .max(1);
+    // The prompt leg alone, for the one case where the provider tells us it
+    // generated nothing. Computed here while the parsed request is still in
+    // scope: it is moved into the settlement guard below.
+    let prompt_floor_micros = price
+        .reserve_micros(input_tokens, 0, reserve_profile)
+        .max(1);
+    let reservation = {
+        let ctx = RequestCtx {
+            key_id: &key_id,
+            provider: "anthropic",
+            model: &parsed.model,
+        };
+        match core.budgets.reserve(&ctx, reserve_micros).await {
+            Ok(r) => r,
+            Err(ReserveError::Denied(d)) => {
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "rejected_budget",
+                    started,
+                    provider_micros,
+                )
+                .await;
+                return anthropic_error(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "permission_error",
+                    &format!("budget exceeded: {d}"),
+                );
+            }
+            Err(ReserveError::Backend(m)) => {
+                tracing::error!(error = %m, "budget backend error on stream reserve");
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "anthropic",
+                    &parsed.model,
+                    "error",
+                    started,
+                    provider_micros,
+                )
+                .await;
+                return anthropic_error_reason(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "backend_error",
+                    "gateway temporarily unavailable",
+                );
+            }
+        }
+    };
+
+    // Admission path only, excluding the count round trip, matching how the
+    // buffered path defines overhead.
+    let overhead_micros = i64::try_from(
+        started
+            .elapsed()
+            .as_micros()
+            .saturating_sub(provider_micros),
+    )
+    .unwrap_or(i64::MAX);
+    let guard = Settlement::new(
+        &core,
+        reservation,
+        reserve_micros,
+        key_id,
+        "anthropic".to_owned(),
+        parsed.model,
+        overhead_micros,
+    );
+
+    let upstream = match provider.forward_stream(&body).await {
+        Ok(r) => r,
+        Err(ProviderError::MeteringFailed(m)) => {
+            // Possibly billed; charge the reservation rather than releasing.
+            tracing::error!(detail = %m, "anthropic stream may have been billed but not metered");
+            guard
+                .settle(reserve_micros, Usage::default(), "estimated")
+                .await;
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error");
+        }
+        Err(e) => {
+            tracing::warn!(detail = %e.to_string(), "anthropic stream upstream error");
+            guard.settle(0, Usage::default(), "error").await;
+            return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error");
+        }
+    };
+
+    let up_status = upstream.status();
+    if !up_status.is_success() {
+        guard.settle(0, Usage::default(), "error").await;
+        return anthropic_error(up_status, "api_error", "upstream provider error");
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    tokio::spawn(relay_stream(
+        upstream,
+        tx,
+        guard,
+        price,
+        reserve_micros,
+        prompt_floor_micros,
+        StreamMeter::Anthropic {
+            line_buf: Vec::new(),
+            meter: crate::providers::AnthropicStreamMeter::new(),
+        },
+    ));
+
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+/// Streaming path for `/v1/chat/completions`. Authenticates, prices, and reserves
+/// the worst case up front (fast admission), opens the upstream SSE stream, then
+/// spawns [`relay_stream`] to pass chunks through to the client while metering
+/// usage from the terminal chunk. Settlement is owned by a [`Settlement`]
+/// guard that charges the observed cost on a clean finish and the FULL reservation
+/// on any abnormal end (client/upstream disconnect, idle/duration timeout, panic),
+/// so a stream is never under-charged.
+async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
+    let started = Instant::now();
+    let core = state.core.load_full();
+    let Some(provider) = state.openai.clone() else {
+        // The endpoint is registered even when the openai upstream is disabled;
+        // without a handle there is nothing to stream to.
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_error",
+            "openai upstream is not configured",
+        );
+    };
+
+    // Exact admission reserves against a real pre-flight token count, but the
+    // OpenAI adapter has no exact counter (it would silently fall back to the fast
+    // estimate, under-reserving on token-dense input). Rather than downgrade
+    // silently, refuse streaming under exact admission (fail closed). The buffered
+    // path stays available; fast admission is the supported streaming mode.
+    if core.admission_exact {
+        return openai_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported",
+            "streaming is not supported under exact admission; use fast admission or the \
+             non-streaming endpoint",
+        );
+    }
+
+    let Some(key_id) = core.authenticate(&headers).await else {
+        return openai_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "invalid or missing API key",
+        );
+    };
+
+    let parsed = match provider.parse_streaming("chat/completions", &body) {
+        Ok(p) => p,
+        Err(ProviderError::BadRequest(m)) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                &format!("invalid request: {m}"),
+            );
+        }
+        // Pre-reservation, so nothing can have been billed on either variant.
+        Err(ProviderError::Upstream(_) | ProviderError::MeteringFailed(_)) => {
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream provider error",
+            );
+        }
+    };
+
+    let Some(price) = core.prices.lookup("openai", &parsed.model).cloned() else {
+        record_stream_refusal(
+            &core,
+            &key_id,
+            "openai",
+            &parsed.model,
+            "unpriced",
+            started,
+            0,
+        )
+        .await;
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "unpriced",
+            &format!("no price configured for openai/{}", parsed.model),
+        );
+    };
+
+    // Reserve the worst case (estimated input + capped output), floored to 1 micro
+    // so nothing meters as zero. build_payload pins the outbound max_tokens to the
+    // same cap, so the upstream cannot generate past what we reserved.
+    // Uses the same helper as the buffered path in gateway::evaluate, so the two
+    // reservations cannot drift apart. The OpenAI adapter cannot report cache
+    // writes, so the prompt leg does not carry the write rate here.
+    let reserve_micros = price
+        .reserve_micros(
+            parsed.estimated_input_tokens,
+            parsed.max_output_tokens,
+            provider.prompt_reserve_profile(&parsed),
+        )
+        .max(1);
+    let reservation = {
+        let ctx = RequestCtx {
+            key_id: &key_id,
+            provider: "openai",
+            model: &parsed.model,
+        };
+        match core.budgets.reserve(&ctx, reserve_micros).await {
+            Ok(r) => r,
+            Err(ReserveError::Denied(d)) => {
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    "openai",
+                    &parsed.model,
+                    "rejected_budget",
+                    started,
+                    0,
+                )
+                .await;
+                return openai_error(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "budget_exceeded",
+                    &format!("budget exceeded: {d}"),
+                );
+            }
+            Err(ReserveError::Backend(m)) => {
+                tracing::error!(error = %m, "budget backend error on stream reserve");
+                record_stream_refusal(&core, &key_id, "openai", &parsed.model, "error", started, 0)
+                    .await;
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "backend_error",
+                    "gateway temporarily unavailable",
+                );
+            }
+        }
+    };
+
+    // Overhead = admission path only (everything before the upstream call), matching
+    // the buffered path's definition. Build the settlement guard now: from here on,
+    // every exit settles the reservation exactly once (Drop covers panic/cancel).
+    let overhead_micros = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let guard = Settlement::new(
+        &core,
+        reservation,
+        reserve_micros,
+        key_id,
+        "openai".to_owned(),
+        parsed.model,
+        overhead_micros,
+    );
+
+    // Open the upstream stream. A connection failure means the provider never
+    // billed, so settle to zero (parity with the buffered forward-error path).
+    let upstream = match provider.forward_stream(&body).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(detail = %e.to_string(), "openai stream upstream error");
+            guard.settle(0, Usage::default(), "error").await;
+            return openai_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                "upstream provider error",
+            );
+        }
+    };
+
+    // A non-2xx upstream is an error page, not an SSE stream: do not relay it.
+    // Charge zero (not billed) and pass the status through with a generic body so
+    // no upstream detail (GCP project/region/host) leaks to the client.
+    // reqwest and axum both re-export `http::StatusCode`, so the upstream status
+    // passes straight through (generic body only: no upstream detail leaks).
+    let up_status = upstream.status();
+    if !up_status.is_success() {
+        guard.settle(0, Usage::default(), "error").await;
+        return openai_error(up_status, "upstream_error", "upstream provider error");
+    }
+
+    // Relay: bounded channel gives natural backpressure (a slow client throttles
+    // upstream reads). The spawned task owns the guard and settles at its single
+    // exit point.
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    tokio::spawn(relay_stream(
+        upstream,
+        tx,
+        guard,
+        price,
+        reserve_micros,
+        // Unused on this path: the OpenAI meter has no pre-generation signal, so
+        // every abnormal end charges the full reservation.
+        reserve_micros,
+        StreamMeter::OpenAi {
+            line_buf: Vec::new(),
+            // The SAME semantics the buffered path uses for this upstream. If
+            // these ever diverge, a caller picks the cheaper metering by
+            // setting stream:true.
+            semantics: provider.cache_semantics(),
+            seen: None,
+        },
+    ));
+
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+/// Relay upstream SSE chunks to the client while metering usage. Runs to a single
+/// exit point that settles the [`Settlement`] guard: observed cost on a
+/// clean finish with a terminal usage chunk, otherwise the FULL reservation (never
+/// under-charge). Enforces an idle timeout, a max total duration, and a bounded
+/// line-reassembly buffer so a hostile or hung upstream cannot grief the gateway.
+async fn relay_stream(
+    upstream: reqwest::Response,
+    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    guard: Settlement,
+    price: ModelPrice,
+    reserve_micros: i64,
+    // Cost of the reserved PROMPT leg alone, for the one case where a provider
+    // tells us it generated nothing. Computed by the caller, which is where the
+    // input token count is known.
+    prompt_floor_micros: i64,
+    mut meter: StreamMeter,
+) {
+    let mut stream = upstream.bytes_stream();
+    let mut transport_eof = false;
+    let deadline = tokio::time::Instant::now() + STREAM_MAX_DURATION;
+
+    loop {
+        let wait_until = (tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT).min(deadline);
+        match tokio::time::timeout_at(wait_until, stream.next()).await {
+            // Idle timeout or max-duration hit: abnormal end.
+            Err(_) => {
+                tracing::warn!("stream aborted: idle timeout or max duration exceeded");
+                break;
+            }
+            // Upstream finished normally.
+            Ok(None) => {
+                transport_eof = true;
+                break;
+            }
+            // Upstream stream error: abnormal end.
+            Ok(Some(Err(e))) => {
+                tracing::warn!(detail = %e.to_string(), "stream upstream error mid-body");
+                break;
+            }
+            Ok(Some(Ok(chunk))) => {
+                meter.observe(&chunk);
+                // Nothing billable follows Anthropic's message_stop, so exit
+                // there rather than holding the upstream connection and the
+                // reservation open until the idle timeout fires.
+                let finished = meter.finished();
+                // Relay downstream, bounded by the SAME idle/duration deadline as
+                // the upstream read: a client that stops reading fills the bounded
+                // channel and would otherwise park this task (and hold the
+                // reservation and upstream connection) indefinitely. On send error
+                // (client gone) or timeout, end abnormally and charge the full
+                // reservation.
+                match tokio::time::timeout_at(wait_until, tx.send(Ok(chunk))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        tracing::debug!("stream client disconnected");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "stream aborted: client too slow to drain (idle/max duration)"
+                        );
+                        break;
+                    }
+                }
+                if finished {
+                    transport_eof = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let clean = meter.is_clean(transport_eof);
+    let seen_usage = meter.usage();
+    if clean && seen_usage.is_none() {
+        tracing::warn!("stream ended cleanly without any usage; charging reservation");
+    }
+    // Anthropic delivers `overloaded_error` as an event on an otherwise-200
+    // stream, BEFORE message_start, so nothing was generated and nothing billed.
+    // Charging the full worst-case reservation there is punitive, and SDK
+    // retries multiply it through an overload window, so charge the reserved
+    // PROMPT leg instead.
+    //
+    // Strictly Anthropic-only, and that restriction is load-bearing. On the
+    // OpenAI path `started` can only become true when the TERMINAL usage chunk
+    // arrives, so a client that reads an entire response and then disconnects
+    // before that chunk looks identical to one that never started. Applying
+    // this branch there would hand out a full generation for the price of the
+    // prompt, on demand and repeatably. Every other abnormal end charges the
+    // full reservation.
+    let (actual, usage, decision) = choose_settlement(
+        &meter,
+        clean,
+        seen_usage,
+        &price,
+        reserve_micros,
+        prompt_floor_micros,
+    );
+    guard.settle(actual, usage, decision).await;
+}
+
+/// Per-provider stream metering, so the relay stays protocol-agnostic.
+///
+/// The two protocols disagree about what "finished" means, and getting that
+/// wrong is a silent under-charge. OpenAI's usage arrives in a terminal chunk,
+/// so transport EOF is a fair proxy for completion. Anthropic's does not:
+/// `message_start` carries a placeholder `output_tokens: 1`, an error event
+/// arrives on an otherwise-healthy 200 stream and is followed by a normal close,
+/// and nothing billable follows `message_stop`.
+pub enum StreamMeter {
+    OpenAi {
+        line_buf: Vec<u8>,
+        semantics: CacheSemantics,
+        seen: Option<Usage>,
+    },
+    Anthropic {
+        line_buf: Vec<u8>,
+        meter: crate::providers::AnthropicStreamMeter,
+    },
+}
+
+impl StreamMeter {
+    fn observe(&mut self, chunk: &[u8]) {
+        match self {
+            Self::OpenAi {
+                line_buf,
+                semantics,
+                seen,
+            } => {
+                if let Some(u) = scan_sse_for_usage(line_buf, chunk, *semantics) {
+                    *seen = Some(u);
+                }
+            }
+            Self::Anthropic { line_buf, meter } => {
+                line_buf.extend_from_slice(chunk);
+                while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = line_buf.drain(..=pos).collect();
+                    if let Ok(s) = std::str::from_utf8(&line) {
+                        meter.observe_line(s.trim_end());
+                    }
+                }
+                if line_buf.len() > MAX_SSE_LINE_BUFFER {
+                    line_buf.clear();
+                }
+            }
+        }
+    }
+
+    /// Whether the stream genuinely completed. `transport_eof` is only a proxy,
+    /// and only a sound one for OpenAI.
+    fn is_clean(&self, transport_eof: bool) -> bool {
+        match self {
+            Self::OpenAi { .. } => transport_eof,
+            Self::Anthropic { meter, .. } => meter.is_clean(),
+        }
+    }
+
+    /// Whether the relay can stop reading now. Only Anthropic has an explicit
+    /// terminal event; OpenAI is finished when the transport says so.
+    fn finished(&self) -> bool {
+        match self {
+            Self::OpenAi { .. } => false,
+            Self::Anthropic { meter, .. } => meter.is_clean(),
+        }
+    }
+
+    // No `started()` here on purpose. It existed to feed the prompt-leg
+    // discount, and having it at this level is what made that discount
+    // applicable to OpenAI, where "started" cannot be distinguished from "client
+    // disconnected before the terminal usage chunk". `choose_settlement` now
+    // reaches the Anthropic meter directly, so the discount cannot be spread to
+    // a provider that has no pre-generation signal.
+
+    fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::OpenAi { seen, .. } => *seen,
+            Self::Anthropic { meter, .. } => meter.usage(),
+        }
+    }
+}
+
+/// Append a chunk to the SSE line-reassembly buffer and return the usage from the
+/// most recent complete `data:` line that carried one (usage can arrive split
+/// across chunk boundaries). Complete lines are drained; a partial line longer
+/// than [`MAX_SSE_LINE_BUFFER`] is dropped so a newline-starved upstream cannot
+/// grow the buffer without bound (worst case: the usage chunk is missed and the
+/// caller settles the full reservation).
+///
+/// `semantics` must be the upstream's, matching what the buffered path uses.
+fn scan_sse_for_usage(
+    line_buf: &mut Vec<u8>,
+    chunk: &[u8],
+    semantics: CacheSemantics,
+) -> Option<Usage> {
+    line_buf.extend_from_slice(chunk);
+    let mut found = None;
+    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = line_buf.drain(..=pos).collect();
+        if let Ok(s) = std::str::from_utf8(&line) {
+            if let Some(u) = usage_from_sse_data(s.trim_end(), semantics) {
+                found = Some(u);
+            }
+        }
+    }
+    if line_buf.len() > MAX_SSE_LINE_BUFFER {
+        line_buf.clear();
+    }
+    found
+}
+
+/// Decide how to settle a finished stream. A clean finish with a metered terminal
+/// chunk charges the observed cost (floored to 1 micro). A clean finish with no
+/// usage chunk, or ANY abnormal end (disconnect, upstream error, idle/duration
+/// timeout), charges the FULL reservation so a stream is never under-charged.
+/// Pick the settlement for a finished relay.
+///
+/// Extracted as a pure function so the discount path is testable. It previously
+/// lived inline in `relay_stream`, which meant the branch that BYPASSES
+/// `stream_settlement` had no coverage at all: the regression test for it
+/// exercised `stream_settlement` and would have passed against the bug.
+fn choose_settlement(
+    meter: &StreamMeter,
+    clean: bool,
+    seen: Option<Usage>,
+    price: &ModelPrice,
+    reserve_micros: i64,
+    prompt_floor_micros: i64,
+) -> (i64, Usage, &'static str) {
+    // Anthropic delivers `overloaded_error` as an event on an otherwise-200
+    // stream, before message_start, so nothing was generated and nothing billed.
+    // Charging the full worst-case reservation there is punitive, and SDK
+    // retries multiply it through an overload window, so charge the prompt leg.
+    //
+    // Three conditions, all load-bearing:
+    //
+    // - Anthropic only. On the OpenAI path `started` can only become true when
+    //   the TERMINAL usage chunk arrives, so a client that reads a whole
+    //   response then disconnects looks identical to one that never started.
+    // - Nothing started.
+    // - The provider EXPLICITLY errored. Without this, any 200 that is not an
+    //   SSE stream at all (an upstream ignoring `stream`, a proxy rewriting the
+    //   response) is relayed to the client in full and then discounted, because
+    //   it contains neither message_start nor message_stop.
+    if let StreamMeter::Anthropic { meter: m, .. } = meter {
+        if !clean && !m.started() && m.errored() {
+            tracing::warn!(
+                "anthropic stream reported an error before generating anything; \
+                 charging the prompt leg"
+            );
+            return (
+                prompt_floor_micros.min(reserve_micros).max(1),
+                Usage::default(),
+                "estimated",
+            );
+        }
+    }
+    stream_settlement(clean, seen, price, reserve_micros)
+}
+
+fn stream_settlement(
+    clean: bool,
+    seen: Option<Usage>,
+    price: &ModelPrice,
+    reserve_micros: i64,
+) -> (i64, Usage, &'static str) {
+    match (clean, seen) {
+        // An implausible count is a metering FAILURE, not an expensive stream.
+        // Costing it saturates to i64::MAX, which the budget counter has no path
+        // back down from, and the ledger row it writes overflows SUM(cost_micros)
+        // on every later startup reconcile. The buffered path already guards
+        // this; the terminal usage chunk is the same untrusted input, and it
+        // reaches this function through a client-selected code path, so a caller
+        // could otherwise pick the unguarded one by setting stream:true.
+        (_, Some(usage)) if usage.is_untrustworthy() => {
+            tracing::error!(
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                suspect = usage.suspect,
+                "stream usage is implausible or self-contradictory; charging the reservation"
+            );
+            (reserve_micros, Usage::default(), "estimated")
+        }
+        // Measured: the only branch that costs what the provider reported.
+        (true, Some(usage)) => {
+            // Same visibility as the buffered path. Streams are the bulk of real
+            // traffic, so warning only in `evaluate` would leave the gap
+            // invisible for most requests, which defeats the point of a default
+            // that reports the gap rather than guessing at it.
+            if price
+                .long_context
+                .is_unpriced_long_context(usage.threshold_prompt_tokens())
+            {
+                tracing::warn!(
+                    provider = %price.provider,
+                    model = %price.model,
+                    prompt_tokens = usage.threshold_prompt_tokens(),
+                    classes_overlap = usage.classes_overlap,
+                    "streamed prompt exceeds the long-context threshold and no tier is \
+                     configured for this model; if it re-rates long requests, this is an \
+                     UNDER-charge. Set it with `admin price set --long-context-threshold \
+                     --long-context-input-permille --long-context-output-permille`"
+                );
+            }
+            (price.cost_micros(usage).max(1), usage, "allowed")
+        }
+        // The remaining branches all charge the RESERVATION, so they are
+        // `estimated`, not `allowed` or `error`. Streams are the bulk of real
+        // traffic, and mislabelling them here would make the console's
+        // measured-versus-estimated split wrong for most of a period, which is
+        // exactly the figure an operator reconciles against a provider invoice.
+        (true, None) => (reserve_micros, Usage::default(), "estimated"),
+        (false, usage) => (reserve_micros, usage.unwrap_or_default(), "estimated"),
+    }
 }
 
 fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Response {
@@ -507,8 +1710,12 @@ async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> R
 struct UsageRow {
     provider: String,
     model: String,
+    /// FRESH prompt tokens only. Cached tokens are carried separately, so this
+    /// is not the whole prompt: see `total_prompt_tokens` in the JSON payload.
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     cost_micros: i64,
     gateway_micros: i64,
     decision: String,
@@ -523,10 +1730,10 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
         return unauthorized();
     }
     let rows = sqlx::query_as::<_, UsageRow>(
-        "SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
-                decision \
-         FROM (SELECT provider, model, input_tokens, output_tokens, cost_micros, gateway_micros, \
-                      decision, started_at \
+        "SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, \
+                cache_write_tokens, cost_micros, gateway_micros, decision \
+         FROM (SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, \
+                      cache_write_tokens, cost_micros, gateway_micros, decision, started_at \
                FROM usage_events ORDER BY started_at DESC LIMIT 100) recent \
          ORDER BY started_at ASC",
     )
@@ -551,6 +1758,14 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
                 "model": r.model,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "cache_write_tokens": r.cache_write_tokens,
+                // input_tokens counts FRESH prompt tokens only, so on a cached
+                // request it can be a tiny number sitting next to a large cost.
+                // This is the figure to divide cost by.
+                "total_prompt_tokens": r.input_tokens
+                    + r.cache_read_tokens
+                    + r.cache_write_tokens,
                 "cost": format_micros(r.cost_micros),
                 "overhead_us": r.gateway_micros,
                 "decision": r.decision,
@@ -558,27 +1773,94 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
         })
         .collect();
     let total: i64 = rows.iter().map(|r| r.cost_micros).sum();
+    // Split measured from assumed. Rows charged at their reservation because
+    // usage could not be trusted are recorded as `estimated`, and an operator
+    // reconciling against a provider invoice needs to know how much of a period
+    // that represents rather than discovering it in a variance review.
+    let estimated: i64 = rows
+        .iter()
+        .filter(|r| r.decision == "estimated")
+        .map(|r| r.cost_micros)
+        .sum();
     Json(json!({
         "events": events,
         "total_cost": format_micros(total),
+        "measured_cost": format_micros(total - estimated),
+        "estimated_cost": format_micros(estimated),
         "count": rows.len(),
     }))
     .into_response()
 }
 
-/// Minimal Prometheus endpoint. Per-request counters are added with a metrics
-/// layer in a later change; the ledger in Postgres is the system of record.
-async fn metrics() -> impl IntoResponse {
+/// Prometheus exposition.
+///
+/// Everything here is read from process memory. A scrape deliberately does not
+/// touch Postgres or Valkey: putting the observability path on the same
+/// dependencies as the money path means an outage takes away the instrument you
+/// would use to see it. The consequence is that budget SPEND is not exported,
+/// because the authoritative figures live in those two stores. `/console/usage`
+/// and `/console/budgets` serve that, and they are honest about querying.
+///
+/// Counters are process-lifetime and reset on restart, which is what Prometheus
+/// expects. `tollgate_budget_limit_micros` is a gauge read from the live config,
+/// so it follows a hot-reloaded budget change without a restart.
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    use std::fmt::Write as _;
+
+    let core = state.core.load_full();
+    let m = &core.metrics;
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+
+    let mut body = String::with_capacity(1024);
+    body.push_str(
+        "# HELP tollgate_up 1 if the gateway is serving.\n\
+         # TYPE tollgate_up gauge\n\
+         tollgate_up 1\n\
+         # HELP tollgate_requests_total Terminal request decisions since start.\n\
+         # TYPE tollgate_requests_total counter\n",
+    );
+    for (decision, value) in [
+        ("allowed", load(&m.allowed)),
+        ("estimated", load(&m.estimated)),
+        ("rejected_budget", load(&m.rejected_budget)),
+        ("unpriced", load(&m.unpriced)),
+        ("error", load(&m.errors)),
+        ("unauthenticated", load(&m.unauthenticated)),
+    ] {
+        let _ = writeln!(
+            body,
+            "tollgate_requests_total{{decision=\"{decision}\"}} {value}"
+        );
+    }
+    let _ = write!(
+        body,
+        "# HELP tollgate_cost_micros_total Settled cost since start, in currency micros.\n\
+         # TYPE tollgate_cost_micros_total counter\n\
+         tollgate_cost_micros_total {}\n\
+         # HELP tollgate_budget_limit_micros Configured limit per budget.\n\
+         # TYPE tollgate_budget_limit_micros gauge\n",
+        load(&m.cost_micros),
+    );
+    for b in state.budgets.load_full().iter() {
+        // Scope and period as labels, so a dashboard can show one budget's
+        // ceiling next to the spend the console reports for it.
+        let _ = writeln!(
+            body,
+            "tollgate_budget_limit_micros{{scope=\"{}\",period=\"{}\",hard_stop=\"{}\"}} {}",
+            b.scope,
+            b.period.as_str(),
+            b.hard_stop,
+            b.limit_micros,
+        );
+    }
+
     (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        "# HELP tollgate_up 1 if the gateway is serving.\n\
-         # TYPE tollgate_up gauge\n\
-         tollgate_up 1\n"
-            .to_owned(),
+        body,
     )
 }
 
@@ -614,4 +1896,284 @@ async fn shutdown_signal(grace: Duration) {
 
     // Allow in-flight requests a window to drain.
     tokio::time::sleep(grace).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `x-tollgate-reason` is what an operator alerts on, so it must mean the
+    /// same thing on every route. It did not: the Anthropic path emitted the
+    /// SDK's error kind, so a budget refusal on `/v1/messages` reported
+    /// `permission_error` while the same refusal on `/v1/chat/completions`
+    /// reported `budget_exceeded`. An alert keyed on the latter silently missed
+    /// every Claude refusal.
+    ///
+    /// The body keeps Anthropic's vocabulary, because the SDK maps it to an
+    /// exception class. Only the header is shared.
+    #[tokio::test]
+    async fn the_refusal_reason_header_is_the_same_word_on_every_route() {
+        use crate::budget::BudgetDenied;
+
+        let denied = || {
+            crate::gateway::Outcome::BudgetDenied(BudgetDenied {
+                scope: "api_key:x".to_owned(),
+                period: "monthly",
+                limit_micros: 1_000,
+                spent_micros: 1_000,
+                cost_micros: 1,
+            })
+        };
+        let unpriced = || crate::gateway::Outcome::Unpriced {
+            provider: "anthropic".to_owned(),
+            model: "m".to_owned(),
+        };
+        let reason = |r: &Response| {
+            r.headers()
+                .get("x-tollgate-reason")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<missing>")
+                .to_owned()
+        };
+
+        // Every refusal, on every one of the three response shapes: the native
+        // Anthropic envelope, the OpenAI envelope, and the legacy enveloped
+        // route. A route that sets the header on some refusals and not others is
+        // worse than one that never sets it, because the alert built on it looks
+        // like it covers the deployment.
+        /// One refusal: a label, the reason every route must report for it, and
+        /// a way to make a fresh `Outcome` (the response mappers consume it, so
+        /// each of the three routes needs its own).
+        type Case = (&'static str, &'static str, fn() -> crate::gateway::Outcome);
+
+        let cases: Vec<Case> = vec![
+            ("unauthenticated", "unauthenticated", || {
+                crate::gateway::Outcome::Unauthenticated
+            }),
+            ("bad request", "bad_request", || {
+                crate::gateway::Outcome::BadRequest("nope".to_owned())
+            }),
+            ("unpriced", "unpriced", unpriced),
+            ("budget", "budget_exceeded", denied),
+            ("backend", "backend_error", || {
+                crate::gateway::Outcome::BackendError("valkey down".to_owned())
+            }),
+            ("upstream", "upstream_error", || {
+                crate::gateway::Outcome::Upstream("502 from provider".to_owned())
+            }),
+        ];
+
+        for (label, want, make) in cases {
+            for (route, got) in [
+                ("/v1/messages", reason(&anthropic_outcome_response(make()))),
+                (
+                    "/v1/chat/completions",
+                    reason(&openai_outcome_response(make())),
+                ),
+                (
+                    "/v1/{provider}/{path}",
+                    reason(&crate::gateway::outcome_response(make())),
+                ),
+            ] {
+                assert_eq!(got, want, "{label} refusal on {route}");
+            }
+        }
+
+        // The BODY must not follow the header. An SDK resolves its exception
+        // class from `error.type`, so unifying that too would be a breaking
+        // change dressed up as consistency.
+        let body = axum::body::to_bytes(anthropic_outcome_response(denied()).into_body(), 65_536)
+            .await
+            .expect("body reads");
+        let v: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            v["error"]["type"], "permission_error",
+            "the Anthropic body must keep Anthropic's vocabulary"
+        );
+    }
+
+    #[test]
+    fn scan_sse_detects_usage_split_across_chunk_boundaries() {
+        let mut buf = Vec::new();
+        // The terminal usage line arrives split across two upstream chunks with no
+        // newline in the first: no usage yet, buffer holds the partial.
+        assert!(
+            scan_sse_for_usage(
+                &mut buf,
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens",
+                CacheSemantics::Inclusive
+            )
+            .is_none()
+        );
+        let u = scan_sse_for_usage(
+            &mut buf,
+            b"\":5,\"completion_tokens\":2}}\n",
+            CacheSemantics::Inclusive,
+        )
+        .unwrap();
+        assert_eq!(u.input_tokens, 5);
+        assert_eq!(u.output_tokens, 2);
+        assert!(buf.is_empty(), "completed line should be drained");
+    }
+
+    #[test]
+    fn scan_sse_ignores_deltas_done_and_bounds_the_buffer() {
+        let mut buf = Vec::new();
+        let sem = CacheSemantics::Inclusive;
+        assert!(
+            scan_sse_for_usage(&mut buf, b"data: {\"choices\":[{\"delta\":{}}]}\n", sem).is_none()
+        );
+        assert!(scan_sse_for_usage(&mut buf, b"data: [DONE]\n", sem).is_none());
+        assert!(buf.is_empty());
+        // A single line larger than the cap with no newline is dropped, so a
+        // newline-starved upstream cannot grow the buffer without bound.
+        let big = vec![b'x'; MAX_SSE_LINE_BUFFER + 10];
+        assert!(scan_sse_for_usage(&mut buf, &big, sem).is_none());
+        assert!(buf.is_empty(), "oversized partial line must be dropped");
+    }
+
+    #[test]
+    fn stream_settlement_never_undercharges() {
+        // $1 per million tokens on both legs => 1 micro/token.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let reserve = 999;
+
+        // Clean finish with usage: charge the observed cost (15 tokens => 15 micros).
+        let (actual, _u, decision) =
+            stream_settlement(true, Some(Usage::new(10, 5)), &price, reserve);
+        assert_eq!(actual, 15);
+        assert_eq!(decision, "allowed");
+
+        // Clean finish, no usage chunk: charge the full reservation, not zero,
+        // and label it estimated because nothing was measured.
+        let (actual, _u, decision) = stream_settlement(true, None, &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "estimated");
+
+        // Abnormal end (even with partial usage seen): charge the full reservation.
+        let (actual, _u, decision) =
+            stream_settlement(false, Some(Usage::new(10, 5)), &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "estimated");
+    }
+
+    /// Drive the relay's settlement CHOICE, not just `stream_settlement`.
+    ///
+    /// The bypass bug lived in the arm that skips `stream_settlement` entirely,
+    /// so a test calling `stream_settlement` directly passed against it. These
+    /// go through `choose_settlement` with a real meter.
+    fn settle_via_meter(
+        meter: &StreamMeter,
+        clean: bool,
+        seen: Option<Usage>,
+    ) -> (i64, &'static str) {
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
+        let (actual, _u, decision) = choose_settlement(meter, clean, seen, &price, 999, 100);
+        (actual, decision)
+    }
+
+    fn anthropic_meter(lines: &[&str]) -> StreamMeter {
+        let mut m = crate::providers::AnthropicStreamMeter::new();
+        for l in lines {
+            m.observe_line(l);
+        }
+        StreamMeter::Anthropic {
+            line_buf: Vec::new(),
+            meter: m,
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_provider_error_earns_the_prompt_leg_discount() {
+        // The intended case: the provider said it failed before generating.
+        let errored =
+            anthropic_meter(&[r#"data: {"type":"error","error":{"type":"overloaded_error"}}"#]);
+        assert_eq!(settle_via_meter(&errored, false, None), (100, "estimated"));
+
+        // A 200 that is not an SSE stream at all: an upstream that ignored
+        // `stream`, or a proxy that rewrote the response. It has no
+        // message_start and no message_stop, exactly like the errored case, but
+        // the client was handed the whole body. Discounting it would give away
+        // the output leg on every request.
+        let not_a_stream =
+            anthropic_meter(&[r#"data: {"id":"msg_x","content":[{"text":"hello"}]}"#]);
+        assert_eq!(
+            settle_via_meter(&not_a_stream, false, None),
+            (999, "estimated")
+        );
+
+        // Nothing at all: connection died before a single complete line.
+        let silent = anthropic_meter(&[]);
+        assert_eq!(settle_via_meter(&silent, false, None), (999, "estimated"));
+
+        // Generation started, then failed: the provider did work, charge in full.
+        let started_then_died = anthropic_meter(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}"#,
+        ]);
+        assert_eq!(
+            settle_via_meter(&started_then_died, false, None),
+            (999, "estimated")
+        );
+    }
+
+    #[test]
+    fn the_prompt_leg_discount_never_applies_to_openai() {
+        // On the OpenAI path `started` only becomes true at the TERMINAL usage
+        // chunk, so a client that reads a full response then disconnects is
+        // indistinguishable from one that never started. Applying the discount
+        // there handed out a whole generation for a token of budget.
+        let openai = StreamMeter::OpenAi {
+            line_buf: Vec::new(),
+            semantics: crate::providers::CacheSemantics::Inclusive,
+            seen: None,
+        };
+        assert_eq!(settle_via_meter(&openai, false, None), (999, "estimated"));
+    }
+
+    #[test]
+    fn openai_stream_cut_before_the_usage_chunk_still_charges_the_reservation() {
+        // A client can read an entire response and disconnect before the
+        // terminal usage chunk. On the OpenAI path that is indistinguishable
+        // from a stream that never started, because `started` only becomes true
+        // when that chunk arrives.
+        //
+        // An earlier version applied Anthropic's "nothing was generated, charge
+        // the prompt leg" rule to both providers, which handed out a full
+        // generation for a token of budget, on demand and repeatably. Every
+        // abnormal end on this path charges the full reservation.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let reserve = 999;
+        let (actual, _u, decision) = stream_settlement(false, None, &price, reserve);
+        assert_eq!(
+            actual, reserve,
+            "a stream cut before its usage chunk must not be cheap"
+        );
+        assert_eq!(decision, "estimated");
+    }
+
+    #[test]
+    fn stream_settlement_rejects_an_implausible_terminal_chunk() {
+        // The buffered path guards this in gateway::evaluate. The streaming path
+        // is selected by the CLIENT (stream:true), so leaving it unguarded would
+        // let a caller pick the code path where a hostile terminal chunk
+        // saturates the cost to i64::MAX and pins a budget counter that nothing
+        // can lower. Charge the reservation and record an error instead.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let reserve = 999;
+        let absurd = Usage::new(1, u64::MAX);
+        assert!(absurd.is_implausible());
+
+        let (actual, usage, decision) = stream_settlement(true, Some(absurd), &price, reserve);
+        assert_eq!(actual, reserve);
+        assert_eq!(decision, "estimated");
+        // The ledger must not carry the absurd counts either: a row holding
+        // i64::MAX makes SUM(cost_micros) overflow on later reconciliation.
+        assert_eq!(usage, Usage::default());
+
+        // A clean stream just under the ceiling still settles normally.
+        let ok = Usage::new(1, crate::pricing::MAX_PLAUSIBLE_TOKENS_PER_LEG);
+        assert!(!ok.is_implausible());
+        let (_actual, _u, decision) = stream_settlement(true, Some(ok), &price, reserve);
+        assert_eq!(decision, "allowed");
+    }
 }

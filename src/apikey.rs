@@ -21,6 +21,10 @@
 //! a database leak alone cannot verify keys. argon2id is reserved for the future
 //! console's human-password login.
 
+// `Mac` carries `new_from_slice` on the 0.12 line (digest 0.10). The 0.13 line
+// moved it to a `KeyInit` that has to be imported separately, so this import is
+// the one thing that has to change if the crate generation moves. It is pinned
+// to 0.12 deliberately: see the comment on the dependency in Cargo.toml.
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
@@ -144,6 +148,29 @@ pub fn parse(key: &str) -> Result<(String, String), KeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_matches_the_rfc_4231_golden_vector() {
+        // RFC 4231 test case 2 for HMAC-SHA-256. This pins the EXACT on-disk
+        // format of `api_keys.key_hash` to the standard, independently of which
+        // hashing crates or crate versions are in the build.
+        //
+        // Its job is to survive dependency upgrades. sha2 and hmac generations
+        // are paired (sha2 0.11 wants digest 0.11, hmac 0.12 wants digest 0.10),
+        // so bumping one drags the other, and a wrong result there would not
+        // fail loudly: it would silently invalidate every key ever issued, and
+        // every operator would see total auth failure at once with no clue why.
+        let hasher = KeyHasher::new(b"Jefe".to_vec());
+        assert_eq!(
+            hasher.hash("what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Verification must accept it through the constant-time path too.
+        assert!(hasher.verify(
+            "what do ya want for nothing?",
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        ));
+    }
 
     #[test]
     fn generate_parse_verify_roundtrip() {
