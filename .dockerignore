@@ -12,5 +12,4 @@ compose/
 !Cargo.lock
 !src
 !migrations
-!assets
 !LICENSE
