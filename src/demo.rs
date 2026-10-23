@@ -369,6 +369,27 @@ fn router(state: Arc<DemoState>) -> Router {
         .with_state(state)
 }
 
+/// Opts the demo out of loopback-only binding, so it honours the IP in
+/// `TOLLGATE_HTTP__BIND`. Needed inside a container, where loopback is
+/// unreachable from the host; keep the published port on loopback there.
+const BIND_ALL_ENV: &str = "TOLLGATE_DEMO_BIND_ALL";
+
+/// `1` or `true` (any case) turns a flag on; anything else, or unset, leaves it off.
+fn env_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Where the demo listens. It preloads a printed key, so it binds LOOPBACK
+/// unless explicitly told otherwise; only the configured port is honoured.
+fn demo_bind(configured: SocketAddr, bind_all: bool) -> SocketAddr {
+    let ip = if bind_all {
+        configured.ip()
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    SocketAddr::new(ip, configured.port())
+}
+
 /// Boot the demo gateway: preload state, print instructions, serve.
 pub async fn serve(cfg: Config) -> Result<()> {
     let Preloaded {
@@ -376,29 +397,24 @@ pub async fn serve(cfg: Config) -> Result<()> {
         plaintext_key,
     } = preload();
 
-    // Demo binds LOOPBACK by default: it preloads a printed key and must never be
-    // exposed on all interfaces unless explicitly opted into (e.g. in container environments).
-    let allow_all = std::env::var("TOLLGATE_DEMO_ALLOW_ALL_INTERFACES")
-        .or_else(|_| std::env::var("TOLLGATE_DEMO_BIND_ALL"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let ip = if allow_all {
-        cfg.http.bind.ip()
-    } else {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    };
-    let bind = SocketAddr::new(ip, cfg.http.bind.port());
+    let bind = demo_bind(
+        cfg.http.bind,
+        env_flag(std::env::var(BIND_ALL_ENV).ok().as_deref()),
+    );
     let per_key = format_micros(state.per_key_limit_micros);
     let global = format_micros(state.global_limit_micros);
     let port = bind.port();
 
-    let loopback_note = if bind.ip().is_loopback() {
-        "  (loopback only)"
-    } else {
-        ""
-    };
     println!("\nTollgate demo (in-memory, no Postgres/Redis/creds)");
-    println!("Listening on http://{bind}{loopback_note}\n");
+    if bind.ip().is_loopback() {
+        println!("Listening on http://{bind}  (loopback only)\n");
+    } else {
+        println!("Listening on http://{bind}\n");
+        println!("WARNING: {BIND_ALL_ENV} is set and the demo is NOT on loopback. Anyone who");
+        println!("can reach this address can open /console, which hands out the demo key.");
+        println!("Only do this inside a container whose published port stays on loopback.\n");
+        tracing::warn!(addr = %bind, "demo bound beyond loopback via {BIND_ALL_ENV}");
+    }
     println!("Open the live console (budgets, spend, hard-stop):");
     println!("    http://localhost:{port}/console\n");
     println!("Demo API key (send as header  {KEY_HEADER}: <key>):");
@@ -433,6 +449,28 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn demo_binds_loopback_unless_bind_all_is_set() {
+        let all: SocketAddr = "0.0.0.0:9000".parse().unwrap();
+        assert_eq!(demo_bind(all, false), "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(demo_bind(all, true), all);
+
+        let lan: SocketAddr = "192.168.1.5:9000".parse().unwrap();
+        assert_eq!(demo_bind(lan, false), "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(demo_bind(lan, true), lan);
+    }
+
+    #[test]
+    fn bind_all_flag_only_accepts_explicit_true() {
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(env_flag(Some(on)), "{on}");
+        }
+        for off in ["", "0", "false", "yes", "on", " true"] {
+            assert!(!env_flag(Some(off)), "{off:?}");
+        }
+        assert!(!env_flag(None));
+    }
 
     #[tokio::test]
     async fn admin_and_gateway_require_a_valid_key() {

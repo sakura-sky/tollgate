@@ -149,16 +149,6 @@ async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
-    let db = crate::db::build_pool(&cfg.database).await?;
-    // Opt-in (compose / local dev): apply migrations before the schema check
-    // below, which would otherwise refuse to start against a fresh database.
-    if cfg.database.auto_migrate {
-        tracing::info!("running database migrations");
-        crate::db::run_migrations(&db).await?;
-    }
-    ensure_schema_current(&db).await?;
-    let redis = build_redis(&cfg.redis.url).await?;
-
     // Fail closed at boot on a fallback multiple that would price an unpriced
     // cache class below the model's own input rate. That is the same fail-open
     // the nullable rate columns exist to prevent, just moved into config.
@@ -167,8 +157,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid billing config: {e}"))?;
 
-    // Load budget config and prices from Postgres into the core.
-    let budgets = load_budgets(&db).await.context("loading budgets")?;
     let long_context = cfg.billing.long_context_tier();
     long_context
         .validate()
@@ -194,15 +182,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
         );
     }
 
-    let prices = load_prices(&db, cache_fallback, long_context)
-        .await
-        .context("loading model prices")?;
-    tracing::info!(
-        budgets = budgets.len(),
-        priced_models = prices.len(),
-        "loaded budget and price config"
-    );
-
     // Fail closed at boot on a missing/weak pepper. Starting with an ephemeral
     // pepper would make every already-issued key fail to verify while the
     // service still reported healthy: a silent, total auth outage.
@@ -218,6 +197,32 @@ pub async fn serve(cfg: Config) -> Result<()> {
              set a real secret before starting"
         );
     }
+
+    let db = crate::db::build_pool(&cfg.database).await?;
+    // DEV ONLY (the compose stack): apply migrations at boot. It runs after the
+    // config checks above, so a misconfigured process never touches the schema.
+    // Production keeps migrations an explicit `admin migrate` step, and the
+    // schema check below still guards it.
+    if cfg.database.auto_migrate {
+        tracing::warn!(
+            "TOLLGATE_DATABASE__AUTO_MIGRATE is set: applying migrations at boot (dev only)"
+        );
+        crate::db::run_migrations(&db).await?;
+    }
+    ensure_schema_current(&db).await?;
+    let redis = build_redis(&cfg.redis.url).await?;
+
+    // Load budget config and prices from Postgres into the core.
+    let budgets = load_budgets(&db).await.context("loading budgets")?;
+    let prices = load_prices(&db, cache_fallback, long_context)
+        .await
+        .context("loading model prices")?;
+    tracing::info!(
+        budgets = budgets.len(),
+        priced_models = prices.len(),
+        "loaded budget and price config"
+    );
+
     let hasher = KeyHasher::new(cfg.security.api_key_pepper.clone().into_bytes());
     let dummy_hash = hasher.hash("tollgate-fixed-dummy-secret");
 

@@ -243,6 +243,8 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
     #[serde(with = "humantime_serde")]
     pub acquire_timeout: Duration,
+    /// DEV ONLY: apply pending migrations when `serve` boots (the compose
+    /// stack sets it). Production runs `admin migrate` as an explicit step.
     #[serde(default)]
     pub auto_migrate: bool,
 }

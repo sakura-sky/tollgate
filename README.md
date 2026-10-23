@@ -100,15 +100,20 @@ The first few requests return `200` with a cost breakdown; once the budget is
 exhausted the gateway returns `402` **before the request reaches the provider**.
 Inspect spend with the console endpoints (which require the key):
 `curl -s -H "x-tollgate-key: <key>" localhost:8080/console/budgets` and
-`/console/usage`. The demo binds to loopback only. Or run the whole narrated
-sequence at once:
+`/console/usage`. The demo binds to loopback only, because `/console` hands out
+the demo key. Inside a container loopback is unreachable from the host, so
+`TOLLGATE_DEMO_BIND_ALL=1` makes it honour the IP in `TOLLGATE_HTTP__BIND`
+instead and prints a warning banner; publish that container's port on
+`127.0.0.1` only. Or run the whole narrated sequence at once:
 
 ```bash
 ./scripts/demo.sh
 ```
 
 That script binds port 8088 rather than the 8080 `cargo run -- demo` uses, so it
-can run beside a gateway already holding 8080.
+can run beside a gateway already holding 8080. Without cargo (or with
+`USE_DOCKER=1`) it builds the image and runs the demo in Docker, published on
+`127.0.0.1:8088`.
 
 ### Pointing Google ADK at Tollgate
 
@@ -214,6 +219,19 @@ cargo run --bin tollgate -- serve
 curl -s http://localhost:8080/healthz | jq
 curl -s http://localhost:8080/readyz  | jq
 ```
+
+To run the gateway in Docker instead of steps 3 and 4, after step 2:
+
+```bash
+docker compose -f compose/docker-compose.yaml --profile app up -d --build
+```
+
+The `tollgate` service sits behind the `app` profile, so step 1 still starts
+only the dependencies. It reads `.env`, overrides the database and Valkey URLs to
+the compose service names, publishes on `127.0.0.1:8080`, and sets
+`TOLLGATE_DATABASE__AUTO_MIGRATE=true` so it boots on a fresh volume. That
+setting is for local dev only: in production keep `admin migrate` an explicit
+step.
 
 ## Monitoring
 
