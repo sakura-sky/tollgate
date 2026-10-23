@@ -9,19 +9,35 @@
 # the spend ledger. No Postgres, Redis, or cloud credentials needed.
 #
 # Usage:  ./scripts/demo.sh
+#         USE_DOCKER=1 ./scripts/demo.sh   # run in Docker (the default without cargo)
 set -euo pipefail
 
 PORT="${PORT:-8088}"
 REQUESTS="${REQUESTS:-5}"
 BODY='{"model":"demo","prompt":"hello tollgate","max_output_tokens":1000}'
 
-echo "Building tollgate..."
-cargo build --quiet
+if command -v cargo >/dev/null 2>&1 && [ "${USE_DOCKER:-0}" != "1" ]; then
+  echo "Building tollgate with cargo..."
+  cargo build --quiet
 
-echo "Starting demo server on 127.0.0.1:${PORT} ..."
-TOLLGATE_HTTP__BIND="127.0.0.1:${PORT}" cargo run --quiet -- demo >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err &
-SERVER_PID=$!
-trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+  echo "Starting demo server on 127.0.0.1:${PORT} ..."
+  TOLLGATE_HTTP__BIND="127.0.0.1:${PORT}" cargo run --quiet -- demo >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err &
+  SERVER_PID=$!
+  trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+else
+  echo "cargo not found (or USE_DOCKER=1); running with Docker..."
+  docker build -q -t tollgate:demo . >/dev/null
+  echo "Starting demo container on 127.0.0.1:${PORT} ..."
+  CONTAINER_NAME="tollgate-demo-${PORT}"
+  docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  # The demo must bind 0.0.0.0 inside the container to be reachable at all, but
+  # /console hands out the demo key, so the host side stays on loopback.
+  docker run -d --name "${CONTAINER_NAME}" -p "127.0.0.1:${PORT}:${PORT}" \
+    -e TOLLGATE_DEMO_BIND_ALL=true \
+    -e TOLLGATE_HTTP__BIND="0.0.0.0:${PORT}" \
+    tollgate:demo demo >/dev/null
+  trap 'docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true' EXIT
+fi
 
 # Wait for it to come up.
 for _ in $(seq 1 30); do
@@ -29,8 +45,12 @@ for _ in $(seq 1 30); do
   sleep 0.3
 done
 
+if [ -z "${SERVER_PID:-}" ]; then
+  docker logs "${CONTAINER_NAME}" >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err
+fi
+
 echo
-sed -n '1,20p' /tmp/tollgate-demo.out
+sed -n '1,24p' /tmp/tollgate-demo.out
 KEY="$(grep -oE 'tgk_[0-9a-f]+_[0-9a-f]+' /tmp/tollgate-demo.out | head -1)"
 
 echo

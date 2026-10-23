@@ -3,6 +3,10 @@
 #
 # Local development dependencies. Run from the repo root:
 #   docker compose -f compose/docker-compose.yaml up -d
+#
+# That starts Postgres and Valkey only. To run Tollgate itself in the stack as
+# well (needs a .env with a real pepper first, see the README):
+#   docker compose -f compose/docker-compose.yaml --profile app up -d --build
 
 services:
   postgres:
@@ -45,6 +49,36 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Opt-in via the `app` profile, so a plain `up -d` stays dependencies-only and
+  # this does not crash-loop before .env exists.
+  tollgate:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: tollgate-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    env_file:
+      - path: ../.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      - TOLLGATE_HTTP__BIND=0.0.0.0:8080
+      - TOLLGATE_DATABASE__URL=postgres://tollgate:tollgate@postgres:5432/tollgate
+      # Dev only: apply migrations at boot so the stack starts on a fresh volume.
+      - TOLLGATE_DATABASE__AUTO_MIGRATE=true
+      - TOLLGATE_REDIS__URL=redis://valkey:6379
+    ports:
+      # Loopback only, like the dependencies above. The container binds 0.0.0.0
+      # so the port can be published at all; the host side stays private.
+      - "127.0.0.1:8080:8080"
 
 volumes:
   tollgate_pg_data:
