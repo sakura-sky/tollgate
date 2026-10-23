@@ -105,7 +105,7 @@ hex = "0.4"
 # 0.32 line: the batch exporter no longer takes a runtime, so no rt-tokio feature.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.33"
 
 [dev-dependencies]
