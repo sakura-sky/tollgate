@@ -150,6 +150,12 @@ async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
 
 pub async fn serve(cfg: Config) -> Result<()> {
     let db = crate::db::build_pool(&cfg.database).await?;
+    // Opt-in (compose / local dev): apply migrations before the schema check
+    // below, which would otherwise refuse to start against a fresh database.
+    if cfg.database.auto_migrate {
+        tracing::info!("running database migrations");
+        crate::db::run_migrations(&db).await?;
+    }
     ensure_schema_current(&db).await?;
     let redis = build_redis(&cfg.redis.url).await?;
 

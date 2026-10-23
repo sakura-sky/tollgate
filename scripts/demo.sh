@@ -15,19 +15,36 @@ PORT="${PORT:-8088}"
 REQUESTS="${REQUESTS:-5}"
 BODY='{"model":"demo","prompt":"hello tollgate","max_output_tokens":1000}'
 
-echo "Building tollgate..."
-cargo build --quiet
+if command -v cargo >/dev/null 2>&1 && [ "${USE_DOCKER:-0}" != "1" ]; then
+  echo "Building tollgate with cargo..."
+  cargo build --quiet
 
-echo "Starting demo server on 127.0.0.1:${PORT} ..."
-TOLLGATE_HTTP__BIND="127.0.0.1:${PORT}" cargo run --quiet -- demo >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err &
-SERVER_PID=$!
-trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+  echo "Starting demo server on 127.0.0.1:${PORT} ..."
+  TOLLGATE_HTTP__BIND="127.0.0.1:${PORT}" cargo run --quiet -- demo >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err &
+  SERVER_PID=$!
+  trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+else
+  echo "cargo not found (or USE_DOCKER=1); running with Docker..."
+  docker build -q -t tollgate:demo . >/dev/null
+  echo "Starting demo container on port ${PORT} ..."
+  CONTAINER_NAME="tollgate-demo-${PORT}"
+  docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  docker run -d --name "${CONTAINER_NAME}" -p "${PORT}:${PORT}" \
+    -e TOLLGATE_DEMO_BIND_ALL=true \
+    -e TOLLGATE_HTTP__BIND="0.0.0.0:${PORT}" \
+    tollgate:demo demo >/dev/null
+  trap 'docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true' EXIT
+fi
 
 # Wait for it to come up.
 for _ in $(seq 1 30); do
   curl -sf "localhost:${PORT}/healthz" >/dev/null 2>&1 && break
   sleep 0.3
 done
+
+if [ -z "${SERVER_PID:-}" ]; then
+  docker logs "${CONTAINER_NAME}" >/tmp/tollgate-demo.out 2>/tmp/tollgate-demo.err
+fi
 
 echo
 sed -n '1,20p' /tmp/tollgate-demo.out

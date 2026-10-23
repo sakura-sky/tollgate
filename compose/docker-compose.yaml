@@ -46,6 +46,30 @@ services:
       timeout: 3s
       retries: 10
 
+  tollgate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: tollgate-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    env_file:
+      - path: ../.env
+        required: false
+      - path: .env
+        required: false
+    environment:
+      - TOLLGATE_HTTP__BIND=0.0.0.0:8080
+      - TOLLGATE_DATABASE__URL=postgres://tollgate:tollgate@postgres:5432/tollgate
+      - TOLLGATE_DATABASE__AUTO_MIGRATE=true
+      - TOLLGATE_REDIS__URL=redis://valkey:6379
+    ports:
+      - "8080:8080"
+
 volumes:
   tollgate_pg_data:
   tollgate_valkey_data:

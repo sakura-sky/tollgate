@@ -376,15 +376,29 @@ pub async fn serve(cfg: Config) -> Result<()> {
         plaintext_key,
     } = preload();
 
-    // Demo binds LOOPBACK only: it preloads a printed key and must never be
-    // exposed on all interfaces. Only the configured port is honoured.
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cfg.http.bind.port());
+    // Demo binds LOOPBACK by default: it preloads a printed key and must never be
+    // exposed on all interfaces unless explicitly opted into (e.g. in container environments).
+    let allow_all = std::env::var("TOLLGATE_DEMO_ALLOW_ALL_INTERFACES")
+        .or_else(|_| std::env::var("TOLLGATE_DEMO_BIND_ALL"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let ip = if allow_all {
+        cfg.http.bind.ip()
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    let bind = SocketAddr::new(ip, cfg.http.bind.port());
     let per_key = format_micros(state.per_key_limit_micros);
     let global = format_micros(state.global_limit_micros);
     let port = bind.port();
 
+    let loopback_note = if bind.ip().is_loopback() {
+        "  (loopback only)"
+    } else {
+        ""
+    };
     println!("\nTollgate demo (in-memory, no Postgres/Redis/creds)");
-    println!("Listening on http://{bind}  (loopback only)\n");
+    println!("Listening on http://{bind}{loopback_note}\n");
     println!("Open the live console (budgets, spend, hard-stop):");
     println!("    http://localhost:{port}/console\n");
     println!("Demo API key (send as header  {KEY_HEADER}: <key>):");
