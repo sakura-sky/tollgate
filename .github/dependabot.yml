@@ -8,6 +8,30 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # Held back with update-types, not version ranges. For cargo, Dependabot
+    # treats a 0.y bump (0.12 -> 0.13) as major, and update-types rules do not
+    # apply to security updates, so these rules never block a security update.
+    # A `versions` range would. Dependabot only checks the direct copy of a
+    # crate for advisories, so RUSTSEC coverage for the transitive rand 0.9/0.10
+    # copies comes from the cargo-audit job in CI.
+    ignore:
+      # hmac/sha2 stay on the digest generation sqlx already pulls in, so the
+      # binary carries one SHA-256 (CHANGELOG v0.2.3). Move them with sqlx.
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
+      # rand generates API keys (src/apikey.rs) and its API changed in 0.9 and
+      # 0.10. Upgrade it as a deliberate, reviewed code change.
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major"]
+    groups:
+      # These must move to a new 0.y together: tracing-opentelemetry 0.34
+      # requires opentelemetry 0.33, so bumping one alone fails to build.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
