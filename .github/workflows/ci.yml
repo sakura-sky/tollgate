@@ -25,19 +25,22 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# TODO: pin third-party actions by full commit SHA, not by tag.
+# All actions are pinned by full commit SHA, not by tag.
 #
 # A tag is mutable. Whoever controls the action's repository, or anyone who
-# takes over that account, can repoint `@v5` at different code, and that code
+# takes over that account, can repoint a tag at different code, and that code
 # runs on our runner with our workflow token and our cache. A SHA cannot be
-# repointed. The tags below are kept only because pinning needs the real
-# digests, which have to be read from the upstream repositories.
+# repointed. When bumping a pin by hand, check the commit is on the upstream
+# repository's own history: GitHub also resolves SHAs that exist only in forks.
 #
-# Pins go in as `uses: owner/action@<40-hex sha>  # v5.0.0`, with the version
-# in a trailing comment so the pin is still readable. Dependabot's
-# github-actions ecosystem is already enabled in .github/dependabot.yml and it
-# updates SHA pins and their comments automatically, so this costs nothing to
-# maintain once done.
+# Pins are written as `uses: owner/action@<40-hex sha>  # vX.Y.Z`, with the
+# version in a trailing comment so the pin stays readable. Dependabot's
+# github-actions ecosystem (.github/dependabot.yml) proposes updates to them.
+#
+# Pinning covers the actions only. Still taken by tag or version range: the
+# container images (valkey/valkey:8-alpine below, and fsfe/reuse:6, which
+# fsfe/reuse-action's Dockerfile builds FROM), the runner image
+# (ubuntu-latest), the Rust toolchains, and cargo-audit's version range.
 jobs:
   rust:
     name: fmt / clippy / test
@@ -46,7 +49,7 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Nothing here pushes, comments or clones a second repository, so the
           # token has no reason to survive in .git/config where every later
@@ -60,7 +63,7 @@ jobs:
           rustup default 1.88
           rustc --version
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -95,7 +98,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -104,7 +107,7 @@ jobs:
           rustup toolchain install 1.88 --profile minimal
           rustup default 1.88
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
 
       # Single-threaded: these tests share one server and assert on absolute
       # counter values, so running them concurrently makes them read each
@@ -141,10 +144,10 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: fsfe/reuse-action@v6
+      - uses: fsfe/reuse-action@676e2d560c9a403aa252096d99fcab3e1132b0f5  # v6.0.0
 
   audit:
     name: cargo audit (advisories)
@@ -152,12 +155,12 @@ jobs:
     # for.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
       - name: Install Rust (stable, for the audit tool)
         run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
       # this directory, but the audit tool itself should build on current stable.
       #
