@@ -6,9 +6,9 @@
 //!
 //! `tollgate demo` boots the shared [`GatewayCore`] with in-memory backends and
 //! the built-in mock provider, preloads one API key and two budgets, and serves
-//! on loopback. It demonstrates the whole value loop (authenticate, price by
-//! tokens, reserve, forward, meter, settle, and hard-stop before overspend) end
-//! to end. Production wires the same core to Postgres + Redis/Valkey.
+//! on loopback by default (`TOLLGATE_DEMO_BIND_ALL` opts out, for containers).
+//! It demonstrates the whole value loop (authenticate, price by tokens,
+//! reserve, forward, meter, settle, and hard-stop before overspend) end to end. Production wires the same core to Postgres + Redis/Valkey.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -42,7 +42,8 @@ pub struct DemoState {
     per_key_limit_micros: i64,
     global_limit_micros: i64,
     // Demo only: the preloaded plaintext key, used to seed the console so it
-    // connects on load. The demo binds loopback and already prints this key.
+    // connects on load. The demo prints this key and binds loopback unless
+    // TOLLGATE_DEMO_BIND_ALL is set (a container, with the published port kept on loopback).
     demo_plaintext_key: String,
 }
 

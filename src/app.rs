@@ -115,8 +115,9 @@ impl CoreParts {
 
 /// Refuse to serve against a database that is behind this binary.
 ///
-/// Migrations are applied by an explicit `admin migrate`, so a deploy can easily
-/// start a new binary against an old schema. That failure is silent and
+/// Migrations are applied by an explicit `admin migrate` (outside the dev-only
+/// `auto_migrate` boot option), so a deploy can easily start a new binary
+/// against an old schema. That failure is silent and
 /// dangerous rather than loud: the usage sink is best-effort and logs-and-drops
 /// on error, so every ledger row would vanish while Valkey counters kept
 /// enforcing and everything looked healthy. A later cache flush then rebuilds
@@ -198,6 +199,68 @@ pub async fn serve(cfg: Config) -> Result<()> {
         );
     }
 
+    // Provider, admission and Redis URL checks need no I/O, so they run before
+    // the database is touched: a misconfigured process never reaches the schema.
+    if cfg.providers.openai.enabled {
+        let oc = &cfg.providers.openai;
+        match oc.upstream.as_str() {
+            "vertex" => {
+                if cfg.providers.vertex.project.is_empty()
+                    || cfg.providers.vertex.location.is_empty()
+                {
+                    anyhow::bail!(
+                        "OpenAI endpoint with upstream=vertex requires \
+                         TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
+                    );
+                }
+            }
+            "custom" => {
+                // An empty key would make the adapter fall back to the GCP
+                // metadata token and send it to the custom host: refuse.
+                if oc.base_url.is_empty() || oc.api_key.is_empty() {
+                    anyhow::bail!(
+                        "OpenAI endpoint with upstream=custom requires \
+                         TOLLGATE_PROVIDERS__OPENAI__BASE_URL and __API_KEY"
+                    );
+                }
+                // Anthropic's OpenAI-compatible endpoint reports NO prompt-cache
+                // tokens: its token-details fields are documented as always
+                // empty and caching is unsupported there. Pointing the OpenAI
+                // adapter at it would silently under-count every cached Claude
+                // request, and no tripwire on our side can detect data the
+                // upstream never sends. Use /v1/messages instead.
+                //
+                // A host compare, so it is a lint rather than a guarantee: it
+                // cannot see a CNAME, an egress proxy, or a gateway fronting
+                // Anthropic. It catches the obvious mistake.
+                if let Some(host) = reqwest::Url::parse(&oc.base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_lowercase()))
+                {
+                    if host == "anthropic.com" || host.ends_with(".anthropic.com") {
+                        anyhow::bail!(
+                            "refusing to use {host} as an OpenAI-compatible upstream: that \
+                             endpoint reports no prompt-cache tokens, so every cached request \
+                             would be silently under-counted. Enable the anthropic provider \
+                             and use /v1/messages instead."
+                        );
+                    }
+                }
+            }
+            other => anyhow::bail!(
+                "TOLLGATE_PROVIDERS__OPENAI__UPSTREAM must be 'vertex' or 'custom' (got {other:?})"
+            ),
+        }
+    }
+    let admission_mode = cfg.providers.admission.to_ascii_lowercase();
+    if admission_mode != "fast" && admission_mode != "exact" {
+        anyhow::bail!(
+            "TOLLGATE_PROVIDERS__ADMISSION must be 'fast' or 'exact' (got {:?})",
+            cfg.providers.admission
+        );
+    }
+    let redis_client = redis::Client::open(cfg.redis.url.as_str()).context("parsing Redis URL")?;
+
     let db = crate::db::build_pool(&cfg.database).await?;
     // DEV ONLY (the compose stack): apply migrations at boot. It runs after the
     // config checks above, so a misconfigured process never touches the schema.
@@ -210,7 +273,9 @@ pub async fn serve(cfg: Config) -> Result<()> {
         crate::db::run_migrations(&db).await?;
     }
     ensure_schema_current(&db).await?;
-    let redis = build_redis(&cfg.redis.url).await?;
+    let redis = ConnectionManager::new(redis_client)
+        .await
+        .context("connecting to Redis")?;
 
     // Load budget config and prices from Postgres into the core.
     let budgets = load_budgets(&db).await.context("loading budgets")?;
@@ -295,14 +360,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
         let oc = &cfg.providers.openai;
         let p = match oc.upstream.as_str() {
             "vertex" => {
-                if cfg.providers.vertex.project.is_empty()
-                    || cfg.providers.vertex.location.is_empty()
-                {
-                    anyhow::bail!(
-                        "OpenAI endpoint with upstream=vertex requires \
-                         TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
-                    );
-                }
                 crate::providers::OpenAiProvider::vertex(
                     http.clone(),
                     stream_http.clone(),
@@ -312,37 +369,6 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 )
             }
             "custom" => {
-                // An empty key would make the adapter fall back to the GCP
-                // metadata token and send it to the custom host: refuse.
-                if oc.base_url.is_empty() || oc.api_key.is_empty() {
-                    anyhow::bail!(
-                        "OpenAI endpoint with upstream=custom requires \
-                         TOLLGATE_PROVIDERS__OPENAI__BASE_URL and __API_KEY"
-                    );
-                }
-                // Anthropic's OpenAI-compatible endpoint reports NO prompt-cache
-                // tokens: its token-details fields are documented as always
-                // empty and caching is unsupported there. Pointing the OpenAI
-                // adapter at it would silently under-count every cached Claude
-                // request, and no tripwire on our side can detect data the
-                // upstream never sends. Use /v1/messages instead.
-                //
-                // A host compare, so it is a lint rather than a guarantee: it
-                // cannot see a CNAME, an egress proxy, or a gateway fronting
-                // Anthropic. It catches the obvious mistake.
-                if let Some(host) = reqwest::Url::parse(&oc.base_url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_lowercase()))
-                {
-                    if host == "anthropic.com" || host.ends_with(".anthropic.com") {
-                        anyhow::bail!(
-                            "refusing to use {host} as an OpenAI-compatible upstream: that \
-                             endpoint reports no prompt-cache tokens, so every cached request \
-                             would be silently under-counted. Enable the anthropic provider \
-                             and use /v1/messages instead."
-                        );
-                    }
-                }
                 crate::providers::OpenAiProvider::custom(
                     http.clone(),
                     stream_http.clone(),
@@ -350,22 +376,14 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     oc.api_key.clone(),
                 )
             }
-            other => anyhow::bail!(
-                "TOLLGATE_PROVIDERS__OPENAI__UPSTREAM must be 'vertex' or 'custom' (got {other:?})"
-            ),
+            // Validated before the database is touched; see the pre-flight checks.
+            _ => unreachable!("openai upstream validated at boot"),
         };
         let arc = Arc::new(p);
         providers.insert("openai".to_owned(), arc.clone() as Arc<dyn Provider>);
         openai_handle = Some(arc);
     }
-    let admission = cfg.providers.admission.to_ascii_lowercase();
-    if admission != "fast" && admission != "exact" {
-        anyhow::bail!(
-            "TOLLGATE_PROVIDERS__ADMISSION must be 'fast' or 'exact' (got {:?})",
-            cfg.providers.admission
-        );
-    }
-    let admission_exact = admission == "exact";
+    let admission_exact = admission_mode == "exact";
     tracing::info!(
         providers = providers.len(),
         admission = %cfg.providers.admission,
@@ -1873,13 +1891,6 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         )],
         body,
     )
-}
-
-async fn build_redis(url: &str) -> Result<ConnectionManager> {
-    let client = redis::Client::open(url).context("parsing Redis URL")?;
-    ConnectionManager::new(client)
-        .await
-        .context("connecting to Redis")
 }
 
 async fn shutdown_signal(grace: Duration) {
