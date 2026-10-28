@@ -359,23 +359,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
     if cfg.providers.openai.enabled {
         let oc = &cfg.providers.openai;
         let p = match oc.upstream.as_str() {
-            "vertex" => {
-                crate::providers::OpenAiProvider::vertex(
-                    http.clone(),
-                    stream_http.clone(),
-                    &cfg.providers.vertex.project,
-                    &cfg.providers.vertex.location,
-                    cfg.providers.vertex.access_token.clone(),
-                )
-            }
-            "custom" => {
-                crate::providers::OpenAiProvider::custom(
-                    http.clone(),
-                    stream_http.clone(),
-                    oc.base_url.clone(),
-                    oc.api_key.clone(),
-                )
-            }
+            "vertex" => crate::providers::OpenAiProvider::vertex(
+                http.clone(),
+                stream_http.clone(),
+                &cfg.providers.vertex.project,
+                &cfg.providers.vertex.location,
+                cfg.providers.vertex.access_token.clone(),
+            ),
+            "custom" => crate::providers::OpenAiProvider::custom(
+                http.clone(),
+                stream_http.clone(),
+                oc.base_url.clone(),
+                oc.api_key.clone(),
+            ),
             // Validated before the database is touched; see the pre-flight checks.
             _ => unreachable!("openai upstream validated at boot"),
         };
