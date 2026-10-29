@@ -17,10 +17,10 @@ Notable changes per release.
   nothing crash-loops before `.env` exists. It publishes on `127.0.0.1:8080`, like
   the dependencies.
 - `TOLLGATE_DATABASE__AUTO_MIGRATE` (default off, dev only): `serve` applies
-  pending migrations at boot, after all config checks (billing, pepper, providers,
-  admission mode, Redis URL), so a misconfigured process never touches the
-  schema. The compose `app` profile sets
-  it. Production should keep running `admin migrate` explicitly.
+  pending migrations at boot, after all config checks (billing, pepper, the
+  OpenAI-compatible upstream, admission mode, Redis URL), so a misconfigured
+  process never touches the schema. The compose `app` profile sets it.
+  Production should keep running `admin migrate` explicitly.
 - `TOLLGATE_DEMO_BIND_ALL`: `tollgate demo` honours the IP in
   `TOLLGATE_HTTP__BIND` instead of forcing loopback, which a container needs. It
   prints a warning banner whenever the demo is not on loopback.
@@ -29,9 +29,10 @@ Notable changes per release.
 
 ### Changed
 
-- `serve` now validates the billing config and the API-key pepper before it
-  connects to Postgres or Valkey, so a config mistake is reported as such rather
-  than behind a connection error.
+- `serve` now validates the billing config, the API-key pepper, the
+  OpenAI-compatible upstream settings, the admission mode and the Redis URL
+  before it connects to Postgres or Valkey, so a config mistake is reported as
+  such rather than behind a connection error.
 
 ## v0.2.3
 
