@@ -8,7 +8,8 @@
 //! the built-in mock provider, preloads one API key and two budgets, and serves
 //! on loopback by default (`TOLLGATE_DEMO_BIND_ALL` opts out, for containers).
 //! It demonstrates the whole value loop (authenticate, price by tokens,
-//! reserve, forward, meter, settle, and hard-stop before overspend) end to end. Production wires the same core to Postgres + Redis/Valkey.
+//! reserve, forward, meter, settle, and hard-stop before overspend) end to
+//! end. Production wires the same core to Postgres + Redis/Valkey.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

@@ -261,6 +261,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
     }
     let redis_client = redis::Client::open(cfg.redis.url.as_str()).context("parsing Redis URL")?;
 
+    // Every check that can fail on config alone goes above this line; the test
+    // `config_errors_are_reported_before_postgres_is_touched` pins the order.
     let db = crate::db::build_pool(&cfg.database).await?;
     // DEV ONLY (the compose stack): apply migrations at boot. It runs after the
     // config checks above, so a misconfigured process never touches the schema.
@@ -1919,6 +1921,126 @@ async fn shutdown_signal(grace: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `serve` must report a config mistake before it touches Postgres. With
+    /// `TOLLGATE_DATABASE__AUTO_MIGRATE` on, a check that runs after the pool is
+    /// built would let a misconfigured process migrate the schema and then exit.
+    ///
+    /// The database URL points at a port nothing listens on, so if any of these
+    /// checks moved below `build_pool`, the error would be the connection
+    /// failure instead. The control case proves that: with valid config, the
+    /// connection failure is exactly what comes back.
+    #[tokio::test]
+    async fn config_errors_are_reported_before_postgres_is_touched() {
+        fn base() -> Config {
+            let mut cfg = Config::default();
+            cfg.security.api_key_pepper = "test-pepper-not-the-dev-placeholder".to_owned();
+            cfg.database.url = "postgres://tollgate:tollgate@127.0.0.1:1/tollgate".to_owned();
+            cfg.database.acquire_timeout = Duration::from_secs(2);
+            // The configuration this ordering exists to protect.
+            cfg.database.auto_migrate = true;
+            cfg
+        }
+        async fn boot_error(cfg: Config) -> String {
+            let err = serve(cfg)
+                .await
+                .expect_err("serve must not start without a database");
+            format!("{err:#}")
+        }
+
+        let msg = boot_error(base()).await;
+        assert!(msg.contains("connecting to Postgres"), "control: {msg}");
+
+        type Case = (&'static str, &'static str, fn(&mut Config));
+        let cases: [Case; 11] = [
+            ("short pepper", "at least 16 bytes", |c| {
+                c.security.api_key_pepper = "short".to_owned();
+            }),
+            ("placeholder pepper", ".env.example placeholder", |c| {
+                c.security.api_key_pepper = crate::config::DEV_PLACEHOLDER_PEPPER.to_owned();
+            }),
+            (
+                "cache fallback below 1x",
+                "cache_read_fallback_permille is 999",
+                |c| {
+                    c.billing.cache_read_fallback_permille = 999;
+                },
+            ),
+            (
+                "long-context multiple below 1x",
+                "long_context_multiple_permille is 999",
+                |c| {
+                    c.billing.long_context_multiple_permille = 999;
+                },
+            ),
+            (
+                "stranded long-context uplift",
+                "__LONG_CONTEXT_THRESHOLD_TOKENS is 0",
+                |c| {
+                    c.billing.long_context_threshold_tokens = 0;
+                    c.billing.long_context_multiple_permille = 2_000;
+                },
+            ),
+            (
+                "unknown openai upstream",
+                "UPSTREAM must be 'vertex' or 'custom'",
+                |c| {
+                    c.providers.openai.enabled = true;
+                    c.providers.openai.upstream = "bogus".to_owned();
+                },
+            ),
+            (
+                "vertex upstream without project",
+                "requires TOLLGATE_PROVIDERS__VERTEX__PROJECT",
+                |c| {
+                    c.providers.openai.enabled = true;
+                    c.providers.openai.upstream = "vertex".to_owned();
+                    c.providers.vertex.project = String::new();
+                },
+            ),
+            (
+                "custom upstream without key",
+                "requires TOLLGATE_PROVIDERS__OPENAI__BASE_URL",
+                |c| {
+                    c.providers.openai.enabled = true;
+                    c.providers.openai.upstream = "custom".to_owned();
+                    c.providers.openai.base_url = "https://upstream.example".to_owned();
+                    c.providers.openai.api_key = String::new();
+                },
+            ),
+            (
+                "custom upstream at anthropic.com",
+                "refusing to use api.anthropic.com",
+                |c| {
+                    c.providers.openai.enabled = true;
+                    c.providers.openai.upstream = "custom".to_owned();
+                    c.providers.openai.base_url = "https://api.anthropic.com/v1".to_owned();
+                    c.providers.openai.api_key = "k".to_owned();
+                },
+            ),
+            (
+                "unknown admission mode",
+                "ADMISSION must be 'fast' or 'exact'",
+                |c| {
+                    c.providers.admission = "slow".to_owned();
+                },
+            ),
+            ("non-redis URL scheme", "parsing Redis URL", |c| {
+                c.redis.url = "http://127.0.0.1:6379".to_owned();
+            }),
+        ];
+
+        for (label, want, break_it) in cases {
+            let mut cfg = base();
+            break_it(&mut cfg);
+            let msg = boot_error(cfg).await;
+            assert!(msg.contains(want), "{label}: expected {want:?}, got {msg}");
+            assert!(
+                !msg.contains("connecting to Postgres"),
+                "{label}: reached Postgres before the config check: {msg}"
+            );
+        }
+    }
 
     /// `x-tollgate-reason` is what an operator alerts on, so it must mean the
     /// same thing on every route. It did not: the Anthropic path emitted the

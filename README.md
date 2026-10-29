@@ -100,11 +100,11 @@ The first few requests return `200` with a cost breakdown; once the budget is
 exhausted the gateway returns `402` **before the request reaches the provider**.
 Inspect spend with the console endpoints (which require the key):
 `curl -s -H "x-tollgate-key: <key>" localhost:8080/console/budgets` and
-`/console/usage`. The demo binds to loopback only, because `/console` hands out
-the demo key. Inside a container loopback is unreachable from the host, so
-`TOLLGATE_DEMO_BIND_ALL=1` makes it honour the IP in `TOLLGATE_HTTP__BIND`
-instead and prints a warning banner; publish that container's port on
-`127.0.0.1` only. Or run the whole narrated sequence at once:
+`/console/usage`. The demo binds to loopback by default, because `/console`
+hands out the demo key. Inside a container loopback is unreachable from the
+host, so `TOLLGATE_DEMO_BIND_ALL=1` makes it honour the IP in
+`TOLLGATE_HTTP__BIND` instead and prints a warning banner; publish that
+container's port on `127.0.0.1` only. Or run the whole narrated sequence at once:
 
 ```bash
 ./scripts/demo.sh
