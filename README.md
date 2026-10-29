@@ -241,7 +241,7 @@ The gateway exposes standard operational endpoints for your SRE stack:
 - `GET /readyz` - readiness
 - `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, and `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` decision, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
 
-Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set.
+Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set. The endpoint must be `http://host:port` or `unix:///path`: export is plaintext gRPC with no TLS compiled in, so send traces to a local OpenTelemetry Collector and let it use TLS to your backend. Any other value is refused at startup, and an empty value disables export.
 
 ## Routes
 
