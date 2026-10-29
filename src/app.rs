@@ -149,6 +149,54 @@ async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Check the Vertex project and location before either is built into a URL.
+///
+/// Both are spliced into every Vertex request URL, and the location into the
+/// hostname (see `providers::vertex_host`), on requests that carry Tollgate's
+/// Google access token. A value containing `.`, `:`, `/`, `@`, `?` or `#` in the
+/// location, or `/`, `@`, `?` or `#` in the project, could move that request,
+/// token included, to another host or path, so anything outside the character
+/// sets Google uses is refused at boot.
+///
+/// Locations are lowercase letters, digits and inner hyphens (`us-central1`,
+/// `europe-west4`, `eu`, `global`). Projects are either a project number (all
+/// digits) or a project ID: lowercase letters, digits and hyphens starting with
+/// a letter, plus `.` and `:` for legacy domain-scoped IDs
+/// (`example.com:my-project`). Neither form can start with `.`, so neither can
+/// be a `.` or `..` path segment.
+fn validate_vertex_target(project: &str, location: &str) -> Result<()> {
+    if project.is_empty() || location.is_empty() {
+        anyhow::bail!(
+            "Vertex (TOLLGATE_PROVIDERS__VERTEX__ENABLED, or the OpenAI endpoint with \
+             upstream=vertex) requires TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
+        );
+    }
+    let location_ok = location
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !location.starts_with('-')
+        && !location.ends_with('-');
+    if !location_ok {
+        anyhow::bail!(
+            "TOLLGATE_PROVIDERS__VERTEX__LOCATION must be a Google Cloud location such as \
+             us-central1 or global (lowercase letters, digits and hyphens), got {location:?}"
+        );
+    }
+    let project_number = project.bytes().all(|b| b.is_ascii_digit());
+    let project_id = project.starts_with(|c: char| c.is_ascii_lowercase())
+        && project.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b':')
+        });
+    if !(project_number || project_id) {
+        anyhow::bail!(
+            "TOLLGATE_PROVIDERS__VERTEX__PROJECT must be a Google Cloud project number \
+             (all digits) or project ID (lowercase letters, digits and hyphens, starting \
+             with a letter; domain-scoped IDs may also contain . and :), got {project:?}"
+        );
+    }
+    Ok(())
+}
+
 pub async fn serve(cfg: Config) -> Result<()> {
     // Fail closed at boot on a fallback multiple that would price an unpriced
     // cache class below the model's own input rate. That is the same fail-open
@@ -201,19 +249,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     // Provider, admission and Redis URL checks need no I/O, so they run before
     // the database is touched: a misconfigured process never reaches the schema.
+    let vertex_in_use = cfg.providers.vertex.enabled
+        || (cfg.providers.openai.enabled && cfg.providers.openai.upstream == "vertex");
+    if vertex_in_use {
+        validate_vertex_target(
+            &cfg.providers.vertex.project,
+            &cfg.providers.vertex.location,
+        )?;
+    }
     if cfg.providers.openai.enabled {
         let oc = &cfg.providers.openai;
         match oc.upstream.as_str() {
-            "vertex" => {
-                if cfg.providers.vertex.project.is_empty()
-                    || cfg.providers.vertex.location.is_empty()
-                {
-                    anyhow::bail!(
-                        "OpenAI endpoint with upstream=vertex requires \
-                         TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION"
-                    );
-                }
-            }
+            // Project and location were validated above.
+            "vertex" => {}
             "custom" => {
                 // An empty key would make the adapter fall back to the GCP
                 // metadata token and send it to the custom host: refuse.
@@ -1922,6 +1970,61 @@ async fn shutdown_signal(grace: Duration) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn vertex_target_accepts_real_locations_project_ids_and_numbers() {
+        for (project, location) in [
+            ("my-project-123", "us-central1"),
+            ("my-project", "global"),
+            ("my-project", "europe-west4"),
+            ("my-project", "eu"),
+            ("123456789012", "us-central1"),
+            ("example.com:my-project", "asia-southeast1"),
+        ] {
+            assert!(
+                validate_vertex_target(project, location).is_ok(),
+                "{project:?} {location:?}"
+            );
+        }
+    }
+
+    /// The location becomes part of the hostname and both values part of the
+    /// path of a request carrying Tollgate's Google token, so anything that
+    /// could move it elsewhere is refused.
+    #[test]
+    fn vertex_target_refuses_values_that_could_redirect_the_request() {
+        for location in [
+            "",
+            "US-CENTRAL1",
+            "us-central1.evil.example",
+            "evil.example/x",
+            "x@evil.example",
+            "us-central1?",
+            "us-central1#",
+            "-us",
+            "us-",
+        ] {
+            assert!(
+                validate_vertex_target("my-project", location).is_err(),
+                "location {location:?}"
+            );
+        }
+        for project in [
+            "",
+            "p/x",
+            "p?x",
+            "p#x",
+            "p@x",
+            "1project",
+            "12/34",
+            "My-Project",
+        ] {
+            assert!(
+                validate_vertex_target(project, "us-central1").is_err(),
+                "project {project:?}"
+            );
+        }
+    }
+
     /// `serve` must report a config mistake before it touches Postgres. With
     /// `TOLLGATE_DATABASE__AUTO_MIGRATE` on, a check that runs after the pool is
     /// built would let a misconfigured process migrate the schema and then exit.
@@ -1952,7 +2055,7 @@ mod tests {
         assert!(msg.contains("connecting to Postgres"), "control: {msg}");
 
         type Case = (&'static str, &'static str, fn(&mut Config));
-        let cases: [Case; 11] = [
+        let cases: [Case; 14] = [
             ("short pepper", "at least 16 bytes", |c| {
                 c.security.api_key_pepper = "short".to_owned();
             }),
@@ -1996,6 +2099,31 @@ mod tests {
                     c.providers.openai.enabled = true;
                     c.providers.openai.upstream = "vertex".to_owned();
                     c.providers.vertex.project = String::new();
+                },
+            ),
+            (
+                "native vertex without project",
+                "requires TOLLGATE_PROVIDERS__VERTEX__PROJECT",
+                |c| {
+                    c.providers.vertex.enabled = true;
+                    c.providers.vertex.project = String::new();
+                },
+            ),
+            (
+                "vertex location that would change the host",
+                "TOLLGATE_PROVIDERS__VERTEX__LOCATION must be",
+                |c| {
+                    c.providers.vertex.enabled = true;
+                    c.providers.vertex.project = "my-project".to_owned();
+                    c.providers.vertex.location = "evil.example/x#".to_owned();
+                },
+            ),
+            (
+                "vertex project with a path separator",
+                "TOLLGATE_PROVIDERS__VERTEX__PROJECT must be",
+                |c| {
+                    c.providers.vertex.enabled = true;
+                    c.providers.vertex.project = "p/../x".to_owned();
                 },
             ),
             (

@@ -18,7 +18,8 @@ Notable changes per release.
   the dependencies.
 - `TOLLGATE_DATABASE__AUTO_MIGRATE` (default off, dev only): `serve` applies
   pending migrations at boot, after all config checks (billing, pepper, the
-  OpenAI-compatible upstream, admission mode, Redis URL), so a misconfigured
+  OpenAI-compatible upstream, the Vertex project and location, admission mode,
+  Redis URL), so a misconfigured
   process never touches the schema. The compose `app` profile sets it.
   Production should keep running `admin migrate` explicitly.
 - `TOLLGATE_DEMO_BIND_ALL`: `tollgate demo` honours the IP in
@@ -29,6 +30,12 @@ Notable changes per release.
 
 ### Changed
 
+- When Vertex is in use, `serve` refuses a location that is not lowercase
+  letters, digits and hyphens, and a project that is neither a project number
+  nor a project ID, before connecting to anything. Both are built into the URL,
+  and the location into the hostname, of requests that carry Tollgate's Google
+  access token. Native Vertex with an empty project or location is now refused
+  at boot too, instead of failing on the first request.
 - OpenTelemetry moves to 0.33 (`tracing-opentelemetry` 0.34). A
   `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` without a scheme, such as `collector:4317`,
   is rewritten to `https://` by the new exporter, and this build has no TLS, so
@@ -38,9 +45,18 @@ Notable changes per release.
   `http://localhost:4317`. Transient export failures are now retried (up to
   three times, with backoff).
 - `serve` now validates the billing config, the API-key pepper, the
-  OpenAI-compatible upstream settings, the admission mode and the Redis URL
-  before it connects to Postgres or Valkey, so a config mistake is reported as
-  such rather than behind a connection error.
+  OpenAI-compatible upstream settings, the Vertex project and location, the
+  admission mode and the Redis URL before it connects to Postgres or Valkey, so
+  a config mistake is reported as such rather than behind a connection error.
+
+### Fixed
+
+- Vertex requests for the `global`, `us` and `eu` locations now go to the hosts
+  Google documents for them: `aiplatform.googleapis.com` for `global` and
+  `aiplatform.{us,eu}.rep.googleapis.com` for the multi-regions, instead of a
+  `{location}-aiplatform.googleapis.com` host Google does not list. The native
+  adapter, the token count and the OpenAI-compatible endpoint all use the same
+  host. Thanks to Florian Valéry for the `global` fix.
 
 ## v0.2.3
 
