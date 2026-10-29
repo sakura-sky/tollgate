@@ -131,6 +131,15 @@ TOLLGATE_PROVIDERS__VERTEX__PROJECT=my-project
 TOLLGATE_PROVIDERS__VERTEX__LOCATION=us-central1
 ```
 
+`TOLLGATE_PROVIDERS__VERTEX__LOCATION=global` uses Vertex's global endpoint,
+which some newer Gemini models are served from. Google does not let you control
+or know which region a global request is processed in, and not every model or
+feature is available there. Google documents the `us` and `eu` multi-region
+locations as keeping ML processing within the US or the EU respectively; see
+Google's data-residency page for what that covers. Price each model at Google's
+rate for the location you set. Tollgate uses one location for all Vertex
+traffic.
+
 Issue the agent its own key, and give that key its own budget, which is the
 point of doing this at all:
 

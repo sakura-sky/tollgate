@@ -49,7 +49,13 @@ post() { # url, auth-header, extra-header, file -> "CODE<TAB>summary"
 }
 
 vertex_url() {
-  echo "https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${PROJECT}/locations/${LOCATION}/publishers/google/models/$1:countTokens"
+  # Same host mapping as src/providers.rs vertex_host.
+  local host="${LOCATION}-aiplatform.googleapis.com"
+  case "$LOCATION" in
+    global) host="aiplatform.googleapis.com" ;;
+    us | eu) host="aiplatform.${LOCATION}.rep.googleapis.com" ;;
+  esac
+  echo "https://${host}/v1/projects/${PROJECT}/locations/${LOCATION}/publishers/google/models/$1:countTokens"
 }
 
 if [ -n "${PROJECT:-}" ] && command -v gcloud >/dev/null; then

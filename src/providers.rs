@@ -972,14 +972,28 @@ impl TokenSource {
 }
 
 /// Vertex API host for a location. Regional endpoints are
-/// `{region}-aiplatform.googleapis.com`, but the `global` location (the only one
-/// serving some newer Gemini models) has no regional prefix.
+/// `{region}-aiplatform.googleapis.com`. The `global` location (which some
+/// newer Gemini models are served from) has no prefix, and the `us` and `eu`
+/// multi-region locations use `aiplatform.{us,eu}.rep.googleapis.com`.
 fn vertex_host(location: &str) -> String {
-    if location == "global" {
-        "aiplatform.googleapis.com".to_owned()
-    } else {
-        format!("{location}-aiplatform.googleapis.com")
+    match location {
+        "global" => "aiplatform.googleapis.com".to_owned(),
+        "us" | "eu" => format!("aiplatform.{location}.rep.googleapis.com"),
+        _ => format!("{location}-aiplatform.googleapis.com"),
     }
+}
+
+/// `https://{host}/v1/projects/{project}/locations/{location}`, the prefix every
+/// Vertex URL Tollgate builds starts with. One function, so the native adapter,
+/// the token count and the OpenAI-compatible base cannot disagree about which
+/// host a location maps to. `project` and `location` are validated at boot
+/// (`app::validate_vertex_target`), so neither can carry a `/`, `?`, `#`, `@`
+/// or port into the URL.
+fn vertex_base(project: &str, location: &str) -> String {
+    format!(
+        "https://{host}/v1/projects/{project}/locations/{location}",
+        host = vertex_host(location)
+    )
 }
 
 /// Adapter for Vertex AI (Gemini) `generateContent`.
@@ -1157,10 +1171,8 @@ impl Provider for VertexProvider {
         let path = safe_rest_path(rest_path)?;
         let token = self.tokens.token(&self.http).await?;
         let url = format!(
-            "https://{host}/v1/projects/{proj}/locations/{loc}/{path}",
-            host = vertex_host(&self.location),
-            loc = self.location,
-            proj = self.project,
+            "{base}/{path}",
+            base = vertex_base(&self.project, &self.location)
         );
         let resp = self
             .http
@@ -1189,10 +1201,8 @@ impl Provider for VertexProvider {
         let model = extract_vertex_model(rest_path).unwrap_or_else(|| parsed.model.clone());
         let token = self.tokens.token(&self.http).await?;
         let url = format!(
-            "https://{host}/v1/projects/{proj}/locations/{loc}/publishers/google/models/{model}:countTokens",
-            host = vertex_host(&self.location),
-            loc = self.location,
-            proj = self.project,
+            "{base}/publishers/google/models/{model}:countTokens",
+            base = vertex_base(&self.project, &self.location)
         );
         let resp = self
             .http
@@ -1545,10 +1555,7 @@ impl OpenAiProvider {
         location: &str,
         static_token: String,
     ) -> Self {
-        let base_url = format!(
-            "https://{host}/v1/projects/{project}/locations/{location}/endpoints/openapi",
-            host = vertex_host(location),
-        );
+        let base_url = format!("{}/endpoints/openapi", vertex_base(project, location));
         Self {
             tokens: TokenSource::new(static_token),
             http,
@@ -1813,6 +1820,28 @@ mod tests {
         );
     }
 
+    /// The prefix every Vertex call uses, for the global location, both
+    /// multi-regions and a regional location. `locations/{location}` stays in the path in each case.
+    #[test]
+    fn vertex_base_maps_each_kind_of_location_to_its_host() {
+        assert_eq!(
+            vertex_base("p", "global"),
+            "https://aiplatform.googleapis.com/v1/projects/p/locations/global"
+        );
+        assert_eq!(
+            vertex_base("p", "eu"),
+            "https://aiplatform.eu.rep.googleapis.com/v1/projects/p/locations/eu"
+        );
+        assert_eq!(
+            vertex_base("p", "us"),
+            "https://aiplatform.us.rep.googleapis.com/v1/projects/p/locations/us"
+        );
+        assert_eq!(
+            vertex_base("p", "europe-west4"),
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/p/locations/europe-west4"
+        );
+    }
+
     fn anthropic_test_provider() -> AnthropicProvider {
         AnthropicProvider::new(
             reqwest::Client::new(),
@@ -1896,6 +1925,31 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    /// The OpenAI-compatible base is the shared Vertex prefix plus
+    /// `/endpoints/openapi`, for the global location as for a regional one.
+    #[test]
+    fn openai_vertex_base_url_follows_the_location_host() {
+        for (location, want) in [
+            (
+                "global",
+                "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi",
+            ),
+            (
+                "us-central1",
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/endpoints/openapi",
+            ),
+        ] {
+            let p = OpenAiProvider::vertex(
+                reqwest::Client::new(),
+                reqwest::Client::new(),
+                "p",
+                location,
+                "t".to_owned(),
+            );
+            assert_eq!(p.base_url, want, "{location}");
+        }
     }
 
     #[test]
