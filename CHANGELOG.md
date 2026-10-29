@@ -7,6 +7,32 @@ SPDX-FileCopyrightText: 2026 Andrew Stevens
 
 Notable changes per release.
 
+## Unreleased
+
+### Added
+
+- The compose file can run Tollgate itself: `docker compose -f
+  compose/docker-compose.yaml --profile app up -d --build`. The service is behind
+  the `app` profile, so a plain `up -d` still starts only Postgres and Valkey and
+  nothing crash-loops before `.env` exists. It publishes on `127.0.0.1:8080`, like
+  the dependencies.
+- `TOLLGATE_DATABASE__AUTO_MIGRATE` (default off, dev only): `serve` applies
+  pending migrations at boot, after all config checks (billing, pepper, providers,
+  admission mode, Redis URL), so a misconfigured process never touches the
+  schema. The compose `app` profile sets
+  it. Production should keep running `admin migrate` explicitly.
+- `TOLLGATE_DEMO_BIND_ALL`: `tollgate demo` honours the IP in
+  `TOLLGATE_HTTP__BIND` instead of forcing loopback, which a container needs. It
+  prints a warning banner whenever the demo is not on loopback.
+- `scripts/demo.sh` runs the demo in Docker when cargo is missing or
+  `USE_DOCKER=1`, publishing on `127.0.0.1` only.
+
+### Changed
+
+- `serve` now validates the billing config and the API-key pepper before it
+  connects to Postgres or Valkey, so a config mistake is reported as such rather
+  than behind a connection error.
+
 ## v0.2.3
 
 Telling the caller whose fault a refusal is, and leaving a trace of it.
