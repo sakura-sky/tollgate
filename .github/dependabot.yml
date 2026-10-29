@@ -8,6 +8,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # Wait before proposing a new release, so a malicious or broken one has time
+    # to be noticed and yanked first. Applies to version updates only: security
+    # updates are never delayed. Cooldown classifies bumps by literal semver
+    # position, so a 0.y bump (breaking in cargo) waits the minor period, not 30.
+    cooldown:
+      default-days: 7
+      semver-patch-days: 7
+      semver-minor-days: 14
+      semver-major-days: 30
     # Held back with update-types, not version ranges. For cargo, Dependabot
     # treats a 0.y bump (0.12 -> 0.13) as major, and update-types rules do not
     # apply to security updates, so these rules never block a security update.
@@ -25,6 +34,12 @@ updates:
       # 0.10. Upgrade it as a deliberate, reviewed code change.
       - dependency-name: "rand"
         update-types: ["version-update:semver-major"]
+      # Don't propose tokio past its 1.53 LTS line (LTS until Sept 2027; bug
+      # fixes are backported as 1.53.x patches, which still come through). This
+      # is not a pin: another crate's update can still pull tokio forward in
+      # Cargo.lock, so check lockfile diffs. Security updates ignore this rule.
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
     groups:
       # These must move to a new 0.y together: tracing-opentelemetry 0.34
       # requires opentelemetry 0.33, so bumping one alone fails to build.
@@ -36,3 +51,6 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # GitHub Actions only supports a single cooldown period.
+    cooldown:
+      default-days: 14
