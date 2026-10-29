@@ -29,6 +29,14 @@ Notable changes per release.
 
 ### Changed
 
+- OpenTelemetry moves to 0.33 (`tracing-opentelemetry` 0.34). A
+  `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` without a scheme, such as `collector:4317`,
+  is rewritten to `https://` by the new exporter, and this build has no TLS, so
+  Tollgate now refuses any endpoint that is not `http://host:port` or
+  `unix:///path`, with a message saying what to set. An empty value now disables
+  export; before, it fell back to the `OTEL_EXPORTER_OTLP_*` variables and then
+  `http://localhost:4317`. Transient export failures are now retried (up to
+  three times, with backoff).
 - `serve` now validates the billing config, the API-key pepper, the
   OpenAI-compatible upstream settings, the admission mode and the Redis URL
   before it connects to Postgres or Valkey, so a config mistake is reported as
