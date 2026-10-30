@@ -96,9 +96,24 @@ fn otlp_endpoint(raw: Option<&str>) -> Result<Option<&str>> {
     if is_http && has_host_and_port {
         return Ok(Some(endpoint));
     }
+    // Only the scheme is shown, never the value: an endpoint can carry
+    // credentials (`https://user:token@host`) or a token in its query, and this
+    // message goes to startup output and the logs.
+    // A scheme is a letter then letters, digits or `+`, and short; anything
+    // else is described rather than shown.
+    let plain = |s: &str| {
+        s.len() <= 16
+            && s.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+')
+    };
+    let got = match endpoint.split_once("://") {
+        Some((s, _)) if plain(s) => format!("a {s:?} scheme"),
+        Some(_) => "an unrecognised scheme".to_owned(),
+        None => "no \"://\" scheme".to_owned(),
+    };
     anyhow::bail!(
         "telemetry.otlp_endpoint (TOLLGATE_TELEMETRY__OTLP_ENDPOINT) must be \
-         http://host:port or unix:///path (got {endpoint:?}): OTLP export is plaintext \
+         http://host:port or unix:///path (got {got}): OTLP export is plaintext \
          gRPC only, because TLS is not compiled into the exporter. Point it at an \
          OpenTelemetry Collector and let the collector use TLS to your backend, or \
          leave the setting unset to disable export"
@@ -180,6 +195,20 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+        // A refused endpoint is never echoed: it can carry credentials.
+        let err = otlp_endpoint(Some(
+            "https://user:SECRETTOKEN@collector:4317/?k=SECRETQUERY",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(err.contains(r#"got a "https" scheme"#), "{err}");
+        // A prefix that is not plainly a scheme is described, not shown.
+        let err = otlp_endpoint(Some("123SECRET://collector:4317"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("SECRET"), "{err}");
+        assert!(err.contains("an unrecognised scheme"), "{err}");
     }
 
     /// Every form `otlp_endpoint` accepts must actually build with the exporter
