@@ -16,7 +16,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::pricing::Usage;
-use crate::provider::{ParsedRequest, Provider, ProviderError, ProviderResponse};
+use crate::provider::{
+    ParsedRequest, Provider, ProviderError, ProviderResponse, RefusalDetail, ResponseMeta,
+    classify_upstream_status,
+};
 
 /// Bounded best-effort input-token estimate for `fast` admission. ASCII counts
 /// at ~4 bytes/token; every non-ASCII byte counts as ~1 token, because dense
@@ -209,19 +212,49 @@ fn classify_transport_error(e: &reqwest::Error) -> ProviderError {
 /// Read a JSON response body, classifying a parse failure by status.
 ///
 /// A 2xx that will not parse was served and billed, so it is a metering failure.
-/// A non-2xx that will not parse (an HTML 502 from a CDN, an empty 3xx body) was
-/// not billed, so it releases the reservation.
-async fn json_or_classified(resp: reqwest::Response) -> Result<(u16, Value), ProviderError> {
+/// A non-2xx that will not parse (an HTML 429 from a CDN, an empty 3xx body) was
+/// not billed; it becomes a [`ProviderError::Refused`] classified by its status,
+/// so a plain-text 429 still reaches the client as a 429 with its Retry-After.
+///
+/// A non-2xx that does parse is returned like a success, so the caller can
+/// settle on whatever usage the provider reported; the gateway then answers
+/// with a classified refusal, never this body.
+///
+/// The headers are read before the body consumes the response.
+async fn json_or_classified(
+    resp: reqwest::Response,
+) -> Result<(u16, ResponseMeta, Value), ProviderError> {
     let status = resp.status().as_u16();
     let success = (200..300).contains(&status);
-    match resp.json::<Value>().await {
-        Ok(v) => Ok((status, v)),
+    let meta = ResponseMeta::from_headers(resp.headers());
+    let raw = match resp.bytes().await {
+        Ok(raw) => raw,
+        Err(e) if success => {
+            return Err(ProviderError::MeteringFailed(format!(
+                "2xx response body could not be read: {e}"
+            )));
+        }
+        // The status and headers arrived, so classify by them: a 429 whose
+        // body read failed is still a 429 with its Retry-After. Nothing was
+        // billed that anyone reported, so the reservation is released.
+        Err(_) => {
+            return Err(ProviderError::Refused {
+                status,
+                fault: classify_upstream_status(status, meta.retry_after_secs),
+                detail: Box::new(RefusalDetail::new(&meta, &[], false)),
+            });
+        }
+    };
+    match serde_json::from_slice::<Value>(&raw) {
+        Ok(v) => Ok((status, meta, v)),
         Err(e) if success => Err(ProviderError::MeteringFailed(format!(
             "2xx response body did not parse: {e}"
         ))),
-        Err(e) => Err(ProviderError::Upstream(format!(
-            "status {status} with unparseable body: {e}"
-        ))),
+        Err(_) => Err(ProviderError::Refused {
+            status,
+            fault: classify_upstream_status(status, meta.retry_after_secs),
+            detail: Box::new(RefusalDetail::new(&meta, &raw, true)),
+        }),
     }
 }
 
@@ -847,12 +880,13 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))?;
-        let (status, json) = json_or_classified(resp).await?;
+        let (status, meta, json) = json_or_classified(resp).await?;
         let usage = parse_anthropic_usage(&json);
         Ok(ProviderResponse {
             status,
             body: json,
             usage,
+            meta,
         })
     }
 
@@ -875,6 +909,7 @@ impl Provider for AnthropicProvider {
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status();
+        let meta = ResponseMeta::from_headers(resp.headers());
         // Bytes then parse, rather than `.json()`: a refusal does not always
         // come back as JSON. An edge proxy or a WAF in front of the provider
         // answers a 400 with an HTML page, and letting the decode error decide
@@ -884,10 +919,10 @@ impl Provider for AnthropicProvider {
             .bytes()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-        if let Some(e) = count_refusal(status, &json, "count_tokens") {
+        if let Some(e) = count_refusal(status, &meta, &raw, "count_tokens") {
             return Err(e);
         }
+        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         // Fail closed: a missing field must not silently downgrade to the weak
         // fast estimate (that would reopen the under-reservation hole).
         json.get("input_tokens")
@@ -1184,12 +1219,13 @@ impl Provider for VertexProvider {
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))?;
-        let (status, json) = json_or_classified(resp).await?;
+        let (status, meta, json) = json_or_classified(resp).await?;
         let usage = parse_vertex_usage(&json);
         Ok(ProviderResponse {
             status,
             body: json,
             usage,
+            meta,
         })
     }
 
@@ -1215,6 +1251,7 @@ impl Provider for VertexProvider {
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status();
+        let meta = ResponseMeta::from_headers(resp.headers());
         // Bytes then parse, rather than `.json()`: a refusal does not always
         // come back as JSON. An edge proxy or a WAF in front of the provider
         // answers a 400 with an HTML page, and letting the decode error decide
@@ -1224,10 +1261,10 @@ impl Provider for VertexProvider {
             .bytes()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-        if let Some(e) = count_refusal(status, &json, "countTokens") {
+        if let Some(e) = count_refusal(status, &meta, &raw, "countTokens") {
             return Err(e);
         }
+        let json: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         json.get("totalTokens")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
@@ -1238,16 +1275,18 @@ impl Provider for VertexProvider {
 
 /// Classify a non-success reply from a token-count endpoint.
 ///
+/// Classified by status like a forward's refusal (see
+/// [`crate::provider::classify_upstream_status`]): 400, 413 and 422 are the
+/// caller's body and keep their status; 429 is the provider rate limiting the
+/// deployment; everything else, including every other 4xx, is a 502.
+///
 /// The count endpoints used to discard their HTTP status and report every
-/// failure as an upstream one, because the missing token field was all the
-/// caller looked at. That turns a request the PROVIDER rejected as malformed
-/// into a 502, which an SDK then retries as if the provider were down: three
-/// round trips to surface what is really a 400 on the caller's own body.
+/// failure as an upstream one. That turned a request the PROVIDER rejected as
+/// malformed into a 502, which an SDK then retries as if the provider were
+/// down: three round trips to surface what is really a 400 on the caller's own
+/// body.
 ///
-/// An ALLOWLIST, not a denylist. Only the statuses that describe the request
-/// BODY are the caller's fault: 400, 413 and 422. Everything else is the
-/// provider, including every 4xx not on that list.
-///
+/// The caller's-body statuses are an ALLOWLIST, not a denylist.
 /// Treating all 4xx as the caller's is the obvious reading and it is wrong in
 /// the worst direction. A 401 or 403 from a count endpoint is Tollgate's own
 /// credential, a rotated Anthropic key or a Vertex token that lost a scope, and
@@ -1257,8 +1296,8 @@ impl Provider for VertexProvider {
 /// the operator's alert to catch, while 100% of traffic fails. A misconfigured
 /// gateway must look like a misconfigured gateway.
 ///
-/// 429 is likewise the provider's: it is transient, and changing the body will
-/// not help.
+/// 429 is the provider's too: it is transient, and changing the body will not
+/// help. It reaches the client as a 429 with its Retry-After.
 ///
 /// The split is checked against what the endpoints actually return, not against
 /// what they ought to. Live: Anthropic `count_tokens` answers 400 to an empty
@@ -1268,40 +1307,25 @@ impl Provider for VertexProvider {
 /// the property that matters. Reprobe with
 /// `scripts/probe-count-endpoints.sh` before changing this list.
 ///
-/// Only the allowlisted statuses have their message echoed to the caller, which
-/// also keeps provider text describing OUR deployment (a Vertex 403 names the
-/// project and region in its resource path) out of a client-facing response.
+/// No provider text reaches the caller on any status: the refusal carries only
+/// its classification, and the provider's type, code and body go to the log
+/// (see [`crate::provider::log_upstream_refusal`]). A Vertex message names the
+/// project and region in its resource path, and even a 400's message can.
 ///
 /// Returns `None` when the status is a success, leaving the caller to parse.
 fn count_refusal(
     status: reqwest::StatusCode,
-    body: &Value,
+    meta: &ResponseMeta,
+    raw: &[u8],
     endpoint: &str,
 ) -> Option<ProviderError> {
     if status.is_success() {
         return None;
     }
-    // Both providers nest a human-readable message, in different places.
-    let detail = body
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .or_else(|| body.get("message").and_then(Value::as_str))
-        .unwrap_or("no detail");
-
-    let describes_the_body = matches!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST
-            | reqwest::StatusCode::PAYLOAD_TOO_LARGE
-            | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-    );
-    if describes_the_body {
-        return Some(ProviderError::BadRequest(format!(
-            "{endpoint} rejected this request ({status}): {detail}"
-        )));
-    }
-
-    // A credential failure is silent otherwise: it is not a transport error, so
-    // nothing else logs it, and the client-facing 502 says only "upstream".
+    let detail = RefusalDetail::new(meta, raw, true);
+    // A credential failure fails every request under `exact` admission, so it
+    // is logged at ERROR here; nothing else logs it at ERROR, and the client's
+    // 502 says only "upstream".
     if matches!(
         status,
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
@@ -1309,14 +1333,19 @@ fn count_refusal(
         tracing::error!(
             endpoint,
             %status,
-            detail,
+            provider_error_type = detail.error_type.as_deref().unwrap_or(""),
+            provider_error_code = detail.error_code.as_deref().unwrap_or(""),
+            provider_request_id = detail.provider_request_id.as_deref().unwrap_or(""),
             "the provider rejected Tollgate's own credential on the pre-flight count; \
              under `exact` admission this fails every request until it is fixed"
         );
     }
-    Some(ProviderError::Upstream(format!(
-        "{endpoint} failed ({status}): {detail}"
-    )))
+    let code = status.as_u16();
+    Some(ProviderError::Refused {
+        status: code,
+        fault: classify_upstream_status(code, meta.retry_after_secs),
+        detail: Box::new(detail),
+    })
 }
 
 /// Default worst-case output reservation when the request omits `max_tokens`.
@@ -1805,12 +1834,13 @@ impl Provider for OpenAiProvider {
             .send()
             .await
             .map_err(|e| classify_transport_error(&e))?;
-        let (status, json) = json_or_classified(resp).await?;
+        let (status, meta, json) = json_or_classified(resp).await?;
         let usage = parse_openai_usage(&json, self.cache_semantics());
         Ok(ProviderResponse {
             status,
             body: json,
             usage,
+            meta,
         })
     }
 }
@@ -2910,85 +2940,101 @@ mod tests {
     }
 
     #[test]
-    fn a_count_endpoint_refusal_is_the_callers_fault_not_the_providers() {
-        // The count endpoints used to discard their status and report every
-        // failure as upstream, so a body the PROVIDER rejected came back as a
-        // 502. SDKs retry 5xx, so a client bug became three round trips and
-        // looked like a provider outage in the logs.
-        let body: Value = serde_json::from_str(
-            r#"{"type":"error","error":{"type":"invalid_request_error",
-                "message":"messages: at least one message is required"}}"#,
-        )
-        .unwrap();
+    fn a_count_endpoint_refusal_is_classified_by_status_and_carries_no_provider_text() {
+        use crate::provider::UpstreamFault;
+        let meta = ResponseMeta::default();
+        let refuse = |status: reqwest::StatusCode, body: &str| {
+            count_refusal(status, &meta, body.as_bytes(), "count_tokens")
+        };
+        let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error",
+            "message":"messages: at least one message is required"}}"#;
 
-        let refused = count_refusal(reqwest::StatusCode::BAD_REQUEST, &body, "count_tokens")
-            .expect("a 400 is a refusal");
-        assert!(
-            matches!(refused, ProviderError::BadRequest(ref m) if m.contains("at least one message")),
-            "a 4xx must surface as BadRequest carrying the provider's reason, got {refused:?}"
-        );
+        // The caller's body: 400, 413 and 422 keep their status. The count
+        // endpoints used to report every failure as upstream, so a client bug
+        // came back as a 502 that SDKs retried.
+        for (status, code) in [
+            (reqwest::StatusCode::BAD_REQUEST, 400),
+            (reqwest::StatusCode::PAYLOAD_TOO_LARGE, 413),
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, 422),
+        ] {
+            match refuse(status, anthropic) {
+                Some(ProviderError::Refused {
+                    status: s,
+                    fault,
+                    detail,
+                }) => {
+                    assert_eq!(s, code);
+                    assert_eq!(fault, UpstreamFault::Request(code));
+                    // The type is kept for the log, the message only in the
+                    // log-only body.
+                    assert_eq!(detail.error_type.as_deref(), Some("invalid_request_error"));
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
 
-        // Everything NOT on the allowlist is the provider's, including 4xx.
-        // This is the important half: a denylist here blames the caller for
-        // Tollgate's own rotated key, and does it to 100% of traffic with no
-        // upstream signal for an operator to alert on.
+        // A 429 is the provider rate limiting this deployment.
+        assert!(matches!(
+            refuse(reqwest::StatusCode::TOO_MANY_REQUESTS, anthropic),
+            Some(ProviderError::Refused {
+                fault: UpstreamFault::RateLimited { .. },
+                ..
+            })
+        ));
+
+        // Everything else is the provider's or Tollgate's own, including 4xx: a
+        // denylist here would blame the caller for Tollgate's rotated key, for
+        // 100% of traffic, with no upstream signal to alert on.
         for status in [
-            reqwest::StatusCode::UNAUTHORIZED,      // our key is wrong
-            reqwest::StatusCode::FORBIDDEN,         // our IAM is wrong
-            reqwest::StatusCode::NOT_FOUND,         // our model or project is wrong
-            reqwest::StatusCode::REQUEST_TIMEOUT,   // transient
-            reqwest::StatusCode::TOO_MANY_REQUESTS, // transient
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::REQUEST_TIMEOUT,
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
         ] {
             assert!(
                 matches!(
-                    count_refusal(status, &body, "count_tokens"),
-                    Some(ProviderError::Upstream(_))
+                    refuse(status, anthropic),
+                    Some(ProviderError::Refused {
+                        fault: UpstreamFault::Provider,
+                        ..
+                    })
                 ),
                 "{status} is not the caller's fault"
             );
         }
-        // The other two body-describing statuses.
-        assert!(matches!(
-            count_refusal(
-                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-                &body,
-                "count_tokens"
-            ),
-            Some(ProviderError::BadRequest(_))
-        ));
-        assert!(matches!(
-            count_refusal(
-                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-                &body,
-                "count_tokens"
-            ),
-            Some(ProviderError::BadRequest(_))
-        ));
+
         // A success is not a refusal at all: the caller parses the body.
-        assert!(count_refusal(reqwest::StatusCode::OK, &body, "count_tokens").is_none());
+        assert!(refuse(reqwest::StatusCode::OK, anthropic).is_none());
 
-        // Vertex nests its message differently; both shapes must be picked up
-        // rather than falling back to "no detail".
-        let vertex: Value = serde_json::from_str(
-            r#"{"error":{"message":"Invalid JSON payload received. Unknown name \"foo\"","code":400}}"#,
-        )
-        .unwrap();
-        let e = count_refusal(reqwest::StatusCode::BAD_REQUEST, &vertex, "countTokens")
-            .expect("400 is a refusal");
-        assert!(matches!(e, ProviderError::BadRequest(ref m) if m.contains("Unknown name")));
+        // No provider text in the error's text, on any status: a Vertex message
+        // names the project and region in its resource path, a 400 included.
+        let vertex = r#"{"error":{"message":"Permission denied on resource //aiplatform.googleapis.com/projects/example-project/locations/us-central1/publishers/google/models/x","code":403,"status":"PERMISSION_DENIED"}}"#;
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let e = refuse(status, vertex).expect("a refusal");
+            let text = e.to_string();
+            assert!(!text.contains("example-project"), "{text}");
+            assert!(!text.contains("Permission denied"), "{text}");
+            if let ProviderError::Refused { detail, .. } = e {
+                assert_eq!(detail.error_type.as_deref(), Some("PERMISSION_DENIED"));
+                assert_eq!(detail.error_code.as_deref(), Some("403"));
+            }
+        }
 
-        // A Vertex 403 names the project and region in its resource path. That
-        // must not reach the caller as a "your request is malformed" message,
-        // which is the second reason the allowlist is narrow.
-        let denied: Value = serde_json::from_str(
-            r#"{"error":{"message":"Permission denied on resource //aiplatform.googleapis.com/projects/example-project/locations/us-central1/publishers/google/models/x","code":403}}"#,
-        )
-        .unwrap();
+        // An HTML refusal from an edge proxy still classifies by status.
         assert!(matches!(
-            count_refusal(reqwest::StatusCode::FORBIDDEN, &denied, "countTokens"),
-            Some(ProviderError::Upstream(_))
+            refuse(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "<html>slow down</html>"
+            ),
+            Some(ProviderError::Refused {
+                fault: UpstreamFault::RateLimited { .. },
+                ..
+            })
         ));
     }
 

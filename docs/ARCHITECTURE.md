@@ -66,7 +66,7 @@ sequenceDiagram
   Note over T: unpriced model -> record, then 400 (fail closed)
   opt admission = exact
     T->>P: pre-flight count_tokens
-    Note over T,P: a failed count is UPSTREAM (502), never a backend error,<br/>a 400/413/422 from it is the caller's body (400)
+    Note over T,P: a count the provider refuses is classified like a forward,<br/>400/413/422 keep their status, 429 stays 429, anything else is 502
   end
   T->>V: reserve worst-case cost (atomic check + incr)
   opt counter absent (flush, failover, eviction, new period)
@@ -83,6 +83,7 @@ sequenceDiagram
     T->>V: settle reservation to actual cost
     T->>DB: append usage row (cost, tokens, overhead)
     T-->>C: 200 (buffered: + x-tollgate-cost, x-tollgate-overhead-us)
+    Note over T,C: a provider non-2xx is settled as reported (zero on a stream or an unparseable body),<br/>then the client gets 400/413/422, 429 or 502 with a fixed body, never the provider's
   end
 ```
 

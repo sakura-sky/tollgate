@@ -29,6 +29,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
+use tracing::Instrument as _;
 
 use crate::gateway::{AuthError, GatewayCore, KEY_HEADER, Outcome, outcome_response};
 
@@ -87,6 +88,9 @@ pub fn surface_for(path: &str) -> Option<Surface> {
 #[derive(Debug, Clone)]
 pub struct Authed {
     pub key_id: String,
+    /// The id sent back in `x-tollgate-request-id`, for log lines that must
+    /// carry it even when the request's span is filtered out.
+    pub request_id: String,
     /// Time spent authenticating, added to the handler's overhead figures so
     /// they still include authentication without including the body upload
     /// that happens between the gate and the handler.
@@ -192,16 +196,33 @@ pub async fn require_key(State(gate): State<GateState>, mut req: Request, next: 
         }
     }
 
+    // Generated here, never read from the request: a client-supplied id would
+    // let a caller plant a value in the operator's logs. (tower-http's request-id
+    // layers keep or copy a client's id, so they are not used.)
+    let request_id = uuid::Uuid::new_v4().to_string();
+
     let core = gate.core.load_full();
     let result = tokio::time::timeout(gate.deadline, core.authenticate(req.headers())).await;
-    match result {
+    let response = match result {
         Ok(Ok(key_id)) => {
             let is_head = req.method() == Method::HEAD;
+            // The span opens only once the caller is authenticated, so
+            // unauthenticated probes are counted on `/metrics` rather than
+            // traced (and, with OTLP set, exported) one by one. It is the only
+            // span on the request path: the JSON log format shows the current
+            // span's fields, so everything logged below carries the id.
+            let span = tracing::info_span!(
+                "request",
+                request_id = %request_id,
+                method = %truncated(req.method().as_str(), MAX_SPAN_METHOD_BYTES),
+                path = %truncated(req.uri().path(), MAX_SPAN_PATH_BYTES),
+            );
             req.extensions_mut().insert(Authed {
                 key_id,
+                request_id: request_id.clone(),
                 auth_elapsed: started.elapsed(),
             });
-            let response = next.run(req).await;
+            let response = next.run(req).instrument(span).await;
             if surface == Surface::Console {
                 label_console_refusal(response, is_head)
             } else {
@@ -220,7 +241,39 @@ pub async fn require_key(State(gate): State<GateState>, mut req: Request, next: 
             gate.log_store_error("deadline", None);
             store_unavailable(surface)
         }
+    };
+    with_request_id(response, &request_id)
+}
+
+/// The response header carrying the request id.
+pub const REQUEST_ID_HEADER: &str = "x-tollgate-request-id";
+
+/// The longest request path recorded on the span. The path is the caller's,
+/// bounded only by the server's URI limit.
+const MAX_SPAN_PATH_BYTES: usize = 256;
+
+/// The longest method recorded on the span. Standard methods are far shorter;
+/// an extension method is the caller's own text.
+const MAX_SPAN_METHOD_BYTES: usize = 16;
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn truncated(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
     }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Set the request id header, replacing any value a handler might have set.
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 /// The 401 for a surface. Byte-identical to what each route returned when it
@@ -324,6 +377,16 @@ mod tests {
         for (path, want) in cases {
             assert_eq!(surface_for(path), want, "{path:?}");
         }
+    }
+
+    #[test]
+    fn span_paths_are_cut_on_a_character_boundary() {
+        assert_eq!(truncated("/v1/x", 256), "/v1/x");
+        let long = "a".repeat(300);
+        assert_eq!(truncated(&long, 256).len(), 256);
+        // A two-byte character straddling the limit is left out whole.
+        let s = format!("{}é", "a".repeat(255));
+        assert_eq!(truncated(&s, 256), "a".repeat(255));
     }
 
     #[test]

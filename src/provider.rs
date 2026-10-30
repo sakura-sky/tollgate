@@ -33,12 +33,228 @@ pub struct ParsedRequest {
     pub may_cache_write: bool,
 }
 
-/// A provider response: upstream status, JSON body to return, and parsed usage.
+/// A provider response: upstream status, JSON body (returned to the client only
+/// on a 2xx), and parsed usage.
+///
+/// A non-2xx whose body parses is still a `ProviderResponse`, so settlement can
+/// charge what the provider reported. Its `body` is then for the log only: the
+/// gateway never returns a non-2xx body to a client.
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub status: u16,
     pub body: Value,
     pub usage: Usage,
+    pub meta: ResponseMeta,
+}
+
+/// What Tollgate keeps from a provider response's headers. Only parsed or
+/// cleaned values, never a raw header to copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseMeta {
+    /// A valid `Retry-After`, clamped to 1..=60 seconds (see
+    /// [`parse_retry_after`]).
+    pub retry_after_secs: Option<u32>,
+    /// The provider's own request id, cleaned, for the log only.
+    pub provider_request_id: Option<String>,
+}
+
+impl ResponseMeta {
+    #[must_use]
+    pub fn from_headers(headers: &http::HeaderMap) -> Self {
+        // Anthropic sends `request-id`; OpenAI-compatible upstreams commonly
+        // send `x-request-id`.
+        let provider_request_id = ["request-id", "x-request-id"].iter().find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| clean_token(v, 128))
+        });
+        Self {
+            retry_after_secs: parse_retry_after(headers),
+            provider_request_id,
+        }
+    }
+}
+
+/// How Tollgate tells the client the provider refused. Decided by the
+/// provider's status alone, so nothing the provider wrote reaches the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamFault {
+    /// 400, 413 or 422: the provider says the caller's request is at fault.
+    /// Carries the status, which the client gets unchanged.
+    Request(u16),
+    /// 429: the provider is rate limiting this deployment.
+    RateLimited { retry_after_secs: Option<u32> },
+    /// Anything else: Tollgate's own credential or configuration (401, 403,
+    /// 404), or the provider itself. The client gets 502.
+    Provider,
+}
+
+impl UpstreamFault {
+    /// A fixed word for the log line.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// Classify a provider's non-2xx status.
+#[must_use]
+pub fn classify_upstream_status(status: u16, retry_after_secs: Option<u32>) -> UpstreamFault {
+    match status {
+        400 | 413 | 422 => UpstreamFault::Request(status),
+        429 => UpstreamFault::RateLimited { retry_after_secs },
+        _ => UpstreamFault::Provider,
+    }
+}
+
+/// The longest `Retry-After` Tollgate passes on, in seconds. The Anthropic and
+/// OpenAI SDKs honour only `0 < x <= 60` and fall back to their own backoff
+/// otherwise, and a provider (or a misconfigured custom upstream) must not be
+/// able to tell every client to wait an hour.
+pub const MAX_RETRY_AFTER_SECS: u32 = 60;
+
+/// A provider's `Retry-After`, as whole seconds clamped to
+/// 1..=[`MAX_RETRY_AFTER_SECS`], or `None`.
+///
+/// Exactly one header value, ASCII digits only, at most 10 of them. An
+/// HTTP-date, a fraction, a sign, whitespace, two headers or a list give `None`.
+/// The value is re-serialised from the integer by the caller, never copied.
+#[must_use]
+pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<u32> {
+    let mut values = headers.get_all(http::header::RETRY_AFTER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 10 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let secs: u64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+    let clamped = secs.clamp(1, u64::from(MAX_RETRY_AFTER_SECS));
+    u32::try_from(clamped).ok()
+}
+
+/// What Tollgate logs about a provider refusal. Never part of a client
+/// response, and never in a `ProviderError`'s `Display`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefusalDetail {
+    /// The provider's error type (`error.type`, or Google's `error.status`).
+    pub error_type: Option<String>,
+    /// The provider's error code (`error.details.error_code`, or `error.code`).
+    pub error_code: Option<String>,
+    pub provider_request_id: Option<String>,
+    /// The body, at most [`LOGGED_BODY_BYTES`] of it, for the opt-in TRACE line.
+    pub body: String,
+}
+
+/// The target of the opt-in TRACE line carrying a provider's refusal body. The
+/// OTLP layer filters it out (see `telemetry::init`). Must match the literal in
+/// [`log_upstream_refusal`].
+pub const UPSTREAM_BODY_TARGET: &str = "tollgate::upstream_body";
+
+/// How much of a refusal body is logged, at TRACE only.
+pub const LOGGED_BODY_BYTES: usize = 2048;
+
+impl RefusalDetail {
+    /// Build from the response's meta and its body bytes. `complete` says
+    /// whether `body` is the whole body: the type and code are read only then,
+    /// because a truncated body does not parse.
+    #[must_use]
+    pub fn new(meta: &ResponseMeta, body: &[u8], complete: bool) -> Self {
+        let parsed = if complete {
+            serde_json::from_slice::<Value>(body).ok()
+        } else {
+            None
+        };
+        Self::from_parts(meta, parsed.as_ref(), body)
+    }
+
+    /// Build from a body that has already been parsed. The body is
+    /// re-serialised for the log only when its TRACE line is enabled.
+    #[must_use]
+    pub fn from_value(meta: &ResponseMeta, body: &Value) -> Self {
+        let text = if tracing::enabled!(target: "tollgate::upstream_body", tracing::Level::TRACE) {
+            body.to_string()
+        } else {
+            String::new()
+        };
+        Self::from_parts(meta, Some(body), text.as_bytes())
+    }
+
+    fn from_parts(meta: &ResponseMeta, parsed: Option<&Value>, raw: &[u8]) -> Self {
+        // Google's OpenAI-compatible endpoint can answer with a one-element
+        // array of error objects.
+        let error = parsed.map(|v| match v {
+            Value::Array(items) => items.first().unwrap_or(&Value::Null),
+            other => other,
+        });
+        let field = |pointers: &[&str]| {
+            error.and_then(|e| {
+                pointers.iter().find_map(|p| match e.pointer(p)? {
+                    Value::String(s) => clean_token(s, 64),
+                    Value::Number(n) => clean_token(&n.to_string(), 64),
+                    _ => None,
+                })
+            })
+        };
+        let cut = raw.len().min(LOGGED_BODY_BYTES);
+        Self {
+            error_type: field(&["/error/type", "/error/status"]),
+            error_code: field(&["/error/details/error_code", "/error/code"]),
+            provider_request_id: meta.provider_request_id.clone(),
+            body: String::from_utf8_lossy(&raw[..cut]).into_owned(),
+        }
+    }
+}
+
+/// `value` if it is 1..=`max` characters of `[A-Za-z0-9_.-]`, else `None`.
+/// Provider-supplied identifiers go into log fields only in this shape.
+#[must_use]
+pub fn clean_token(value: &str, max: usize) -> Option<String> {
+    let ok = !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    ok.then(|| value.to_owned())
+}
+
+/// Log a provider refusal: the identifiers at WARN, the body at TRACE under
+/// `tollgate::upstream_body` (off under the default filter, and kept out of
+/// OTLP). `request_id` is Tollgate's, the one the client was given.
+pub fn log_upstream_refusal(
+    request_id: Option<&str>,
+    provider: &str,
+    model: &str,
+    status: u16,
+    fault: UpstreamFault,
+    detail: &RefusalDetail,
+) {
+    let request_id = request_id.unwrap_or("");
+    tracing::warn!(
+        request_id,
+        provider,
+        model,
+        status,
+        fault = fault.as_str(),
+        provider_error_type = detail.error_type.as_deref().unwrap_or(""),
+        provider_error_code = detail.error_code.as_deref().unwrap_or(""),
+        provider_request_id = detail.provider_request_id.as_deref().unwrap_or(""),
+        "upstream refused the request"
+    );
+    tracing::trace!(
+        target: "tollgate::upstream_body",
+        request_id,
+        status,
+        body = %detail.body,
+        "upstream refusal body"
+    );
 }
 
 /// Errors from a provider adapter.
@@ -61,6 +277,19 @@ pub enum ProviderError {
     /// silently.
     #[error("metering failed: {0}")]
     MeteringFailed(String),
+    /// The provider answered with a non-2xx that Tollgate passes on only as a
+    /// classified refusal (see [`UpstreamFault`]). No usage was reported for it,
+    /// so the reservation is released.
+    ///
+    /// The `Display` names the status only: `detail` is for
+    /// [`log_upstream_refusal`] and never reaches a log line through this
+    /// error's text, nor a client.
+    #[error("provider refused the request ({status})")]
+    Refused {
+        status: u16,
+        fault: UpstreamFault,
+        detail: Box<RefusalDetail>,
+    },
 }
 
 /// A backend Tollgate can proxy to.
@@ -206,6 +435,7 @@ impl Provider for MockProvider {
             status: 200,
             body,
             usage: Usage::new(input, output),
+            meta: ResponseMeta::default(),
         })
     }
 }
@@ -213,6 +443,119 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retry_after(values: &[&[u8]]) -> Option<u32> {
+        let mut headers = http::HeaderMap::new();
+        for v in values {
+            headers.append(
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_bytes(v).expect("valid header bytes"),
+            );
+        }
+        parse_retry_after(&headers)
+    }
+
+    #[test]
+    fn retry_after_is_one_integer_clamped_to_a_minute() {
+        assert_eq!(retry_after(&[]), None);
+        assert_eq!(retry_after(&[b"0"]), Some(1));
+        assert_eq!(retry_after(&[b"1"]), Some(1));
+        assert_eq!(retry_after(&[b"30"]), Some(30));
+        assert_eq!(retry_after(&[b"60"]), Some(60));
+        assert_eq!(retry_after(&[b"61"]), Some(60));
+        assert_eq!(retry_after(&[b"3600"]), Some(60));
+        assert_eq!(retry_after(&[b"9999999999"]), Some(60));
+        for bad in [
+            &b""[..],
+            b"99999999999",
+            b"-1",
+            b"1.5",
+            b" 30",
+            b"30 ",
+            b"+30",
+            b"Wed, 21 Oct 2026 07:28:00 GMT",
+            b"30, 40",
+            b"\xc3\xa9",
+        ] {
+            assert_eq!(retry_after(&[bad]), None, "{bad:?}");
+        }
+        // Two headers: ambiguous, so neither.
+        assert_eq!(retry_after(&[b"30", b"30"]), None);
+    }
+
+    #[test]
+    fn provider_statuses_are_classified_by_fault() {
+        for status in [400, 413, 422] {
+            assert_eq!(
+                classify_upstream_status(status, None),
+                UpstreamFault::Request(status)
+            );
+        }
+        assert_eq!(
+            classify_upstream_status(429, Some(5)),
+            UpstreamFault::RateLimited {
+                retry_after_secs: Some(5)
+            }
+        );
+        for status in [401, 403, 404, 408, 409, 500, 502, 503, 529] {
+            assert_eq!(
+                classify_upstream_status(status, Some(5)),
+                UpstreamFault::Provider,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_detail_keeps_only_clean_identifiers_and_a_bounded_body() {
+        let meta = ResponseMeta {
+            retry_after_secs: None,
+            provider_request_id: Some("req_1".to_owned()),
+        };
+        // Anthropic's shape, including a spend-limit code.
+        let anthropic = br#"{"type":"error","error":{"type":"rate_limit_error","message":"x","details":{"error_code":"enforced_spend_limit_reached"}}}"#;
+        let d = RefusalDetail::new(&meta, anthropic, true);
+        assert_eq!(d.error_type.as_deref(), Some("rate_limit_error"));
+        assert_eq!(
+            d.error_code.as_deref(),
+            Some("enforced_spend_limit_reached")
+        );
+        assert_eq!(d.provider_request_id.as_deref(), Some("req_1"));
+
+        // Google's array form, with a numeric code and a status word.
+        let google = br#"[{"error":{"code":400,"message":"x","status":"INVALID_ARGUMENT"}}]"#;
+        let d = RefusalDetail::new(&meta, google, true);
+        assert_eq!(d.error_type.as_deref(), Some("INVALID_ARGUMENT"));
+        assert_eq!(d.error_code.as_deref(), Some("400"));
+
+        // A type that is not a clean token is dropped, not logged.
+        let dirty = br#"{"error":{"type":"bad\ntype with spaces"}}"#;
+        assert_eq!(RefusalDetail::new(&meta, dirty, true).error_type, None);
+
+        // An incomplete body is not parsed, and the logged body is bounded.
+        let long = vec![b'a'; LOGGED_BODY_BYTES * 2];
+        let d = RefusalDetail::new(&meta, &long, false);
+        assert_eq!(d.body.len(), LOGGED_BODY_BYTES);
+        assert_eq!(d.error_type, None);
+
+        // A character cut in half at the limit does not panic.
+        let mut cut = vec![b'a'; LOGGED_BODY_BYTES - 1];
+        cut.extend_from_slice("é".as_bytes());
+        let _ = RefusalDetail::new(&meta, &cut, true);
+    }
+
+    #[test]
+    fn clean_tokens_are_short_and_plain() {
+        assert_eq!(
+            clean_token("req_011.abc-1", 64).as_deref(),
+            Some("req_011.abc-1")
+        );
+        assert_eq!(clean_token("", 64), None);
+        assert_eq!(clean_token(&"a".repeat(65), 64), None);
+        for bad in ["a b", "a\nb", "a\"b", "é", "a/b"] {
+            assert_eq!(clean_token(bad, 64), None, "{bad:?}");
+        }
+    }
 
     #[tokio::test]
     async fn mock_parses_and_reports_deterministic_usage() {

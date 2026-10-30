@@ -306,15 +306,17 @@ A buffered success carries the request's settled cost. On `/v1/messages` and
 reads it without touching the body it was going to parse as the provider's. The
 catch-all `/v1/{provider}/{path}` route wraps the upstream body anyway, so the
 figure goes inside its `tollgate` envelope instead. Streams carry neither: the
-cost is not known when the headers are sent.
+cost is not known when the headers are sent. Every response on `/v1` and
+`/console/*` also carries `x-tollgate-request-id` (see below).
 
 Every refusal Tollgate itself generates on `/v1` and `/console/*` carries
 `x-tollgate-reason`, and it means the same thing on every route: `budget_exceeded` on a `402` (a hard cap would have been breached),
 `unpriced` on a `400` (no price is configured for that provider and model, so
 Tollgate refuses rather than forwarding something it cannot cost), then
-`unauthenticated`, `bad_request`, `backend_error`, `upstream_error`, and
-`unsupported` on the `501` for streaming under `exact` admission. Alert on the
-header. On `/console/*` that includes the `404`, `405` and request-timeout `503`
+`unauthenticated`, `bad_request`, `backend_error`, `upstream_error`,
+`upstream_rate_limited` on a `429` (the provider is rate limiting this
+deployment), and `unsupported` on the `501` for streaming under `exact`
+admission. Alert on the header. On `/console/*` that includes the `404`, `405` and request-timeout `503`
 the HTTP framework generates (`bad_request`, `bad_request` and `backend_error`).
 On `/v1`, the framework's own answers to an authenticated caller (`404` for a
 path no route serves, such as `/v1/models`; `405` for a wrong method; `413` for
@@ -327,12 +329,39 @@ the `/v1/{provider}/{path}` route, which refuses an unknown provider itself:
 store that cannot answer is also counted as `key_store_error`), or a streaming
 request for a provider this deployment has not enabled. The `501` and the
 not-enabled `503` are returned only to an authenticated caller.
-`upstream_error` means the provider, including any failure of the pre-flight
-token count that `exact` admission makes before forwarding, and including the
-case where the provider rejects Tollgate's own credential. A count failure is
-reported as `bad_request` only when the provider's status says the request BODY
-is at fault (`400`, `413`, `422`); a `401` or `403` is a gateway
-misconfiguration, not a client one, and is logged as such.
+`upstream_error` means the provider, including the case where the provider
+rejects Tollgate's own credential. The pre-flight token count that `exact`
+admission makes before forwarding is classified the same way as the request
+itself (the table below): a count the provider could not answer at all is
+`upstream_error`.
+
+When the provider refuses a request, the client gets a classified refusal,
+never the provider's response:
+
+| Provider status | Client gets | Reason |
+| --- | --- | --- |
+| `400`, `413`, `422` (the request body is at fault) | the same status | `bad_request` |
+| `429` | `429`, with `Retry-After` when the provider sent a whole number of seconds, clamped to 1 to 60 | `upstream_rate_limited` |
+| `401`, `403`, `404` and every other non-2xx | `502` | `upstream_error` |
+
+A `401`, `403` or `404` from the provider describes Tollgate's own credential or
+configuration, not the caller's, so it is never passed on as such. The
+refusal's body is fixed text in the route's format. The provider's message and
+headers are not passed on, because they can name the cloud project, region and
+resource path. The gateway's log line for the response's
+`x-tollgate-request-id` carries the provider's error type, error code and own
+request id; the first 2 KiB of the provider's body is logged only while the
+operator has switched it on (see [`docs/OPERATIONS.md`](./docs/OPERATIONS.md)).
+This covers every response the provider sends with a non-2xx status, buffered
+or streaming. An error event the provider sends inside a stream that started
+with `200` is still relayed as sent; it is not yet rewritten.
+
+Every response on `/v1` and `/console/*` carries `x-tollgate-request-id`, a
+random id Tollgate generates for that request (a client-supplied value is never
+used). Quote it when reporting a failure: it is on the log lines written while
+an authenticated request is handled (including the stream relay and
+settlement), and on the log line for a provider refusal. The demo does not set
+it, and nor does the `500` for a panic in the authentication gate itself.
 
 The response BODY is shaped for whichever client the route serves, so on
 `/v1/messages` it is an Anthropic error envelope and its `error.type` uses
@@ -493,6 +522,9 @@ is the property the design actually guarantees.
 ## Limitations
 
 Known limitations in this release, stated up front:
+
+- **A client never sees the provider's own error message.** A refused request gets a classified status, a reason and a fixed message, so a developer whose request a provider rejects is told it was rejected and given a request id, not why. The gateway's log has the provider's error type and code under that id, and the first 2 KiB of the provider's body only while the operator has switched it on. This is deliberate: provider messages can name the deployment's cloud project, region and resource paths.
+- **An error event inside a successful stream is relayed as the provider sent it.** Anthropic, for example, can send an `error` event on a stream that began with `200`. Every non-2xx response is classified; these mid-stream events are not yet rewritten.
 
 - **Streaming under `exact` admission is refused on the OpenAI path.** A streaming request to `/v1/chat/completions` with `TOLLGATE_PROVIDERS__ADMISSION=exact` returns `501` to an authenticated caller. The native Anthropic path at `/v1/messages` does support the combination, because `count_tokens` gives it a real pre-flight count for the prompt.
 - **Streaming is supported on `/v1/chat/completions` and `/v1/messages` only.** The native Vertex adapter still allows only `:generateContent`, because usage cannot be metered from a partial `streamGenerateContent` response.

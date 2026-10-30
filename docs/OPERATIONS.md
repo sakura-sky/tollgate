@@ -139,6 +139,60 @@ because returning it would first test it with no time limit, and on a silent
 network path that holds a lookup slot until the operating system gives up on the
 connection.
 
+## Provider refusals and request ids
+
+Every response on `/v1` and `/console/*` carries `x-tollgate-request-id`. Ask a
+client reporting a failure for it: the log lines written while an authenticated
+request is handled carry it, including the stream relay and settlement, in the
+`request_id` field of the line or of its `request` span. That span also records
+the method (cut to 16 bytes) and the path without its query (cut to 256 bytes),
+both the caller's own text.
+Unauthenticated requests open no span, so their lines (and the key-store
+failure line, which is rate-limited and aggregate) have none. A panic inside
+the authentication gate itself is answered without the header.
+
+When a provider answers with a non-2xx, the client gets a classified refusal
+(see the README's reason table) and the log gets one WARN line,
+`upstream refused the request`, with:
+
+- `request_id`, the id the client was given, on the line itself, so a `warn`
+  log filter (which drops the span) still finds it;
+- `provider`, `model`, `status`, and `fault` (`request`, `rate_limited` or
+  `provider`);
+- `provider_error_type` and `provider_error_code`, read from the provider's
+  error body and kept only when they are short, plain identifiers. They are
+  empty when the body is not JSON, or, on a stream, when it is over 2 KiB or
+  took more than 2 seconds to read; a stream's line is written by a background
+  task up to 2 seconds after the response;
+- `provider_request_id`, the provider's own id for the request, to quote to the
+  provider's support.
+
+The provider's message is not on that line, because it can echo part of the
+request. Up to 2 KiB of the provider's body is logged at TRACE under the target
+`tollgate::upstream_body`, which the default filter leaves off. To see it, add
+`tollgate::upstream_body=trace` to `TOLLGATE_TELEMETRY__LOG_FILTER`. Filters match
+targets by prefix, so `tollgate=trace` or a bare `trace` switches it on too. That
+line is never exported over OTLP. It covers refusals from the moment it is on;
+earlier ones cannot be recovered.
+
+A burst of `bad_request` across many keys can be a deployment fault rather than
+callers' bodies. Anthropic, for example, documents a `400` for a workspace spend
+limit, and a `429` with no Retry-After and the error code
+`enforced_spend_limit_reached` for its tier spend cap (check the provider's
+current documentation). Read the WARN lines'
+`provider_error_type` and `provider_error_code` before blaming clients.
+
+A provider `401`, `403`, `404`, or any other non-2xx outside `400`, `413`, `422`
+and `429`, reaches the client as `502`, so each one
+also produces tower-http's ERROR `response failed` line, as Tollgate's own
+`502`s always have.
+
+With `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` set, one Tollgate `request` span is now
+exported per authenticated request on `/v1` and `/console/*`. Before, the per-request span
+was at DEBUG in tower-http and filtered out by default. Unauthenticated
+requests and the public paths (`/healthz`, `/readyz`, `/metrics`, `/console`)
+open no span.
+
 ## Ledger retention
 
 `usage_events` is append-only: a trigger rejects `UPDATE` and `DELETE` for every

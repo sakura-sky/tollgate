@@ -15,6 +15,8 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -53,7 +55,15 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard> {
     let guard = if let Some(endpoint) = otlp_endpoint(cfg.otlp_endpoint.as_deref())? {
         let provider = build_otlp_provider(endpoint, &cfg.service_name)?;
         let tracer = provider.tracer(cfg.service_name.clone());
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        // Provider error bodies are opt-in at TRACE for investigation and never
+        // leave the process over OTLP: the export is plaintext gRPC, and a body
+        // can echo part of a request. (With TRACE on, the JSON log on stdout
+        // does carry them.)
+        let otel_layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter_fn(|meta| {
+                meta.target() != crate::provider::UPSTREAM_BODY_TARGET
+            }));
         global::set_text_map_propagator(TraceContextPropagator::new());
         registry.with(otel_layer).try_init().ok();
         TelemetryGuard {
