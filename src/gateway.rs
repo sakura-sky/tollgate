@@ -243,6 +243,11 @@ pub struct Metrics {
     pub unpriced: AtomicU64,
     pub errors: AtomicU64,
     pub unauthenticated: AtomicU64,
+    /// The number of configured budgets that cannot match some or all of their
+    /// requests, as of the last successful config load (set at boot and after
+    /// each successful reload). A budget that silently never applies is a
+    /// fail-open, so it must stay visible after the log line has scrolled away.
+    pub unmatchable_budgets: AtomicU64,
     /// Sum of settled cost, in currency micros. Wrapping is unreachable: at
     /// u64 micros this is more currency than exists, and Prometheus treats a
     /// counter reset as a restart anyway.

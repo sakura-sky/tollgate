@@ -832,6 +832,14 @@ impl PriceBook {
         self.lookup(provider, model).map(|p| p.cost_micros(usage))
     }
 
+    /// Every priced model under `provider`, in no particular order.
+    pub fn models_for<'a>(&'a self, provider: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.by_key
+            .keys()
+            .filter(move |(p, _)| p == provider)
+            .map(|(_, m)| m.as_str())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.by_key.len()

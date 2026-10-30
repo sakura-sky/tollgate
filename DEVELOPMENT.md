@@ -60,7 +60,7 @@ Migrations live in `migrations/` and are embedded into the binary by `sqlx::migr
 
 ```bash
 # Filenames are scanned in lexical order; use a 4-digit prefix.
-$EDITOR migrations/0011_your_change.sql
+$EDITOR migrations/0012_your_change.sql
 
 # Apply against your local Postgres
 cargo run --bin tollgate -- admin migrate

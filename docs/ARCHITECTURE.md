@@ -89,6 +89,13 @@ rather than a mandatory one. Its absence is logged at WARN by the config-reload
 task, which means it is never reported at all with
 `TOLLGATE_RELOAD__INTERVAL=0s`.
 
+A scope matches by exact string: the key id in lowercase hyphenated form, the
+provider as the route's provider id (`openai` for `/v1/chat/completions`,
+`anthropic` for `/v1/messages`, the path segment for `/v1/{provider}/...`), and
+the model as `provider:model` under the name the request used. A budget that
+cannot match some or all of its requests is reported at startup and on reload,
+with a warning and the `tollgate_unmatchable_budgets` gauge, not refused.
+
 ## Data model
 
 ```mermaid
@@ -104,7 +111,7 @@ erDiagram
   }
   budgets {
     text scope_type "global|api_key|provider|model"
-    text scope_id
+    text scope_id "api_key: lowercase hyphenated UUID (CHECK); model: provider:model"
     text period "daily|weekly|monthly"
     bigint limit_micros
     bool hard_stop
@@ -133,7 +140,7 @@ erDiagram
     uuid id PK
     text principal "cli:<user>@<host>, self-asserted"
     text action "key.issue|key.revoke|budget.set|price.set"
-    text resource "key id (issue), key prefix (revoke), budget scope, provider/model"
+    text resource "key id (issue), key prefix (revoke), budget scope (canonical), provider/model"
     jsonb metadata "never a secret"
     timestamptz occurred_at
   }
@@ -170,7 +177,10 @@ anybody; see `SECURITY.md`.
 - **No fail-open by omission.** A request matching no budget at all is denied. A
   global budget is not required for this: a deployment holding only per-key
   budgets serves normally. It is a strongly recommended backstop, not a
-  mandatory one.
+  mandatory one. A budget that exists but can never match (a non-canonical key
+  id, a disabled provider, an unpriced model) is the same fail-open in another
+  form, so ids are stored canonically, `admin budget set` refuses what it can,
+  and the rest is reported by the gauge.
 - **Auth.** Keys are `tgk_<pub>_<secret>`; only an HMAC of the secret under a
   server-side pepper is stored, compared in constant time, with a dummy-hash
   verify on prefix miss so hit and miss cost the same.
