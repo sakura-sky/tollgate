@@ -42,9 +42,10 @@ sequenceDiagram
   participant T as Tollgate
   participant V as Valkey
   participant P as Provider
-  participant L as Postgres ledger
+  participant L as Postgres (keys, ledger)
   C->>T: POST /v1/messages or /v1/chat/completions
-  T->>T: authenticate (HMAC-SHA256)
+  T->>L: look up the key (before routing)
+  T->>T: verify it (HMAC-SHA256)
   T->>T: price request (tokens to cost)
   T->>V: reserve worst-case cost
   opt counter missing (flush, failover, eviction, new period)
@@ -185,7 +186,9 @@ separation is the reason an agent's key can be revoked or capped without touchin
 the provider account.
 
 Streaming works, with one restriction: a streaming request under
-`TOLLGATE_PROVIDERS__ADMISSION=exact` is refused with `501` on this route. Run
+`TOLLGATE_PROVIDERS__ADMISSION=exact` is refused with `501` on this route (to an
+authenticated caller; without a valid key every request gets `401` first, or
+`503` if the key store cannot answer). Run
 `fast` admission if your agents stream, which is the default.
 
 ### Console (read-only web UI)
@@ -250,7 +253,7 @@ The gateway exposes standard operational endpoints for your SRE stack:
 
 - `GET /healthz` - liveness ping
 - `GET /readyz` - readiness
-- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard, and `tollgate_unmatchable_budgets`, the number of configured budgets that cannot match some or all of their requests: a key id that is not a UUID, a provider that is not enabled, a model with no current price, or a model also priced under a second name with no budget at least as hard of its own. A Vertex budget while `/v1/chat/completions` also reaches Vertex is logged but not counted, since no budget can clear it. Alert on it being above zero; a budget staged on purpose for a disabled provider or an unpriced model keeps it raised until it can match. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` decision and the `tollgate_unmatchable_budgets` gauge, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
+- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`, `key_store_error`), `tollgate_cost_micros_total`, `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard, and `tollgate_unmatchable_budgets`, the number of configured budgets that cannot match some or all of their requests: a key id that is not a UUID, a provider that is not enabled, a model with no current price, or a model also priced under a second name with no budget at least as hard of its own. A Vertex budget while `/v1/chat/completions` also reaches Vertex is logged but not counted, since no budget can clear it. Alert on it being above zero; a budget staged on purpose for a disabled provider or an unpriced model keeps it raised until it can match. `unauthenticated` counts every request under `/v1` or `/console/` refused for its key, including unknown paths, wrong methods and `/v1/messages/` sub-paths. `key_store_error` counts requests refused with `503` because the key store could not answer; alert on it separately, since it means Postgres, not a caller. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` and `key_store_error` decisions and the `tollgate_unmatchable_budgets` gauge, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
 
 Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set. The endpoint must be `http://host:port` or `unix:///path`: export is plaintext gRPC with no TLS compiled in, so send traces to a local OpenTelemetry Collector and let it use TLS to your backend. Any other value is refused at startup, and an empty value disables export.
 
@@ -259,6 +262,7 @@ Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set. The endp
 | Route | Method | Auth accepted |
 | --- | --- | --- |
 | `/v1/messages` | POST | `x-tollgate-key`, `Authorization: Bearer`, or `x-api-key` |
+| `/v1/messages/{path}` | POST | as `/v1/messages`; answers `404` (not metered) |
 | `/v1/chat/completions` | POST | `x-tollgate-key` or `Authorization: Bearer` |
 | `/v1/{provider}/{path}` | POST | `x-tollgate-key` or `Authorization: Bearer` |
 | `/console` | GET | none (the page itself; the viewer supplies a key to the endpoints below) |
@@ -266,14 +270,36 @@ Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set. The endp
 | `/healthz`, `/readyz`, `/metrics` | GET | none |
 
 Every authenticated route accepts the key either as `x-tollgate-key` or as
-`Authorization: Bearer`. `x-api-key` is read on `/v1/messages` only, so the
-Anthropic SDK works against it unchanged. Other sub-paths of `/v1/messages/`,
-such as `count_tokens` and `batches`, return 404: they are not metered, and
-serving them unmetered would put spend outside the ledger.
+`Authorization: Bearer`. `x-api-key` is read on `/v1/messages` and the paths
+under it only, so the Anthropic SDK works against it unchanged. Other sub-paths
+of `/v1/messages/`, such as `count_tokens` and `batches`, return 404 to an
+authenticated caller: they are not metered, and serving them unmetered would
+put spend outside the ledger.
+
+When more than one key header is present, `x-tollgate-key` wins, then
+`x-api-key` (on `/v1/messages` paths only), then `Authorization: Bearer`. An
+`x-tollgate-key` header that is present but empty, blank or not readable as text
+is skipped in favour of `Authorization: Bearer`, but it still stops `x-api-key`
+from being read.
+
+Authentication comes first. A request to `/v1`, to any path under `/v1/`, or to
+any path under `/console/` without a valid key gets `401` before anything else
+runs, including on unknown paths and with the wrong method. The response depends
+only on which family the path belongs to (Anthropic, OpenAI, the enveloped
+`/v1/{provider}` routes, or the console), never on which providers are enabled,
+the admission mode, prices, budgets, the method or the body. The one other answer
+is `503` with `x-tollgate-reason: backend_error` when the key store cannot answer
+within `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT` plus 250 ms. Only the exact key shape
+Tollgate issues (`tgk_`, 16 lowercase hex characters, `_`, 48 lowercase hex
+characters) is looked up; anything else is refused without touching Postgres.
+[`SECURITY.md`](./SECURITY.md) gives the limits of this: a HEAD response carries
+no body on the wire, and how long a `503` takes reflects that timeout and how
+busy key lookups are.
 
 `/console` is unauthenticated because it holds no data. It is a static asset that
 fetches everything from the two JSON endpoints, so serving it to an anonymous
-viewer discloses nothing; the key is checked where the spend actually lives.
+viewer discloses nothing; the key is checked on the endpoints that hold the
+data.
 
 A buffered success carries the request's settled cost. On `/v1/messages` and
 `/v1/chat/completions` it is the `x-tollgate-cost` response header, so a client
@@ -282,16 +308,25 @@ catch-all `/v1/{provider}/{path}` route wraps the upstream body anyway, so the
 figure goes inside its `tollgate` envelope instead. Streams carry neither: the
 cost is not known when the headers are sent.
 
-Every proxied refusal carries `x-tollgate-reason`, and it means the same thing on
-every route: `budget_exceeded` on a `402` (a hard cap would have been breached),
+Every refusal Tollgate itself generates on `/v1` and `/console/*` carries
+`x-tollgate-reason`, and it means the same thing on every route: `budget_exceeded` on a `402` (a hard cap would have been breached),
 `unpriced` on a `400` (no price is configured for that provider and model, so
 Tollgate refuses rather than forwarding something it cannot cost), then
 `unauthenticated`, `bad_request`, `backend_error`, `upstream_error`, and
 `unsupported` on the `501` for streaming under `exact` admission. Alert on the
-header.
+header. On `/console/*` that includes the `404`, `405` and request-timeout `503`
+the HTTP framework generates (`bad_request`, `bad_request` and `backend_error`).
+On `/v1`, the framework's own answers to an authenticated caller (`404` for a
+path no route serves, such as `/v1/models`; `405` for a wrong method; `413` for
+a body over 2 MiB; `400` for a path or body that does not decode) carry no
+header. A POST to any other path with two or more segments under `/v1/` reaches
+the `/v1/{provider}/{path}` route, which refuses an unknown provider itself:
+`400` with `x-tollgate-reason: unpriced`.
 
-`backend_error` means Tollgate's own dependencies, Valkey or Postgres, or a
-streaming request for a provider this deployment has not enabled.
+`backend_error` means Tollgate's own dependencies, Valkey or Postgres (a key
+store that cannot answer is also counted as `key_store_error`), or a streaming
+request for a provider this deployment has not enabled. The `501` and the
+not-enabled `503` are returned only to an authenticated caller.
 `upstream_error` means the provider, including any failure of the pre-flight
 token count that `exact` admission makes before forwarding, and including the
 case where the provider rejects Tollgate's own credential. A count failure is
@@ -459,7 +494,7 @@ is the property the design actually guarantees.
 
 Known limitations in this release, stated up front:
 
-- **Streaming under `exact` admission is refused on the OpenAI path.** A streaming request to `/v1/chat/completions` with `TOLLGATE_PROVIDERS__ADMISSION=exact` returns `501`. The native Anthropic path at `/v1/messages` does support the combination, because `count_tokens` gives it a real pre-flight count for the prompt.
+- **Streaming under `exact` admission is refused on the OpenAI path.** A streaming request to `/v1/chat/completions` with `TOLLGATE_PROVIDERS__ADMISSION=exact` returns `501` to an authenticated caller. The native Anthropic path at `/v1/messages` does support the combination, because `count_tokens` gives it a real pre-flight count for the prompt.
 - **Streaming is supported on `/v1/chat/completions` and `/v1/messages` only.** The native Vertex adapter still allows only `:generateContent`, because usage cannot be metered from a partial `streamGenerateContent` response.
 - **A stream that does not end cleanly is charged its full reservation**, which over-charges. "Cleanly" means the provider said it finished, not merely that the connection closed, because a proxy can close a connection cleanly mid-generation. On `/v1/messages` that is Anthropic's `message_stop`: Anthropic reports a small placeholder `output_tokens` in `message_start` and can deliver an error event on an otherwise-healthy 200 stream, so trusting the connection would under-charge a failed stream by its entire output leg. On `/v1/chat/completions` a stream is charged its measured usage when the upstream sent a non-empty `finish_reason` with no output after it, a usage report in or after that chunk, and `data: [DONE]`. A client that stops reading at the end of an answer, before `[DONE]`, is still measured: once the finish has arrived, Tollgate keeps reading the upstream for up to 10 seconds after it notices the client has stopped, without forwarding anything, to receive the usage and `[DONE]`. On Cloud Run with CPU allocated only during requests (`cpu_idle = true` in the shipped Terraform), that work may run with throttled CPU once the client has gone, so a drain can expire and charge the reservation. Two consequences for a custom OpenAI-compatible upstream: one that never sends a `finish_reason` or `[DONE]` is charged its reservation on every stream, and usage is assumed to be cumulative, so one that reports per-chunk deltas would be under-counted, or charged its reservation where a delta is smaller than the one before. Each stream the relay settles logs a `stream settled` line giving how it ended and what was seen, at `debug` when it was measured, ended at the provider's end marker and was not drained, and at `info` otherwise. Streams are cut after 60 seconds with no bytes, or 15 minutes in total, and charged their reservation. `/console/usage` splits `measured_cost` from `estimated_cost` over the rows it returns, so this is visible rather than silent. One exception: on `/v1/messages`, when Anthropic reports an error before generating anything (`overloaded_error` is the common one), only the reserved prompt leg is charged, because nothing was generated and SDK retries would otherwise multiply a full worst-case reservation through an overload window.
 - **Claude is reached at `/v1/messages`, not `/v1/chat/completions`.** Tollgate does not translate between provider protocols. Point your client's native Anthropic support at it; the Anthropic SDK, LiteLLM and the ADK all speak it. Do **not** configure Anthropic's own OpenAI-compatible endpoint as a custom upstream: it reports no prompt-cache tokens at all, so every cached Claude request would be silently under-counted. Tollgate refuses the obvious form of this at boot, but a CNAME or proxy in front of it cannot be detected.
@@ -479,12 +514,12 @@ Known limitations in this release, stated up front:
 - **`/metrics` reports decisions, limits and the number of unmatchable budgets, not spend.** A scrape reads process memory and queries neither Postgres nor Valkey, so there is no `tollgate_budget_spent` series: the authoritative figures live in the two stores that fail during the incident you would be using metrics to diagnose. Counters reset on restart. For spend, read `/console/budgets`, which queries and says so.
 - **Some spend is estimated rather than measured, and says so.** When usage cannot be trusted (an upstream that timed out after the request was sent, a response body that will not parse, self-contradictory token counts, a stream without the provider's finish, usage and end marker), Tollgate charges the request's reservation rather than releasing it, because the provider may well have served and billed it. Those rows are recorded as `estimated`, and `/console/usage` reports `measured_cost` alongside `estimated_cost`. This deliberately over-charges: releasing instead would under-charge a request the provider is invoicing. Two `estimated` cases charge less than the full reservation on purpose: a 2xx that reports no usage at all (a safety-blocked response) is charged the reserved prompt leg, and an Anthropic stream that errored before generating anything is charged the same.
 - **Soft budgets count and log, and refuse nothing.** `admin budget set --hard-stop false` records spend against a budget and logs a WARN each time it is exceeded, but never returns a `402`. There is no alerting, no metric, and no console indication beyond the flag itself, so a soft cap is a log line, not a notification. Budgets are hard by default.
-- **Postgres is on the request path, and an outage looks like mass key revocation.** Every request does one Postgres lookup to verify its API key, and one insert to append to the ledger. There is no key cache. If Postgres is unreachable, key verification fails and clients receive `401`, not `503`, and those refusals also land on the `unauthenticated` metric, so a database outage reads there like a burst of credential guessing. Reserve and settle normally touch only Valkey, but reserve also reads the ledger whenever a budget counter is absent, which is the first request of every period and any request after a cache loss, and it refuses with `503` if the ledger cannot answer. See the durability section of [`docs/OPERATIONS.md`](./docs/OPERATIONS.md). The ledger insert is best effort: a failure is logged and the request still succeeds, so a sustained Postgres outage means spend that Valkey enforced and the ledger never recorded.
+- **Postgres is on the request path.** Every request does one Postgres lookup to verify its API key, and one insert to append to the ledger. There is no key cache. If the key lookup cannot be answered within `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT` plus 250 ms, the request gets `503` with `x-tollgate-reason: backend_error` and is counted as `key_store_error`, not as `unauthenticated`, and SDKs retry it, so expect retry load during an outage. Key lookups use their own small pool (a quarter of `TOLLGATE_DATABASE__MAX_CONNECTIONS`, at most 4, so `serve` needs at least 4). A flood of well-formed but unknown keys can fill that pool, and legitimate callers then get the same `503` until it drains, but it cannot take the connections the ledger and config reload use. Reserve and settle normally touch only Valkey, but reserve also reads the ledger whenever a budget counter is absent, which is the first request of every period and any request after a cache loss, and it refuses with `503` if the ledger cannot answer. See the durability section of [`docs/OPERATIONS.md`](./docs/OPERATIONS.md). The ledger insert is best effort: a failure is logged and the request still succeeds, so a sustained Postgres outage means spend that Valkey enforced and the ledger never recorded.
 - **Budget periods are UTC.** `daily` resets at UTC midnight, `weekly` on Monday by ISO week, `monthly` on the calendar month. There is no way to align a period to a local day or to a provider's billing cycle, so a budget will not line up with an invoice that runs on a different boundary.
 - **A buffered upstream that times out is charged, not released.** `TOLLGATE_PROVIDERS__REQUEST_TIMEOUT` (default 600s) bounds one non-streaming provider call. When it expires the request is recorded as `estimated` at its reservation, because the provider may well have generated a full response Tollgate never read. Setting it low to fail fast therefore over-charges rather than failing cheaply. Any timeout in front of the gateway must be LONGER than this one and longer than the 15-minute stream cap, or the platform cuts the request first, Tollgate never gets to settle it, and the reservation is charged in full. The shipped Terraform sets Cloud Run to 960 seconds for exactly this reason.
 - **The console shows settled spend, and enforcement uses a different number.** `/console/budgets` sums the ledger; enforcement reads the Valkey counter, which also holds every reservation currently in flight. The two differ by the in-flight amount, so the console can show headroom while requests are being refused. Each open console polls Postgres once per second: one spend query per budget plus one query for the 100 most recent ledger rows.
 - **The ledger deletes itself by default.** `TOLLGATE_RETENTION__WINDOW` defaults to 90 days and drops whole partitions past it. If the ledger is your billing record, set it to `0s` or export partitions before they age out.
-- **There is no rate limiter.** Tollgate has none, so deploy it behind one. A request presenting a well-formed but unknown key still costs a Postgres key lookup (a missing or malformed key is rejected before the query), and a key that is over budget writes one rejected row to the ledger per attempt, on streaming and buffered routes alike, which a client in a retry loop will turn into ledger volume.
+- **There is no rate limiter.** Tollgate has none, so deploy it behind one; per-key rate limiting and a cache of unknown key prefixes are planned. A request presenting a well-formed but unknown key still costs a Postgres key lookup (a missing or malformed key is rejected before the query). Lookups run on their own small pool, so a flood of them can make legitimate callers wait and get `503`, but cannot starve the ledger. And a key that is over budget writes one rejected row to the ledger per attempt, on streaming and buffered routes alike, which a client in a retry loop will turn into ledger volume.
 - **Budgets are corrected upward only.** Startup reconciliation rebuilds counters from the ledger and never lowers them. There is no mechanism to adjust a live budget counter down, deliberately: the same path would be the highest-value thing in the system to compromise, and for output tokens there is no later source of truth to correct against, since they exist only in the response that reported them. Reconciling against a provider invoice is a reporting exercise, not an enforcement one.
 
 ## Enterprise edition
@@ -560,7 +595,8 @@ src/
   config.rs       - layered config (figment)
   telemetry.rs    - tracing + optional OTLP
   app.rs          - axum app, state, graceful shutdown
-  db.rs           - Postgres pool + migration runner
+  auth_gate.rs    - authentication before routing for /v1 and /console/*
+  db.rs           - Postgres pools (shared and key-lookup) + migration runner
   error.rs        - HTTP error type
   pricing.rs      - token → cost engine (integer micros, currency-agnostic)
   apikey.rs       - API-key generation, hashing (HMAC-SHA256), verification

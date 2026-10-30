@@ -254,7 +254,11 @@
       fetch("/console/budgets", { headers: headers() }),
       fetch("/console/usage", { headers: headers() })
     ]).then(function (rs) {
-      if (rs[0].status === 401) { throw new Error("Invalid API key."); }
+      if (rs[0].status === 401 || rs[1].status === 401) { throw new Error("Invalid API key."); }
+      // A 503 (key store or ledger unavailable) or any other refusal: say so,
+      // rather than render an empty dashboard or fail on a body that is not
+      // the expected JSON.
+      if (!rs[0].ok || !rs[1].ok) { throw new Error("Gateway temporarily unavailable."); }
       return Promise.all([rs[0].json(), rs[1].json()]);
     }).then(function (data) {
       var budgets = (data[0] && data[0].budgets) || [];

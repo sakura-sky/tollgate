@@ -145,6 +145,35 @@ pub fn parse(key: &str) -> Result<(String, String), KeyError> {
     Ok((format!("{KEY_TAG}_{pub_hex}"), secret.to_owned()))
 }
 
+/// Hex characters in the public part of a key `generate` produces (8 bytes).
+pub const PUB_HEX_LEN: usize = 16;
+/// Hex characters in the secret of a key `generate` produces (24 bytes).
+pub const SECRET_HEX_LEN: usize = 48;
+
+/// As [`parse`], but accept only the exact shape [`KeyHasher::generate`]
+/// produces: `tgk_`, 16 lowercase hex, `_`, 48 lowercase hex (69 characters).
+///
+/// Authentication uses this so that only a key that could have been issued
+/// costs a store lookup. `parse` stays lenient for `admin key revoke`, which
+/// also accepts a bare prefix.
+///
+/// # Errors
+/// Returns [`KeyError::Malformed`] for anything else.
+pub fn parse_strict(key: &str) -> Result<(String, String), KeyError> {
+    fn lower_hex(s: &str, len: usize) -> bool {
+        s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    let rest = key
+        .strip_prefix(KEY_TAG)
+        .and_then(|r| r.strip_prefix('_'))
+        .ok_or(KeyError::Malformed)?;
+    let (pub_hex, secret) = rest.split_once('_').ok_or(KeyError::Malformed)?;
+    if !lower_hex(pub_hex, PUB_HEX_LEN) || !lower_hex(secret, SECRET_HEX_LEN) {
+        return Err(KeyError::Malformed);
+    }
+    Ok((format!("{KEY_TAG}_{pub_hex}"), secret.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +240,45 @@ mod tests {
         // restarts work in production.
         let h2 = KeyHasher::new(pepper);
         assert!(h2.verify(&secret, &key.key_hash));
+    }
+
+    #[test]
+    fn generated_keys_have_the_strict_shape() {
+        let hasher = KeyHasher::random();
+        for _ in 0..64 {
+            let key = hasher.generate();
+            assert_eq!(key.plaintext.len(), 69, "{}", key.plaintext);
+            let (prefix, secret) = parse_strict(&key.plaintext).expect("strict shape");
+            assert_eq!(prefix, key.prefix);
+            assert!(hasher.verify(&secret, &key.key_hash));
+        }
+    }
+
+    #[test]
+    fn strict_parse_refuses_anything_generate_cannot_produce() {
+        let pub16 = "0123456789abcdef";
+        let sec48 = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let good = format!("tgk_{pub16}_{sec48}");
+        assert_eq!(good.len(), 69);
+        assert!(parse_strict(&good).is_ok());
+        let bad = [
+            String::new(),
+            "tgk_a_b".to_owned(),
+            format!("TGK_{pub16}_{sec48}"),
+            format!("tgk_{}_{sec48}", pub16.to_uppercase()),
+            format!("tgk_{pub16}_{}", sec48.to_uppercase()),
+            format!("tgk_{}_{sec48}", &pub16[1..]),
+            format!("tgk_{pub16}0_{sec48}"),
+            format!("tgk_{pub16}_{}", &sec48[1..]),
+            format!("tgk_{pub16}_{sec48}0"),
+            format!("tgk_{pub16}_{sec48}_"),
+            format!("tgk_{pub16}__{sec48}"),
+            format!("tgk_{}g_{sec48}", &pub16[1..]),
+            format!(" tgk_{pub16}_{sec48}"),
+        ];
+        for k in bad {
+            assert_eq!(parse_strict(&k), Err(KeyError::Malformed), "{k:?}");
+        }
     }
 
     #[test]

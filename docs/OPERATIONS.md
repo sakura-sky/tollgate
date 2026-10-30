@@ -77,6 +77,68 @@ full reconcile storm and a momentary cold window:
 If you deliberately want a cold cache (for example after changing budget periods),
 restart the gateway and let reconcile rebuild the counters from the ledger.
 
+## API-key lookups
+
+Every request under `/v1` and `/console/` is authenticated before anything else,
+with one Postgres lookup by key prefix. `serve` runs those lookups on their own
+pool, carved out of `TOLLGATE_DATABASE__MAX_CONNECTIONS`: a quarter of it, at
+most 4, with the rest for the shared pool (ledger writes, budget rebuilds, config
+reload, maintenance, the console). The default of 10 is 2 for lookups and 8
+shared. `serve` refuses to start below 4. Admin commands are unaffected and use
+the whole figure.
+
+Sizing: instances times `TOLLGATE_DATABASE__MAX_CONNECTIONS` must fit under the
+server's connection limit, which is low on small Cloud SQL tiers. This change
+leaves the total per instance as it was. With 4 to 7 connections the lookup pool
+has one connection, so one slow lookup holds up every other lookup for up to
+`TOLLGATE_DATABASE__ACQUIRE_TIMEOUT`.
+
+**Timeout.** Every lookup connection is opened with
+`statement_timeout` = `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT`, as a startup option,
+so the server ends a stalled lookup. Dropping a query from the client does not
+cancel it. At boot, before migrating, `serve` reads the setting back from
+`pg_settings` on a lookup connection and refuses to start if it does not match.
+That catches a connection pooler that drops startup options, which some
+transaction-mode poolers do. Every lookup connection opened later is checked the
+same way; one that does not match is discarded (sqlx logs `error returned from
+after_connect` for each attempt) and the lookup gets a `503`. The shipped
+Terraform connects to Cloud SQL directly; if you put a pooler in front, it must
+pass startup options through.
+
+`statement_timeout` does not cover a connection whose network path has gone
+silent, and Tollgate sets no TCP keepalive on its connections (the shared pool
+has the same exposure). The gate's own deadline, `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT`
+plus 250 ms, still bounds what the caller waits.
+
+**When the store cannot answer.** The caller gets `503` with
+`x-tollgate-reason: backend_error` in the route's error format, never `401`.
+Each one is counted on
+`tollgate_requests_total{decision="key_store_error"}`. SDKs retry a `503` (they do
+not retry a `401`), so expect retry load during a Postgres outage. The failure is
+logged at ERROR as `api key lookup failed; answering 503 until the key store
+recovers`, with a fixed `kind` (`pool_timed_out`, `io`, `database`, `deadline`
+and so on) and the SQLSTATE where there is one. At most one such line is written
+per minute, carrying the count of lines skipped since the previous one, because
+unauthenticated callers can trigger it. The metric is the authoritative count.
+The lookup pool's own statement and slow-acquire logging is switched off for the
+same reason. sqlx can still log a warning when it fails to test a returned
+connection; set the log filter for `sqlx` to `error` if that line is noise.
+
+**Saturation.** A flood of well-formed but unknown keys costs one lookup each and
+can fill the lookup pool, and legitimate callers then get that `503` until it
+drains. It cannot take the shared pool's connections, so the ledger and config
+reload keep working. Put a rate limiter in front; per-key rate limiting and a
+cache of unknown prefixes are planned.
+
+After a Postgres restart or failover, the lookup pool tests each idle connection
+before use and reconnects, so callers normally see no error. An idle connection
+whose network path went silent instead stalls the next lookup until the acquire
+timeout. A lookup the gate abandons at its deadline has its connection closed
+(sqlx gives up on the close after 5 seconds) rather than returned to the pool,
+because returning it would first test it with no time limit, and on a silent
+network path that holds a lookup slot until the operating system gives up on the
+connection.
+
 ## Ledger retention
 
 `usage_events` is append-only: a trigger rejects `UPDATE` and `DELETE` for every
@@ -279,6 +341,11 @@ Alert on two log messages. `usage ledger maintenance failed` is the early
 warning, weeks before anything visibly breaks. `failed to write usage event` is
 the ledger already losing rows. Neither affects the response a client gets, which
 is exactly why they need an alert rather than a dashboard.
+
+Alert on `tollgate_requests_total{decision="key_store_error"}` increasing. It
+means the key store (Postgres, or the key-lookup pool) could not answer and
+callers are getting `503`, not that anyone presented a bad key. See API-key
+lookups above.
 
 Alert too on `tollgate_unmatchable_budgets` being above zero. Each budget it
 counts fails to cover some or all of the requests it appears to. For a non-UUID

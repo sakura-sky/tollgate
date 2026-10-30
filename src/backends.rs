@@ -16,7 +16,9 @@ use redis::aio::ConnectionManager;
 use sqlx::{PgPool, Row};
 
 use crate::budget::{Budget, BudgetDenied, Period, RequestCtx, Reservation, Scope, resolve};
-use crate::gateway::{BudgetBackend, KeyRecord, KeyStore, ReserveError, UsageEvent, UsageSink};
+use crate::gateway::{
+    BudgetBackend, KeyRecord, KeyStore, KeyStoreError, ReserveError, UsageEvent, UsageSink,
+};
 use crate::pricing::{ModelPrice, PriceBook};
 
 /// Counter keys expire this many seconds after creation, so stale period
@@ -28,6 +30,11 @@ const COUNTER_TTL_SECS: i64 = 40 * 24 * 60 * 60;
 // ---------------------------------------------------------------------------
 
 /// Looks up API keys in Postgres by prefix (active keys only).
+///
+/// `serve` gives this its own small pool with a server-side
+/// `statement_timeout` (see [`crate::db::build_key_pool`]), so a flood of
+/// lookups cannot starve the ledger or reload of connections, and a stalled
+/// lookup is ended by the server rather than left holding a connection.
 pub struct PgKeyStore {
     pool: PgPool,
 }
@@ -41,26 +48,88 @@ impl PgKeyStore {
 
 #[async_trait]
 impl KeyStore for PgKeyStore {
-    async fn lookup(&self, prefix: &str) -> Option<KeyRecord> {
-        // A DB error must be logged, not silently collapsed into "key not found"
-        // (which would mask an outage as a wave of 401s).
-        let row = match sqlx::query(
+    async fn lookup(&self, prefix: &str) -> Result<Option<KeyRecord>, KeyStoreError> {
+        // Every failure is an `Err`, never "no such key": collapsing them would
+        // turn an outage into a wave of 401s. Not logged here; the HTTP gate
+        // logs store failures through one rate limiter, so an unauthenticated
+        // flood during an outage cannot flood the log as well.
+        let conn = self.pool.acquire().await.map_err(|e| key_store_error(&e))?;
+        let mut conn = CloseIfCancelled {
+            conn,
+            finished: false,
+        };
+        let row = sqlx::query(
             "SELECT id, key_hash FROM api_keys WHERE prefix = $1 AND revoked_at IS NULL",
         )
         .bind(prefix)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(row) => row?,
-            Err(e) => {
-                tracing::error!(error = %e, "api key lookup failed");
-                return None;
-            }
+        .fetch_optional(&mut *conn.conn)
+        .await;
+        conn.finished = true;
+        let row = row.map_err(|e| key_store_error(&e))?;
+        let Some(row) = row else {
+            return Ok(None);
         };
-        Some(KeyRecord {
-            id: row.get::<uuid::Uuid, _>("id").to_string(),
-            key_hash: row.get::<String, _>("key_hash"),
-        })
+        // `try_get`, not `get`: a schema that drifted from this query is a
+        // store failure (503), not a panic on the request path.
+        let id = row
+            .try_get::<uuid::Uuid, _>("id")
+            .map_err(|e| key_store_error(&e))?;
+        let key_hash = row
+            .try_get::<String, _>("key_hash")
+            .map_err(|e| key_store_error(&e))?;
+        Ok(Some(KeyRecord {
+            id: id.to_string(),
+            key_hash,
+        }))
+    }
+}
+
+/// A key-pool connection that is closed, not returned to the pool, if its query
+/// is abandoned.
+///
+/// The HTTP gate drops a lookup that misses its deadline. Returned to the pool,
+/// the connection would first be pinged with no timeout (sqlx 0.8), and on a
+/// network path that has gone silent that ping holds a lookup slot until the
+/// kernel gives up on the socket. Marked to close instead, sqlx gives up on the
+/// close after 5 seconds, and the slot is then free for the next lookup. A query that finished,
+/// successfully or not, returns its connection as usual.
+struct CloseIfCancelled {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    finished: bool,
+}
+
+impl Drop for CloseIfCancelled {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.conn.close_on_drop();
+        }
+    }
+}
+
+/// Classify a sqlx error into a fixed, loggable kind. The error's own text is
+/// not kept: it is not needed to act on the failure, and keeping only fixed
+/// strings guarantees nothing from the request reaches the log.
+fn key_store_error(e: &sqlx::Error) -> KeyStoreError {
+    let kind = match e {
+        sqlx::Error::PoolTimedOut => "pool_timed_out",
+        sqlx::Error::PoolClosed => "pool_closed",
+        sqlx::Error::Io(_) => "io",
+        sqlx::Error::Tls(_) => "tls",
+        sqlx::Error::Protocol(_) => "protocol",
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::Decode(_) => "schema",
+        _ => "other",
+    };
+    KeyStoreError {
+        kind,
+        code: e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned()),
     }
 }
 

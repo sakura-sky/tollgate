@@ -47,9 +47,49 @@ pub struct KeyRecord {
 }
 
 /// Looks up API keys by their public prefix.
+///
+/// `Ok(None)` means the store answered and there is no such key. `Err` means the
+/// store could not answer. The two must stay apart: collapsing a store failure
+/// into "no such key" turns a database outage into a wave of 401s, which SDKs do
+/// not retry and operators read as a credential problem.
 #[async_trait]
 pub trait KeyStore: Send + Sync {
-    async fn lookup(&self, prefix: &str) -> Option<KeyRecord>;
+    async fn lookup(&self, prefix: &str) -> Result<Option<KeyRecord>, KeyStoreError>;
+}
+
+/// The key store could not answer. Carries only what is safe to log: a fixed
+/// kind and, for a database error, its SQLSTATE. Never the query, the prefix or
+/// anything else derived from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyStoreError {
+    pub kind: &'static str,
+    pub code: Option<String>,
+}
+
+impl KeyStoreError {
+    #[must_use]
+    pub fn new(kind: &'static str) -> Self {
+        Self { kind, code: None }
+    }
+}
+
+impl std::fmt::Display for KeyStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.code {
+            Some(code) => write!(f, "key store {} (sqlstate {code})", self.kind),
+            None => write!(f, "key store {}", self.kind),
+        }
+    }
+}
+
+/// Why [`GatewayCore::authenticate`] did not resolve a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// No key, a malformed key, an unknown key, a revoked key or a wrong secret.
+    Unauthenticated,
+    /// The key store could not answer, so the key was neither accepted nor
+    /// refused. The HTTP layer maps this to 503 `backend_error`, never 401.
+    StoreUnavailable(KeyStoreError),
 }
 
 /// Why a reservation failed: a real budget denial, or a backend (infra) error.
@@ -243,6 +283,10 @@ pub struct Metrics {
     pub unpriced: AtomicU64,
     pub errors: AtomicU64,
     pub unauthenticated: AtomicU64,
+    /// Requests refused with 503 because the key store could not answer (an
+    /// error, or the key-lookup deadline). Counted apart from `unauthenticated`
+    /// so a database outage does not look like a credential-guessing attack.
+    pub key_store_error: AtomicU64,
     /// The number of configured budgets that cannot match some or all of their
     /// requests, as of the last successful config load (set at boot and after
     /// each successful reload). A budget that silently never applies is a
@@ -275,6 +319,17 @@ impl Metrics {
     pub fn observe_unauthenticated(&self) {
         self.unauthenticated.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn observe_key_store_error(&self) {
+        self.key_store_error.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `now - elapsed`, or `now` if that would precede the clock's origin.
+#[must_use]
+pub fn backdate(elapsed: std::time::Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_sub(elapsed).unwrap_or(now)
 }
 
 /// Extract the presented Tollgate key from either the `x-tollgate-key` header or
@@ -299,35 +354,51 @@ fn presented_key(headers: &HeaderMap) -> Option<String> {
 }
 
 impl GatewayCore {
-    /// Resolve the caller's key id from the request headers, or `None`.
-    /// Counting lives here rather than at the call sites: the streaming routes
-    /// and the console authenticate themselves without going through
-    /// `evaluate`, so counting there left a key-guesser sending `stream: true`
-    /// invisible to the one series most worth alerting on.
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Option<String> {
-        let id = self.authenticate_inner(headers).await;
-        if id.is_none() {
-            self.metrics.observe_unauthenticated();
+    /// Resolve the caller's key id from the request headers.
+    ///
+    /// Counting lives here rather than at the call sites, so every caller counts
+    /// the same way: `unauthenticated` for a refused key, `key_store_error` for
+    /// a store that could not answer. Never both for one call.
+    ///
+    /// # Errors
+    /// [`AuthError::Unauthenticated`] when no valid key was presented, and
+    /// [`AuthError::StoreUnavailable`] when the key store could not answer.
+    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<String, AuthError> {
+        let result = self.authenticate_inner(headers).await;
+        match &result {
+            Ok(_) => {}
+            Err(AuthError::Unauthenticated) => self.metrics.observe_unauthenticated(),
+            Err(AuthError::StoreUnavailable(_)) => self.metrics.observe_key_store_error(),
         }
-        id
+        result
     }
 
-    async fn authenticate_inner(&self, headers: &HeaderMap) -> Option<String> {
-        let presented = presented_key(headers)?;
-        let (prefix, secret) = apikey::parse(&presented).ok()?;
-        match self.keys.lookup(&prefix).await {
-            Some(k) if self.hasher.verify(&secret, &k.key_hash) => Some(k.id),
-            Some(_) => None,
-            None => {
-                // One verify against a fixed dummy hash, matching the hit path.
+    async fn authenticate_inner(&self, headers: &HeaderMap) -> Result<String, AuthError> {
+        let presented = presented_key(headers).ok_or(AuthError::Unauthenticated)?;
+        // Only the exact shape `generate` produces reaches the store, so crafted
+        // input can neither cost a lookup nor reach the 503 path.
+        let (prefix, secret) =
+            apikey::parse_strict(&presented).map_err(|_| AuthError::Unauthenticated)?;
+        let found = self.keys.lookup(&prefix).await;
+        // Exactly one verify on every path that reached the store, so a hit, a
+        // miss and a store failure cost the same hashing work.
+        match found {
+            Ok(Some(k)) if self.hasher.verify(&secret, &k.key_hash) => Ok(k.id),
+            Ok(Some(_)) => Err(AuthError::Unauthenticated),
+            Ok(None) => {
                 let _ = self.hasher.verify(&secret, &self.dummy_hash);
-                None
+                Err(AuthError::Unauthenticated)
+            }
+            Err(e) => {
+                let _ = self.hasher.verify(&secret, &self.dummy_hash);
+                Err(AuthError::StoreUnavailable(e))
             }
         }
     }
 
-    /// Run the full request flow. Records a usage event for every terminal
-    /// decision except unauthenticated (which never resolves to a key).
+    /// Authenticate, then run the full request flow. Used by the demo and the
+    /// tests; the production routes authenticate in the HTTP gate and call
+    /// [`GatewayCore::evaluate_authenticated`].
     pub async fn evaluate(
         &self,
         provider_id: &str,
@@ -335,15 +406,45 @@ impl GatewayCore {
         headers: &HeaderMap,
         body: &str,
     ) -> Outcome {
-        // Measure the gateway's own overhead: total time in this method minus the
-        // time awaiting the provider (pre-flight token count and the forward).
         let started = std::time::Instant::now();
+        match self.authenticate(headers).await {
+            Ok(key_id) => {
+                self.evaluate_authenticated(
+                    &key_id,
+                    started.elapsed(),
+                    provider_id,
+                    rest_path,
+                    body,
+                )
+                .await
+            }
+            // Both counted inside `authenticate`. Neither writes a ledger row:
+            // no key was resolved to charge it to.
+            Err(AuthError::Unauthenticated) => Outcome::Unauthenticated,
+            Err(AuthError::StoreUnavailable(e)) => Outcome::BackendError(e.to_string()),
+        }
+    }
+
+    /// Run the request flow for a caller already authenticated as `key_id`.
+    /// Records a usage event for every terminal decision.
+    ///
+    /// `auth_elapsed` is the time authentication took, so the overhead figures
+    /// include it as they did when authentication ran here, without also
+    /// counting the client's upload of the body in between.
+    pub async fn evaluate_authenticated(
+        &self,
+        key_id: &str,
+        auth_elapsed: std::time::Duration,
+        provider_id: &str,
+        rest_path: &str,
+        body: &str,
+    ) -> Outcome {
+        // Measure the gateway's own overhead: total time in this method, plus
+        // authentication, minus the time awaiting the provider (pre-flight
+        // token count and the forward).
+        let started = backdate(auth_elapsed);
         let mut provider_micros: u128 = 0;
-        let Some(key_id) = self.authenticate(headers).await else {
-            // Counted inside `authenticate`, which every route uses, rather
-            // than here, which only the buffered ones reach.
-            return Outcome::Unauthenticated;
-        };
+        let key_id = key_id.to_owned();
         let Some(provider) = self.providers.get(provider_id) else {
             self.record(
                 &key_id,
@@ -912,8 +1013,8 @@ impl MemKeyStore {
 
 #[async_trait]
 impl KeyStore for MemKeyStore {
-    async fn lookup(&self, prefix: &str) -> Option<KeyRecord> {
-        self.by_prefix.get(prefix).cloned()
+    async fn lookup(&self, prefix: &str) -> Result<Option<KeyRecord>, KeyStoreError> {
+        Ok(self.by_prefix.get(prefix).cloned())
     }
 }
 
@@ -1418,6 +1519,37 @@ mod tests {
             .evaluate("mock", "generate", &HeaderMap::new(), "{}")
             .await;
         assert!(matches!(out, Outcome::Unauthenticated));
+    }
+
+    /// A store that cannot answer is never "no such key": `evaluate` maps it to
+    /// a backend error, counts `key_store_error` (not `unauthenticated`) and
+    /// writes no ledger row.
+    #[tokio::test]
+    async fn a_failing_key_store_is_a_backend_error_not_unauthenticated() {
+        struct Failing;
+        #[async_trait]
+        impl KeyStore for Failing {
+            async fn lookup(&self, _prefix: &str) -> Result<Option<KeyRecord>, KeyStoreError> {
+                Err(KeyStoreError::new("test_failure"))
+            }
+        }
+        let (mut core, key) = core_with_key();
+        core.keys = Arc::new(Failing);
+        let usage = Arc::new(MemUsageSink::new());
+        core.usage = usage.clone();
+        let out = core.evaluate("mock", "generate", &header(&key), "{}").await;
+        assert!(matches!(out, Outcome::BackendError(_)), "{}", label(&out));
+        assert_eq!(core.metrics.key_store_error.load(Ordering::Relaxed), 1);
+        assert_eq!(core.metrics.unauthenticated.load(Ordering::Relaxed), 0);
+        assert!(usage.snapshot().is_empty());
+
+        // A malformed key never reaches the failing store: still a 401.
+        let out = core
+            .evaluate("mock", "generate", &header("tgk_a_b"), "{}")
+            .await;
+        assert!(matches!(out, Outcome::Unauthenticated));
+        assert_eq!(core.metrics.key_store_error.load(Ordering::Relaxed), 1);
+        assert_eq!(core.metrics.unauthenticated.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
