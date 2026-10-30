@@ -4,11 +4,13 @@
 //! Real provider adapters: Anthropic and Vertex/Gemini.
 //!
 //! Both implement the [`Provider`] trait via native pass-through: the client's
-//! provider-native body is forwarded verbatim to the upstream with that
-//! provider's credentials, and token usage is read from the response. Upstream
+//! provider-native body is forwarded to the upstream with that provider's
+//! credentials (native Vertex forwards the client's bytes only once
+//! `VertexProvider::checked_body` has proved they mean what was checked), and token usage is read from the response. Upstream
 //! base URLs are pinned from config and the client-supplied path is checked for
 //! traversal, so a request cannot be redirected off the configured provider.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,56 @@ fn estimate_input_tokens(body: &str) -> u64 {
     ((ascii / 4) + non_ascii).max(1) as u64
 }
 
+/// Refuse a body carrying an integer literal outside the `i64` and `u64`
+/// ranges.
+///
+/// `serde_json` reads such a literal as the nearest `f64`, so a body that is
+/// re-serialised before it is forwarded would send the provider another
+/// number than the client wrote, and a body checked as a parsed value but
+/// forwarded as sent (native Vertex) would be checked as another number. Scans the raw text, outside strings, for
+/// number tokens with no fraction or exponent. Run it only on a body that has
+/// already parsed as JSON.
+fn reject_lossy_integers(body: &str) -> Result<(), ProviderError> {
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_string {
+            match c {
+                b'\\' => i += 2,
+                b'"' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            i += 1;
+        } else if c == b'-' || c.is_ascii_digit() {
+            let start = i;
+            let mut integer = true;
+            while i < b.len() && matches!(b[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                integer &= !matches!(b[i], b'.' | b'e' | b'E');
+                i += 1;
+            }
+            let token = &body[start..i];
+            if integer && token.parse::<i64>().is_err() && token.parse::<u64>().is_err() {
+                return Err(bad(
+                    "an integer in the request body is outside the 64-bit range and would \
+                     not reach the provider unchanged",
+                ));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Reject path traversal / absolute paths in the client-supplied rest path so a
 /// request cannot escape the configured upstream base URL.
 fn safe_rest_path(rest_path: &str) -> Result<&str, ProviderError> {
@@ -40,9 +92,8 @@ fn safe_rest_path(rest_path: &str) -> Result<&str, ProviderError> {
         || rest_path.contains("..")
         || rest_path.contains(['\0', '\\'])
     {
-        return Err(ProviderError::BadRequest(format!(
-            "invalid upstream path: {rest_path}"
-        )));
+        // Fixed text: the path is the client's.
+        return Err(bad("invalid upstream path"));
     }
     Ok(rest_path)
 }
@@ -64,27 +115,22 @@ fn value_has_media_ref(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
             for (k, val) in map {
-                let key = k.to_ascii_lowercase();
+                // Without case or underscores, as `loose_key` compares them:
+                // the native Vertex adapter forwards `file__data` or
+                // `File_Data` as `fileData`, so this must see them as one key.
+                let key = loose_key(k);
                 // External-reference keys across Anthropic, Gemini, and OpenAI
                 // shapes (OpenAI vision/audio use image_url / input_audio).
                 if matches!(
                     key.as_str(),
-                    "fileuri"
-                        | "file_uri"
-                        | "file_id"
-                        | "filedata"
-                        | "file_data"
-                        | "image_url"
-                        | "input_audio"
+                    "fileuri" | "fileid" | "filedata" | "imageurl" | "inputaudio"
                 ) {
                     return true;
                 }
                 // A source/part typed as a URL or OpenAI media reference.
                 if key == "type"
                     && val.as_str().is_some_and(|s| {
-                        s.eq_ignore_ascii_case("url")
-                            || s.eq_ignore_ascii_case("image_url")
-                            || s.eq_ignore_ascii_case("input_audio")
+                        matches!(loose_key(s).as_str(), "url" | "imageurl" | "inputaudio")
                     })
                 {
                     return true;
@@ -156,14 +202,17 @@ fn reject_rate_switches(v: &Value) -> Result<(), ProviderError> {
             "server-side search is billed per call, which no token count reports",
         );
     }
-    // Priority tiers bill more per token at identical token counts.
-    if let Some(t) = v.get("service_tier").and_then(Value::as_str) {
-        if !matches!(t, "auto" | "default") {
-            return refuse(
-                "an explicit service_tier",
-                "non-default tiers change the per-token rate",
-            );
-        }
+    // Priority tiers bill more per token at identical token counts, and
+    // `auto` lets the provider pick one. Anything present but the exact
+    // string "default" is refused, `null` and non-strings included: how an
+    // upstream reads those is not known.
+    if v.get("service_tier")
+        .is_some_and(|t| t.as_str() != Some("default"))
+    {
+        return refuse(
+            "a service_tier other than 'default'",
+            "other tiers, and 'auto', which may pick one, change the per-token rate",
+        );
     }
     // Hosted/server-side tools carry per-call fees. Client-executed function
     // tools are token-only and stay allowed.
@@ -340,15 +389,27 @@ impl AnthropicProvider {
     /// requires `max_tokens` and `parse_common` refused the request without it,
     /// so reserved and enforced already agree.
     ///
+    /// `anthropic_beta` is the handler's validated, joined beta list (see
+    /// [`joined_anthropic_betas`]).
+    ///
     /// # Errors
     /// Returns a provider error if the upstream call fails.
-    pub async fn forward_stream(&self, body: &str) -> Result<reqwest::Response, ProviderError> {
+    pub async fn forward_stream(
+        &self,
+        body: &str,
+        anthropic_beta: Option<&str>,
+    ) -> Result<reqwest::Response, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
-        self.stream_http
+        let mut request = self
+            .stream_http
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(beta) = anthropic_beta {
+            request = request.header("anthropic-beta", beta);
+        }
+        request
             .body(pin_outbound(body, true))
             .send()
             .await
@@ -453,7 +514,8 @@ const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
 /// billing-neutral. The header may carry a comma-separated list, and a client
 /// may send the header more than once, so callers check each value.
 ///
-/// Returns the first unrecognised beta so the refusal can name it.
+/// Returns the first unrecognised beta. It is the client's string, so the
+/// refusal does not repeat it.
 #[must_use]
 pub fn unknown_anthropic_beta(header_value: &str) -> Option<String> {
     header_value
@@ -462,6 +524,25 @@ pub fn unknown_anthropic_beta(header_value: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
         .find(|s| !ALLOWED_ANTHROPIC_BETAS.contains(s))
         .map(str::to_owned)
+}
+
+/// The betas to forward, from every `anthropic-beta` header value: split on
+/// commas, trimmed, deduplicated in first-seen order and joined with `,`.
+/// `None` when there are none.
+///
+/// Callers pass only values that [`unknown_anthropic_beta`] has cleared, so
+/// what is forwarded is always on the allowlist.
+#[must_use]
+pub fn joined_anthropic_betas<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut betas: Vec<&str> = Vec::new();
+    for value in values {
+        for beta in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if !betas.contains(&beta) {
+                betas.push(beta);
+            }
+        }
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 impl AnthropicProvider {
@@ -483,6 +564,8 @@ impl AnthropicProvider {
         }
         let v: Value =
             serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        // The body is re-serialised before it is forwarded (`pin_outbound`).
+        reject_lossy_integers(body)?;
         if !allow_stream && v.get("stream").and_then(Value::as_bool) == Some(true) {
             return Err(ProviderError::BadRequest(
                 "streaming is handled on a separate path".to_owned(),
@@ -531,12 +614,13 @@ impl AnthropicProvider {
         // 1.25x, against one configured write rate. An operator who set the 5m
         // rate would reserve at 1.25x and settle at 2x, overshooting a hard cap
         // by the difference on every request.
-        if let Some(ttl) = find_cache_control_ttl(&v) {
-            return Err(ProviderError::BadRequest(format!(
-                "cache_control ttl '{ttl}' is not supported: a longer TTL bills at a \
+        // Fixed text: the TTL is the client's.
+        if has_non_default_cache_ttl(&v) {
+            return Err(bad(
+                "a cache_control ttl other than 5m is not supported: a longer TTL bills at a \
                  different multiple of the input rate than the default, and one \
-                 configured cache-write rate cannot express both"
-            )));
+                 configured cache-write rate cannot express both",
+            ));
         }
         // Priority tier bills the same tokens at a premium.
         if let Some(t) = v.get("service_tier").and_then(Value::as_str) {
@@ -555,6 +639,9 @@ impl AnthropicProvider {
             // Only a request carrying a cache breakpoint can produce a cache
             // write, so only that request is reserved at the write rate.
             may_cache_write: value_has_cache_control(&v),
+            anthropic_beta: None,
+            // Refused above.
+            external_media: false,
         })
     }
 }
@@ -739,14 +826,11 @@ fn parse_anthropic_usage_obj(u: &Value) -> Usage {
 /// prevent. Reasoning about which fields "cannot" affect an input count is how
 /// that bug got written; measure instead.
 ///
-/// `cachedContent` being rejected is a real limitation rather than a nuisance.
-/// A request naming a stored context cache has a small body and a large metered
-/// prompt, and `:countTokens` will not accept the field that says so, so `exact`
-/// admission cannot size those requests on Vertex at all. They settle correctly
-/// and can overshoot their reservation. See the README's `exact` limitation.
-fn vertex_count_payload(body: &str) -> Result<Value, ProviderError> {
-    let v: Value =
-        serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+/// `cachedContent` never reaches this function: `check_vertex_allowlist`
+/// refuses a request naming a stored context cache before any count or
+/// forward, because its small body hides a large metered prompt that
+/// `:countTokens` cannot size.
+fn vertex_count_payload(v: &Value) -> Result<Value, ProviderError> {
     let mut out = serde_json::Map::new();
     for k in ["contents", "tools", "generationConfig"] {
         if let Some(val) = v.get(k) {
@@ -818,29 +902,22 @@ fn count_tokens_payload(body: &str) -> Result<Value, ProviderError> {
     Ok(Value::Object(out))
 }
 
-/// The `ttl` of any `cache_control` block, when it is not the default.
+/// Whether any `cache_control` block carries a `ttl` other than the default.
 ///
-/// Returned so the caller can refuse it: TTL selects a billing multiple, and the
-/// price book has one cache-write rate.
-fn find_cache_control_ttl(v: &Value) -> Option<String> {
+/// The caller refuses it: TTL selects a billing multiple, and the price book
+/// has one cache-write rate.
+fn has_non_default_cache_ttl(v: &Value) -> bool {
     match v {
-        Value::Object(map) => {
-            for (k, val) in map {
-                if k.eq_ignore_ascii_case("cache_control") {
-                    if let Some(ttl) = val.get("ttl").and_then(Value::as_str) {
-                        if !ttl.eq_ignore_ascii_case("5m") {
-                            return Some(ttl.to_owned());
-                        }
-                    }
-                }
-                if let Some(found) = find_cache_control_ttl(val) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(find_cache_control_ttl),
-        _ => None,
+        Value::Object(map) => map.iter().any(|(k, val)| {
+            let longer = k.eq_ignore_ascii_case("cache_control")
+                && val
+                    .get("ttl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ttl| !ttl.eq_ignore_ascii_case("5m"));
+            longer || has_non_default_cache_ttl(val)
+        }),
+        Value::Array(items) => items.iter().any(has_non_default_cache_ttl),
+        _ => false,
     }
 }
 
@@ -865,16 +942,23 @@ impl Provider for AnthropicProvider {
         &self,
         rest_path: &str,
         body: &str,
-        _parsed: &ParsedRequest,
+        parsed: &ParsedRequest,
     ) -> Result<ProviderResponse, ProviderError> {
         let path = safe_rest_path(rest_path)?;
         let url = format!("{}/v1/{path}", self.base_url);
-        let resp = self
+        let mut request = self
             .http
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.version)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // Validated against the allowlist by the native handler. Not sent on
+        // the token count: every allowlisted beta is billing-neutral, and the
+        // count matched real usage without them (probe P10).
+        if let Some(beta) = parsed.anthropic_beta.as_deref() {
+            request = request.header("anthropic-beta", beta);
+        }
+        let resp = request
             .body(pin_outbound(body, false))
             .send()
             .await
@@ -929,6 +1013,844 @@ impl Provider for AnthropicProvider {
             .ok_or_else(|| {
                 ProviderError::Upstream("count_tokens returned no input_tokens".to_owned())
             })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native Vertex request checks
+// ---------------------------------------------------------------------------
+
+/// The refusal for a `fileData` URI that is not allowed. Fixed text: it never
+/// carries the URI or the bucket, which can name the operator's storage.
+pub const FORBIDDEN_SOURCE: &str = "a fileData URI names a source this gateway does not allow: \
+     gs:// URIs outside the operator's allowlisted buckets, Google storage and API hosts, \
+     URIs carrying credentials, and other schemes are refused";
+
+/// The refusal for an `https://` `fileData` URI that is not otherwise
+/// forbidden. Remote media is not supported yet: its size is unbounded, and
+/// what the URL serves can change between the token count and the generation,
+/// so neither admission mode can bound it.
+pub const REMOTE_MEDIA_UNSUPPORTED: &str = "https:// fileData URIs are not supported yet: \
+     remote media is unbounded and can change between the token count and the generation. \
+     Use a gs:// URI in a bucket the operator has allowlisted";
+
+/// A JSON value parsed with duplicate object keys refused.
+///
+/// `serde_json::Value` keeps the LAST of two equal keys, while another parser
+/// may keep the first, so a body with duplicates can mean one thing to the
+/// checks here and another to the provider. Refusing them makes the checked
+/// value the only reading. Nesting depth stays bounded by serde_json's own
+/// recursion limit, since every level goes back through `deserialize_any`.
+struct StrictValue(Value);
+
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor).map(StrictValue)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
+        // JSON cannot spell a non-finite number, so the fallback is unreachable.
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(StrictValue(v)) = seq.next_element()? {
+            items.push(v);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if out.contains_key(&key) {
+                // Fixed text: the key is the client's.
+                return Err(serde::de::Error::custom("duplicate key in a JSON object"));
+            }
+            let StrictValue(v) = map.next_value()?;
+            out.insert(key, v);
+        }
+        Ok(Value::Object(out))
+    }
+}
+
+/// Parse a body, refusing duplicate keys anywhere in it.
+fn parse_strict(body: &str) -> Result<Value, ProviderError> {
+    let v = serde_json::from_str::<StrictValue>(body)
+        .map(|StrictValue(v)| v)
+        .map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+    reject_lossy_integers(body)?;
+    Ok(v)
+}
+
+/// The canonical `lowerCamelCase` spelling of a key in a Google-defined
+/// object, or `None` for a key Tollgate will not forward.
+///
+/// Only two spellings are accepted: strict lowerCamel (`^[a-z][a-zA-Z0-9]*$`),
+/// returned as is, and strict snake_case (`^[a-z][a-z0-9]*(_[a-z0-9]+)+$`),
+/// rewritten as Google's JSON parser reads it (`max_output_tokens` becomes
+/// `maxOutputTokens`). Google's parser also accepts looser spellings
+/// (`file__data`, `File_Data`, `file_data_`), but which field it maps each to
+/// is not documented, so they are refused rather than guessed.
+fn camel_case(key: &str) -> Option<String> {
+    let b = key.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_lowercase) {
+        return None;
+    }
+    if b.iter().all(u8::is_ascii_alphanumeric) {
+        return Some(key.to_owned());
+    }
+    let snake = key.split('_').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    });
+    if !snake {
+        return None;
+    }
+    let mut segments = key.split('_');
+    let mut out = segments.next().unwrap_or("").to_owned();
+    for segment in segments {
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    Some(out)
+}
+
+/// How the value under one canonical key is handled.
+type Nested = fn(&str, Value) -> Result<Value, ProviderError>;
+
+/// Rewrite one Google-defined object's own keys to camelCase, handing each
+/// value to `nested` by its canonical key. Two keys that name the same field
+/// (`maxOutputTokens` beside `max_output_tokens`) are refused: Google would
+/// pick one, and the checks here must see the one it picks. So are two keys
+/// that differ only in case or underscores (`fileDATA` beside `fileData`,
+/// `pARTS` beside `parts`), compared as [`loose_key`] compares them: which of
+/// them Google reads is not documented. A value that is not an object is
+/// returned unchanged; the provider refuses wrong types.
+fn canon_object(v: Value, nested: Nested) -> Result<Value, ProviderError> {
+    let Value::Object(map) = v else {
+        return Ok(v);
+    };
+    let mut loose = std::collections::HashSet::new();
+    let mut out = serde_json::Map::new();
+    for (k, val) in map {
+        if !loose.insert(loose_key(&k)) {
+            // Fixed text: the keys are the client's.
+            return Err(bad(
+                "two keys in one Google-defined object differ only in case or underscores; \
+                 send one",
+            ));
+        }
+        let Some(key) = camel_case(&k) else {
+            // Fixed text: the key is the client's.
+            return Err(bad(
+                "a field name in a Google-defined object must be lowerCamelCase or \
+                 snake_case",
+            ));
+        };
+        let val = nested(&key, val)?;
+        if out.insert(key, val).is_some() {
+            return Err(ProviderError::BadRequest(
+                "two keys in one object name the same field (a snake_case and a camelCase \
+                 spelling); send one"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Apply `f` to each element of an array; any other value is unchanged.
+fn canon_each(
+    v: Value,
+    f: fn(Value) -> Result<Value, ProviderError>,
+) -> Result<Value, ProviderError> {
+    match v {
+        Value::Array(items) => items
+            .into_iter()
+            .map(f)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        other => Ok(other),
+    }
+}
+
+/// Leave a value as the client sent it: client-owned maps (`args`, schemas,
+/// `labels`) are never rewritten, so a tool parameter called `user_id` beside
+/// one called `userId` stays two parameters.
+fn keep(_key: &str, v: Value) -> Result<Value, ProviderError> {
+    Ok(v)
+}
+
+fn keep_object(v: Value) -> Result<Value, ProviderError> {
+    canon_object(v, keep)
+}
+
+fn canon_top(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        "generationConfig" => canon_object(v, canon_generation_config),
+        "toolConfig" => canon_object(v, canon_tool_config),
+        "systemInstruction" => canon_object(v, canon_content),
+        "contents" => canon_each(v, canon_content_entry),
+        "tools" => canon_each(v, canon_tool_entry),
+        "safetySettings" => canon_each(v, keep_object),
+        _ => Ok(v),
+    }
+}
+
+fn canon_generation_config(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        // Not `responseSchema` / `responseJsonSchema`: those are the client's.
+        "thinkingConfig" => canon_object(v, keep),
+        _ => Ok(v),
+    }
+}
+
+fn canon_tool_config(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        "functionCallingConfig" => canon_object(v, keep),
+        _ => Ok(v),
+    }
+}
+
+fn canon_content_entry(v: Value) -> Result<Value, ProviderError> {
+    canon_object(v, canon_content)
+}
+
+fn canon_content(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        "parts" => canon_each(v, canon_part_entry),
+        _ => Ok(v),
+    }
+}
+
+fn canon_part_entry(v: Value) -> Result<Value, ProviderError> {
+    canon_object(v, canon_part)
+}
+
+fn canon_part(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        // Their own keys only: `functionCall.args` is the client's.
+        "inlineData"
+        | "fileData"
+        | "functionCall"
+        | "videoMetadata"
+        | "executableCode"
+        | "codeExecutionResult"
+        | "mediaResolution" => canon_object(v, keep),
+        // Its own keys, and the media parts it may carry; `response` is the
+        // client's.
+        "functionResponse" => canon_object(v, canon_function_response),
+        _ => Ok(v),
+    }
+}
+
+fn canon_function_response(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        "parts" => canon_each(v, canon_part_entry),
+        _ => Ok(v),
+    }
+}
+
+fn canon_tool_entry(v: Value) -> Result<Value, ProviderError> {
+    canon_object(v, canon_tool)
+}
+
+fn canon_tool(key: &str, v: Value) -> Result<Value, ProviderError> {
+    match key {
+        // Each declaration's own keys; its `parameters`, `parametersJsonSchema`
+        // and `response` schemas are the client's.
+        "functionDeclarations" => canon_each(v, keep_object),
+        _ => Ok(v),
+    }
+}
+
+/// Top-level fields a native Vertex request may carry.
+///
+/// Everything else is refused. `cachedContent` names the operator's caches and
+/// cannot be sized; `routingConfig` and `modelConfig` can send the request to a
+/// model other than the one priced; `model` in the body is refused because the
+/// path names the model; unknown fields cannot be metered.
+const VERTEX_TOP_LEVEL: &[&str] = &[
+    "contents",
+    "systemInstruction",
+    "generationConfig",
+    "tools",
+    "toolConfig",
+    "safetySettings",
+    "labels",
+];
+
+/// `generationConfig` fields that leave the rate and the model alone.
+/// `candidateCount`, `responseModalities` and `thinkingConfig` are allowed
+/// with the further checks in [`check_generation_config`]. Everything else,
+/// such as `speechConfig`, `imageConfig`, `audioTimestamp`, `routingConfig` and
+/// `enableAffectiveDialog`, is refused.
+const VERTEX_GENERATION_CONFIG: &[&str] = &[
+    "temperature",
+    "topP",
+    "topK",
+    "maxOutputTokens",
+    "stopSequences",
+    "responseMimeType",
+    "responseSchema",
+    "responseJsonSchema",
+    "responseFormat",
+    "presencePenalty",
+    "frequencyPenalty",
+    "seed",
+    "responseLogprobs",
+    "logprobs",
+    "mediaResolution",
+    "thinkingConfig",
+    "responseModalities",
+    "candidateCount",
+];
+
+const VERTEX_THINKING_CONFIG: &[&str] = &["includeThoughts", "thinkingBudget", "thinkingLevel"];
+
+/// Label limits: 63 characters per key and value is Google's documented limit;
+/// 64 labels is Tollgate's own cap.
+const MAX_LABELS: usize = 64;
+const MAX_LABEL_CHARS: usize = 63;
+
+fn bad(message: &str) -> ProviderError {
+    ProviderError::BadRequest(message.to_owned())
+}
+
+/// Check a canonical native Vertex body against the allowlist. `labels` are
+/// accepted only when the operator allowed them.
+fn check_vertex_allowlist(v: &Value, allow_labels: bool) -> Result<(), ProviderError> {
+    let Some(top) = v.as_object() else {
+        return Err(bad("the request body must be a JSON object"));
+    };
+    if top.keys().any(|k| !VERTEX_TOP_LEVEL.contains(&k.as_str())) {
+        return Err(bad(
+            "native Vertex requests accept only these top-level fields: contents, \
+             systemInstruction, generationConfig, tools, toolConfig, safetySettings, labels. \
+             Others (cachedContent, routingConfig, modelConfig, model, ...) are refused: they \
+             name the operator's caches, change the model that is billed, or cannot be metered",
+        ));
+    }
+    if let Some(tools) = top.get("tools") {
+        let Some(tools) = tools.as_array() else {
+            return Err(bad("tools must be an array"));
+        };
+        for tool in tools {
+            let Some(tool) = tool.as_object() else {
+                return Err(bad("each tools entry must be an object"));
+            };
+            if tool.keys().any(|k| k != "functionDeclarations") {
+                return Err(bad(
+                    "only functionDeclarations tools are supported: server-side tools \
+                     (search, retrieval, code execution, URL context, maps, computer use) \
+                     bill per call or read the operator's data, which no token count reports",
+                ));
+            }
+        }
+    }
+    if let Some(tool_config) = top.get("toolConfig") {
+        let ok = tool_config
+            .as_object()
+            .is_some_and(|m| m.keys().all(|k| k == "functionCallingConfig"));
+        if !ok {
+            return Err(bad(
+                "toolConfig must be an object carrying only functionCallingConfig",
+            ));
+        }
+    }
+    if let Some(labels) = top.get("labels") {
+        if !allow_labels {
+            return Err(bad(
+                "labels are not accepted: they land in the operator's billing export. The \
+                 operator can allow them with providers.vertex.allow_client_labels",
+            ));
+        }
+        check_labels(labels)?;
+    }
+    if let Some(generation_config) = top.get("generationConfig") {
+        check_generation_config(generation_config)?;
+    }
+    Ok(())
+}
+
+/// Labels land in the operator's billing export, so they are bounded: each key
+/// and value at most 63 characters (Google's documented limit), and at most 64
+/// labels (Tollgate's own cap; Google documents no count here).
+fn check_labels(labels: &Value) -> Result<(), ProviderError> {
+    let refuse = || {
+        bad(
+            "labels must be an object of at most 64 string values, each key and value at \
+             most 63 characters",
+        )
+    };
+    let Some(map) = labels.as_object() else {
+        return Err(refuse());
+    };
+    if map.len() > MAX_LABELS {
+        return Err(refuse());
+    }
+    for (k, val) in map {
+        let Some(val) = val.as_str() else {
+            return Err(refuse());
+        };
+        if k.chars().count() > MAX_LABEL_CHARS || val.chars().count() > MAX_LABEL_CHARS {
+            return Err(refuse());
+        }
+    }
+    Ok(())
+}
+
+fn check_generation_config(generation_config: &Value) -> Result<(), ProviderError> {
+    let Some(map) = generation_config.as_object() else {
+        return Err(bad("generationConfig must be an object"));
+    };
+    if map
+        .keys()
+        .any(|k| !VERTEX_GENERATION_CONFIG.contains(&k.as_str()))
+    {
+        return Err(bad(
+            "generationConfig carries a field Tollgate does not allow: speech, image and \
+             audio output and routing settings change the rate or the model that is billed, \
+             so only the text-generation fields listed in the README are accepted",
+        ));
+    }
+    // Each candidate is a separate generation up to `maxOutputTokens`, so more
+    // than one multiplies output beyond the reservation.
+    if map
+        .get("candidateCount")
+        .is_some_and(|n| n.as_u64() != Some(1))
+    {
+        return Err(bad(
+            "generationConfig.candidateCount must be absent or 1: each candidate multiplies \
+             output beyond the reserved cap",
+        ));
+    }
+    // Audio and image output bill at other rates than text.
+    if let Some(m) = map.get("responseModalities") {
+        let text_only = m.as_array().is_some_and(|a| {
+            a.len() == 1
+                && a[0]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("TEXT"))
+        });
+        if !text_only {
+            return Err(bad(
+                "generationConfig.responseModalities must be absent or [\"TEXT\"]: other \
+                 output modalities bill at a different rate",
+            ));
+        }
+    }
+    if let Some(thinking) = map.get("thinkingConfig") {
+        let Some(thinking) = thinking.as_object() else {
+            return Err(bad("generationConfig.thinkingConfig must be an object"));
+        };
+        if thinking
+            .keys()
+            .any(|k| !VERTEX_THINKING_CONFIG.contains(&k.as_str()))
+        {
+            return Err(bad(
+                "thinkingConfig accepts only includeThoughts, thinkingBudget and thinkingLevel",
+            ));
+        }
+        if let Some(budget) = thinking.get("thinkingBudget") {
+            explicit_thinking_budget(budget)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a client's thinking budget: `Some(n)` for a positive budget, `None`
+/// for 0 or -1 (dynamic). Any other negative or a non-integer is refused.
+fn explicit_thinking_budget(budget: &Value) -> Result<Option<u64>, ProviderError> {
+    match budget.as_i64() {
+        Some(-1 | 0) => Ok(None),
+        Some(n) if n > 0 => Ok(u64::try_from(n).ok()),
+        _ => match budget.as_u64() {
+            // Above i64::MAX: still a positive integer.
+            Some(n) => Ok(Some(n)),
+            None => Err(bad(
+                "a thinking budget must be an integer: -1 (dynamic), 0, or a positive count",
+            )),
+        },
+    }
+}
+
+/// Refuse any `fileData` URI the provider would fetch with the operator's
+/// identity from somewhere the operator has not allowed.
+///
+/// Walks the whole body, so a `fileData` nested in `functionResponse` or in
+/// `systemInstruction` is checked like one in `contents`. Keys are compared
+/// without case or underscores, a superset of the spellings Google accepts,
+/// since a missed spelling would be a hole and an extra one only a refusal.
+fn check_file_uris(v: &Value, buckets: &[String]) -> Result<(), ProviderError> {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                if loose_key(k) == "filedata" {
+                    check_file_data(val, buckets)?;
+                }
+                check_file_uris(val, buckets)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => items.iter().try_for_each(|i| check_file_uris(i, buckets)),
+        _ => Ok(()),
+    }
+}
+
+/// Check every URI in one `fileData` object. A `fileData` that is not an
+/// object, or a URI that is not a string, is not one Tollgate can check, so it
+/// is refused too.
+fn check_file_data(file_data: &Value, buckets: &[String]) -> Result<(), ProviderError> {
+    let Value::Object(file_data) = file_data else {
+        return Err(ProviderError::Forbidden(FORBIDDEN_SOURCE.to_owned()));
+    };
+    for (k, uri) in file_data {
+        if loose_key(k) == "fileuri" {
+            match uri.as_str() {
+                Some(uri) => check_file_uri(uri, buckets)?,
+                None => return Err(ProviderError::Forbidden(FORBIDDEN_SOURCE.to_owned())),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether Vertex may fetch `uri`: a 403 for a source the operator has not
+/// allowed, a 400 for remote `https://` media, which is not supported yet.
+fn check_file_uri(uri: &str, buckets: &[String]) -> Result<(), ProviderError> {
+    let forbidden = || Err(ProviderError::Forbidden(FORBIDDEN_SOURCE.to_owned()));
+    if uri.starts_with("gs://") {
+        return if gcs_uri_allowed(uri, buckets) {
+            Ok(())
+        } else {
+            forbidden()
+        };
+    }
+    let Ok(url) = reqwest::Url::parse(uri) else {
+        return forbidden();
+    };
+    if google_storage_or_credentials(&url) {
+        return forbidden();
+    }
+    if url.scheme() == "https" {
+        return Err(bad(REMOTE_MEDIA_UNSUPPORTED));
+    }
+    forbidden()
+}
+
+/// A URL Vertex would fetch with the operator's Google identity, or one that
+/// carries credentials: any `googleapis.com` host (Cloud Storage's JSON and
+/// XML APIs among them) and `storage.cloud.google.com`, compared without case
+/// and without a trailing dot, or any userinfo. Refused whatever else is
+/// allowed, since a bucket off the allowlist must not be reachable over https.
+fn google_storage_or_credentials(url: &reqwest::Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return true;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "googleapis.com"
+        || host.ends_with(".googleapis.com")
+        || host == "storage.cloud.google.com"
+}
+
+fn loose_key(k: &str) -> String {
+    k.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether Vertex may read a `gs://` URI.
+///
+/// `gs://` is read on the operator's behalf, so only a bucket on
+/// the allowlist is accepted: the text between `gs://` and the next `/` must
+/// equal an allowlisted name exactly. A URI with `%`, `..` or `\` is refused
+/// outright rather than decoded or normalised, since the provider might
+/// resolve it to another bucket or object than the one checked.
+fn gcs_uri_allowed(uri: &str, buckets: &[String]) -> bool {
+    let Some(rest) = uri.strip_prefix("gs://") else {
+        return false;
+    };
+    if uri.contains(['%', '\\']) || uri.contains("..") {
+        return false;
+    }
+    let bucket = rest.split('/').next().unwrap_or("");
+    !bucket.is_empty()
+        && !bucket.chars().any(char::is_uppercase)
+        && buckets.iter().any(|b| b == bucket)
+}
+
+/// Check the `providers.media.gcs_buckets` allowlist at startup: each entry a
+/// plain bucket name (lowercase letters, digits, `-`, `_`, `.`, no `..`), so
+/// that an entry can only ever match one bucket exactly.
+///
+/// # Errors
+/// Names the first bad entry.
+pub fn validate_gcs_buckets(buckets: &[String]) -> Result<(), String> {
+    for b in buckets {
+        let plain = !b.is_empty()
+            && !b.contains("..")
+            && b.bytes().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'_' | b'.')
+            });
+        if !plain {
+            return Err(format!(
+                "providers.media.gcs_buckets entry {b:?} is not a bucket name: use the exact \
+                 lowercase name, without gs:// or a path"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gemini thinking rules
+// ---------------------------------------------------------------------------
+
+/// The route a model rule applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuleUpstream {
+    /// Native Vertex `generateContent`.
+    Vertex,
+    /// The OpenAI-compatible route fronting Vertex.
+    VertexOpenAi,
+}
+
+impl RuleUpstream {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "vertex" => Some(Self::Vertex),
+            "vertex-openai" => Some(Self::VertexOpenAi),
+            _ => None,
+        }
+    }
+
+    /// The id a rule is keyed by: the model the provider is sent (see
+    /// [`vertex_openai_model`] for the OpenAI-compatible route), lowercased, so
+    /// `gemini-x` and `google/gemini-x` are one model with one rule. Only the
+    /// rule lookup ignores case; the forwarded and priced id keeps it.
+    fn model_key(self, model: &str) -> String {
+        match self {
+            Self::Vertex => model.to_ascii_lowercase(),
+            Self::VertexOpenAi => vertex_openai_model(model).to_ascii_lowercase(),
+        }
+    }
+
+    /// Whether a model key (see [`Self::model_key`]) is a Gemini model.
+    fn is_gemini(self, key: &str) -> bool {
+        match self {
+            Self::Vertex => key.starts_with("gemini-"),
+            Self::VertexOpenAi => key.starts_with("google/gemini-"),
+        }
+    }
+}
+
+/// Whether a Gemini model's thinking tokens count against the output cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingRule {
+    /// Thinking is inside `maxOutputTokens` / `max_tokens`, so the cap bounds
+    /// it. Proven live for gemini-3.8-flash on both Vertex routes.
+    WithinOutputCap,
+    /// Thinking comes on top of the cap, up to the operator's bound. The bound
+    /// is an assertion, not a provider guarantee (Google calls the budget a
+    /// soft limit); settlement still charges real usage.
+    Additive { max_thinking_tokens: u64 },
+}
+
+/// Models built in as `within_output_cap`: only ids proven live (probes P7,
+/// P13). Every other Gemini model needs an operator row, since every Gemini
+/// 2.5+ model thinks by default and an unproven one must fail closed.
+const BUILTIN_WITHIN_OUTPUT_CAP: &[(RuleUpstream, &str)] = &[
+    (RuleUpstream::Vertex, "gemini-3.8-flash"),
+    (RuleUpstream::VertexOpenAi, "google/gemini-3.8-flash"),
+];
+
+/// The prefix the OpenAI-compatible route adds to a bare model id on Vertex.
+const VERTEX_MODEL_PREFIX: &str = "google/";
+
+/// The model id the OpenAI-compatible route sends Vertex for the client's
+/// `model`: a bare id gets the `google/` prefix, and an id with any `/` is sent
+/// as written. Case is kept. The payload, the thinking rule, and the
+/// `ParsedRequest` model (so the price, budget scopes, ledger row and metrics)
+/// all use this one id, so two spellings of one upstream model cannot be
+/// priced or budgeted apart.
+#[must_use]
+pub fn vertex_openai_model(model: &str) -> std::borrow::Cow<'_, str> {
+    if model.contains('/') {
+        std::borrow::Cow::Borrowed(model)
+    } else {
+        std::borrow::Cow::Owned(format!("{VERTEX_MODEL_PREFIX}{model}"))
+    }
+}
+
+/// Thinking rules by upstream and model key (see [`RuleUpstream::model_key`]):
+/// the built-in rows, with the operator's `[[providers.models]]` rows over
+/// them.
+#[derive(Debug, Clone)]
+pub struct ThinkingRules(HashMap<(RuleUpstream, String), ThinkingRule>);
+
+impl Default for ThinkingRules {
+    /// The built-in rows alone.
+    fn default() -> Self {
+        Self(
+            BUILTIN_WITHIN_OUTPUT_CAP
+                .iter()
+                .map(|(upstream, model)| {
+                    (
+                        (*upstream, upstream.model_key(model)),
+                        ThinkingRule::WithinOutputCap,
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+impl ThinkingRules {
+    /// The built-in rows with the operator's rows over them.
+    ///
+    /// # Errors
+    /// Describes the first invalid row: an unknown upstream or `thinking`
+    /// value, an empty model, two rows for one (upstream, model) once the model
+    /// is normalised as the route forwards it, `additive` without
+    /// `max_thinking_tokens`, or `max_thinking_tokens` on a rule that ignores
+    /// it.
+    pub fn from_config(rows: &[crate::config::ModelRuleConfig]) -> Result<Self, String> {
+        let mut rules = Self::default();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let Some(upstream) = RuleUpstream::parse(&row.upstream) else {
+                return Err(format!(
+                    "[[providers.models]] upstream must be 'vertex' or 'vertex-openai' (got {:?})",
+                    row.upstream
+                ));
+            };
+            if row.model.is_empty() {
+                return Err("[[providers.models]] row has an empty model".to_owned());
+            }
+            let key = upstream.model_key(&row.model);
+            if !seen.insert((upstream, key.clone())) {
+                return Err(format!(
+                    "[[providers.models]] has two rows for {key} on {} (model ids are \
+                     compared without case, and a bare id on vertex-openai is the \
+                     google/ one)",
+                    row.upstream
+                ));
+            }
+            let rule = match (row.thinking.as_deref(), row.max_thinking_tokens) {
+                (Some("within_output_cap"), 0) => ThinkingRule::WithinOutputCap,
+                (Some("within_output_cap"), _) => {
+                    return Err(format!(
+                        "[[providers.models]] {}: max_thinking_tokens applies only to \
+                         thinking = \"additive\"",
+                        row.model
+                    ));
+                }
+                (Some("additive"), 0) => {
+                    return Err(format!(
+                        "[[providers.models]] {}: thinking = \"additive\" needs \
+                         max_thinking_tokens above 0, or the reservation has no bound for \
+                         the thinking tokens",
+                        row.model
+                    ));
+                }
+                (Some("additive"), n) => ThinkingRule::Additive {
+                    max_thinking_tokens: n,
+                },
+                (other, _) => {
+                    return Err(format!(
+                        "[[providers.models]] {}: thinking must be \"within_output_cap\" or \
+                         \"additive\" (got {other:?})",
+                        row.model
+                    ));
+                }
+            };
+            rules.0.insert((upstream, key), rule);
+        }
+        Ok(rules)
+    }
+
+    /// The output leg to reserve for `model` on `upstream`, given the request's
+    /// output cap and its explicit thinking budget, if any.
+    ///
+    /// Non-Gemini models have no thinking rule. A Gemini model with no row is
+    /// refused: an unproven model fails closed.
+    fn output_leg(
+        &self,
+        upstream: RuleUpstream,
+        model: &str,
+        max_output: u64,
+        explicit_budget: Option<u64>,
+    ) -> Result<u64, ProviderError> {
+        let key = upstream.model_key(model);
+        if !upstream.is_gemini(&key) {
+            return Ok(max_output);
+        }
+        match self.0.get(&(upstream, key)) {
+            Some(ThinkingRule::WithinOutputCap) => Ok(max_output),
+            // The budget is a soft limit the client set, so a larger one
+            // raises the bound rather than being ignored.
+            Some(ThinkingRule::Additive {
+                max_thinking_tokens,
+            }) => {
+                Ok(max_output
+                    .saturating_add((*max_thinking_tokens).max(explicit_budget.unwrap_or(0))))
+            }
+            None => Err(bad(
+                "this Gemini model has no thinking rule: the operator must add a \
+                 [[providers.models]] row with thinking = \"within_output_cap\" or \
+                 \"additive\" for it (see docs/OPERATIONS.md)",
+            )),
+        }
     }
 }
 
@@ -1034,9 +1956,15 @@ fn vertex_base(project: &str, location: &str) -> String {
 /// Adapter for Vertex AI (Gemini) `generateContent`.
 pub struct VertexProvider {
     http: reqwest::Client,
-    project: String,
-    location: String,
+    /// `vertex_base(project, location)`, computed once.
+    base: String,
     tokens: TokenSource,
+    /// `providers.media.gcs_buckets`: the only buckets a `gs://` URI may name.
+    gcs_buckets: Vec<String>,
+    thinking: ThinkingRules,
+    /// `providers.vertex.allow_client_labels`: whether a request may carry
+    /// `labels`, which land in the operator's billing export.
+    allow_client_labels: bool,
 }
 
 impl VertexProvider {
@@ -1050,9 +1978,64 @@ impl VertexProvider {
         Self {
             tokens: TokenSource::new(static_token),
             http,
-            project,
-            location,
+            base: vertex_base(&project, &location),
+            gcs_buckets: Vec::new(),
+            thinking: ThinkingRules::default(),
+            allow_client_labels: false,
         }
+    }
+
+    /// Accept client `labels` (default: refused).
+    #[must_use]
+    pub fn with_client_labels(mut self, allow: bool) -> Self {
+        self.allow_client_labels = allow;
+        self
+    }
+
+    /// Allow `gs://` URIs in these buckets (default: none).
+    #[must_use]
+    pub fn with_gcs_buckets(mut self, buckets: Vec<String>) -> Self {
+        self.gcs_buckets = buckets;
+        self
+    }
+
+    /// Replace the built-in thinking rules.
+    #[must_use]
+    pub fn with_thinking_rules(mut self, rules: ThinkingRules) -> Self {
+        self.thinking = rules;
+        self
+    }
+
+    /// Point the adapter at a local stub instead of Google.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_base(mut self, base: String) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// The client's body as checked: parsed with duplicate keys and lossy
+    /// integers refused, Google's own objects rewritten to camelCase (strict
+    /// lowerCamel or snake_case only, and no two keys in one object naming the
+    /// same field), then checked against the allowlist and the `fileData`
+    /// source rules. Every decision is made on this value.
+    ///
+    /// The client's original bytes are what is forwarded, not this value.
+    /// Re-serialising would sort every object's keys (serde_json is built
+    /// without `preserve_order`), reordering client-owned maps such as a
+    /// `responseJsonSchema`'s `properties`, which Gemini may follow for output
+    /// order. Forwarding the bytes is safe because of the refusals above:
+    /// Google's parser accepts both spellings (camelCase is the form the REST
+    /// reference documents; a live check on 2026-10-30 showed a snake_case
+    /// `generation_config.max_output_tokens` honoured), so with no duplicates,
+    /// no colliding spellings, no other spellings and no rounded numbers, the
+    /// raw body and this value are the same request.
+    fn checked_body(&self, body: &str) -> Result<Value, ProviderError> {
+        let raw = parse_strict(if body.is_empty() { "{}" } else { body })?;
+        let canonical = canon_object(raw, canon_top)?;
+        check_vertex_allowlist(&canonical, self.allow_client_labels)?;
+        check_file_uris(&canonical, &self.gcs_buckets)?;
+        Ok(canonical)
     }
 }
 
@@ -1173,27 +2156,45 @@ impl Provider for VertexProvider {
                     .to_owned(),
             ));
         }
-        let model = extract_vertex_model(path).ok_or_else(|| {
-            ProviderError::BadRequest(format!("could not determine model from path: {rest_path}"))
-        })?;
-        let v: Value = serde_json::from_str(if body.is_empty() { "{}" } else { body })
-            .map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        let model = extract_vertex_model(path)
+            .ok_or_else(|| bad("could not determine the model from the request path"))?;
+        // Here, not later: under `exact` admission the count call comes next,
+        // and `countTokens` would itself read a `gs://` object.
+        let v = self.checked_body(body)?;
         // Require an explicit output cap so the reservation bounds real spend;
         // otherwise the model's (much larger) default would govern generation.
+        // Zero is refused too: Google may read 0 as unset, which would leave
+        // generation uncapped behind a reservation of nothing.
         let max_output_tokens = v
             .get("generationConfig")
             .and_then(|g| g.get("maxOutputTokens"))
             .and_then(Value::as_u64)
+            .filter(|&n| n > 0)
             .ok_or_else(|| {
-                ProviderError::BadRequest("generationConfig.maxOutputTokens is required".to_owned())
+                bad("generationConfig.maxOutputTokens is required and must be a positive integer")
             })?;
+        let explicit_budget = match v.pointer("/generationConfig/thinkingConfig/thinkingBudget") {
+            Some(b) => explicit_thinking_budget(b)?,
+            None => None,
+        };
+        let max_output_tokens = self.thinking.output_leg(
+            RuleUpstream::Vertex,
+            &model,
+            max_output_tokens,
+            explicit_budget,
+        )?;
         Ok(ParsedRequest {
             model,
+            // Over the bytes that are forwarded: the client's own.
             estimated_input_tokens: estimate_input_tokens(body),
             max_output_tokens,
             // Vertex cache creation is a separate cachedContents call that never
             // transits the proxy, so a generateContent request cannot write.
             may_cache_write: false,
+            anthropic_beta: None,
+            // Read from the checked value, so either accepted spelling of
+            // `fileData` is seen by fast admission.
+            external_media: value_has_media_ref(&v),
         })
     }
 
@@ -1204,11 +2205,12 @@ impl Provider for VertexProvider {
         _parsed: &ParsedRequest,
     ) -> Result<ProviderResponse, ProviderError> {
         let path = safe_rest_path(rest_path)?;
+        // Checked again here so the forward never depends on the caller having
+        // run `parse_request`; the bytes sent are the client's (see
+        // `checked_body` for why that is the request that was checked).
+        self.checked_body(body)?;
         let token = self.tokens.token(&self.http).await?;
-        let url = format!(
-            "{base}/{path}",
-            base = vertex_base(&self.project, &self.location)
-        );
+        let url = format!("{base}/{path}", base = self.base);
         let resp = self
             .http
             .post(&url)
@@ -1235,17 +2237,20 @@ impl Provider for VertexProvider {
         parsed: &ParsedRequest,
     ) -> Result<u64, ProviderError> {
         let model = extract_vertex_model(rest_path).unwrap_or_else(|| parsed.model.clone());
+        // Built from the checked value: a separate, allowlisted request, so the
+        // key order the forward preserves does not matter here.
+        let payload = vertex_count_payload(&self.checked_body(body)?)?;
         let token = self.tokens.token(&self.http).await?;
         let url = format!(
             "{base}/publishers/google/models/{model}:countTokens",
-            base = vertex_base(&self.project, &self.location)
+            base = self.base
         );
         let resp = self
             .http
             .post(&url)
             .bearer_auth(token)
             .header("content-type", "application/json")
-            .json(&vertex_count_payload(body)?)
+            .json(&payload)
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
@@ -1536,6 +2541,239 @@ fn parse_openai_usage(v: &Value, semantics: CacheSemantics) -> Usage {
     }
 }
 
+/// The default for `providers.openai.pin_service_tier`: on for OpenAI's own
+/// API, where an omitted tier means `auto`, and off for any other host, since
+/// other OpenAI-compatible servers may reject a field they do not know.
+fn default_pin_service_tier(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        })
+        .is_some_and(|h| h == "api.openai.com")
+}
+
+/// Check the Google-specific settings a body may carry on the Vertex
+/// OpenAI-compatible route, and return the explicit positive thinking budget,
+/// if any.
+///
+/// Vertex honours them both under a top-level `google` object and under a
+/// literal `extra_body.google` object (probe P13), so both are checked, and a
+/// body carrying both is refused because which one wins is not known. Inside
+/// either, only `thinking_config` is allowed: `cached_content` names the
+/// operator's caches (refused on the native route too), and anything else
+/// cannot be metered. Any other `extra_body` member is refused for the same
+/// reason.
+fn check_google_settings(v: &Value) -> Result<Option<u64>, ProviderError> {
+    let nested = match v.get("extra_body") {
+        None => None,
+        Some(Value::Object(extra)) => {
+            reject_uppercase_keys_in(extra)?;
+            reject_alias_keys_in(extra)?;
+            if extra.keys().any(|k| k != "google") {
+                return Err(bad(
+                    "extra_body accepts only a google object on this upstream",
+                ));
+            }
+            extra.get("google")
+        }
+        Some(_) => return Err(bad("extra_body must be an object")),
+    };
+    let google = match (v.get("google"), nested) {
+        (Some(_), Some(_)) => {
+            return Err(bad(
+                "send Google settings in google or in extra_body.google, not both",
+            ));
+        }
+        (Some(g), None) | (None, Some(g)) => g,
+        (None, None) => return Ok(None),
+    };
+    let Some(google) = google.as_object() else {
+        return Err(bad("google must be an object"));
+    };
+    reject_uppercase_keys_in(google)?;
+    reject_alias_keys_in(google)?;
+    if google.keys().any(|k| k != "thinking_config") {
+        return Err(bad(
+            "Google settings accept only thinking_config on this route: cached_content \
+             names the operator's caches, and other settings cannot be metered",
+        ));
+    }
+    let Some(thinking) = google.get("thinking_config") else {
+        return Ok(None);
+    };
+    let Some(thinking) = thinking.as_object() else {
+        return Err(bad("thinking_config must be an object"));
+    };
+    reject_uppercase_keys_in(thinking)?;
+    reject_alias_keys_in(thinking)?;
+    if thinking.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "include_thoughts" | "thinking_budget" | "thinking_level"
+        )
+    }) {
+        return Err(bad(
+            "thinking_config accepts only include_thoughts, thinking_budget and thinking_level",
+        ));
+    }
+    match thinking.get("thinking_budget") {
+        Some(b) => explicit_thinking_budget(b),
+        None => Ok(None),
+    }
+}
+
+/// On the Vertex OpenAI-compatible route, refuse a top-level key with an
+/// uppercase ASCII letter.
+///
+/// Vertex may read camelCase aliases (`maxTokens`, `extraBody`,
+/// `candidateCount`, `serviceTier`) beside the snake_case fields every check
+/// here reads, so an alias would bypass the output cap, the reservation and
+/// the rate checks. A body that is not an object is left to the other checks.
+fn reject_uppercase_keys(v: &Value) -> Result<(), ProviderError> {
+    match v.as_object() {
+        Some(map) => reject_uppercase_keys_in(map),
+        None => Ok(()),
+    }
+}
+
+fn reject_uppercase_keys_in(map: &serde_json::Map<String, Value>) -> Result<(), ProviderError> {
+    if map
+        .keys()
+        .any(|k| k.bytes().any(|c| c.is_ascii_uppercase()))
+    {
+        // Fixed text: the key is the client's.
+        return Err(bad(
+            "field names on this upstream must be snake_case: a key with an uppercase \
+             letter may be read as an alias that bypasses Tollgate's checks",
+        ));
+    }
+    Ok(())
+}
+
+/// Every field Tollgate reads, pins, refuses or rewrites on the Vertex
+/// OpenAI-compatible route: `parse_common`, `build_payload`,
+/// `openai_effective_max`, `reject_rate_switches` and `check_google_settings`,
+/// plus the Google fields those checks refuse by name.
+const VERTEX_OPENAI_CHECKED_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stream",
+    "stream_options",
+    "service_tier",
+    "modalities",
+    "audio",
+    "prediction",
+    "web_search_options",
+    "tools",
+    "tool_choice",
+    "reasoning_effort",
+    "google",
+    "extra_body",
+    "thinking_config",
+    "thinking_budget",
+    "include_thoughts",
+    "thinking_level",
+    "cached_content",
+    "candidate_count",
+];
+
+/// On the Vertex OpenAI-compatible route, refuse a top-level key that is a
+/// loose respelling of a checked field, or two keys with one loose form.
+///
+/// Lowercase alone does not make a key safe: `maxtokens`, `max__tokens` or
+/// `max_tokens_` would be forwarded beside the gateway's own `max_tokens`, and
+/// a shim that matches names loosely could let one override the cap. A key
+/// whose loose form (lowercase, underscores removed) equals a checked field's
+/// must be spelled exactly as that field. A body that is not an object is left
+/// to the other checks.
+fn reject_alias_keys(v: &Value) -> Result<(), ProviderError> {
+    match v.as_object() {
+        Some(map) => reject_alias_keys_in(map),
+        None => Ok(()),
+    }
+}
+
+fn reject_alias_keys_in(map: &serde_json::Map<String, Value>) -> Result<(), ProviderError> {
+    let mut seen = std::collections::HashSet::with_capacity(map.len());
+    for k in map.keys() {
+        let loose = loose_key(k);
+        let alias = VERTEX_OPENAI_CHECKED_FIELDS
+            .iter()
+            .any(|f| *f != k.as_str() && loose_key(f) == loose);
+        if alias || !seen.insert(loose) {
+            // Fixed text: the key is the client's.
+            return Err(bad(
+                "field names on this upstream must be spelled exactly: a key that differs \
+                 from a checked field, or from another key, only in case or underscores \
+                 may be read as an alias that bypasses Tollgate's checks",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// On the Vertex OpenAI-compatible route, refuse a top-level `cached_content`
+/// or `candidate_count`.
+///
+/// Whether Vertex reads either at the top level is unverified, so both are
+/// refused (fail closed): `cached_content` names the operator's caches and
+/// `candidate_count` multiplies output beyond the reservation. Their alias
+/// spellings are already refused by `reject_uppercase_keys` and
+/// `reject_alias_keys`.
+fn reject_top_level_google_fields(v: &Value) -> Result<(), ProviderError> {
+    let Some(map) = v.as_object() else {
+        return Ok(());
+    };
+    if map.contains_key("cached_content") || map.contains_key("candidate_count") {
+        // Fixed text: the value is the client's.
+        return Err(bad(
+            "cached_content and candidate_count are not accepted at the top level on this \
+             upstream: a cached context names the operator's caches, and extra candidates \
+             multiply output beyond the reservation",
+        ));
+    }
+    Ok(())
+}
+
+/// On the Vertex OpenAI-compatible route, refuse any message `content` array
+/// part other than `{"type": "text", "text": "..."}`.
+///
+/// Vertex may read media parts under spellings the media check does not know
+/// (`input_file`, `file_url`, `imageUrl` are untested; probe P1 found `file`
+/// parts refused by Vertex itself), and would fetch them on the operator's
+/// behalf. Allowing exactly one shape closes every spelling.
+/// String content is unchanged.
+fn check_text_only_parts(v: &Value) -> Result<(), ProviderError> {
+    let Some(messages) = v.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for message in messages {
+        let Some(Value::Array(parts)) = message.get("content") else {
+            continue;
+        };
+        for part in parts {
+            let text_only = part.as_object().is_some_and(|p| {
+                p.get("type").and_then(Value::as_str) == Some("text")
+                    && p.get("text").is_some_and(Value::is_string)
+                    && p.keys().all(|k| k == "type" || k == "text")
+            });
+            if !text_only {
+                return Err(bad(
+                    "on this upstream a message content array may carry only \
+                     {\"type\": \"text\", \"text\": ...} parts: media and file parts are not \
+                     supported yet",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// OpenAI-compatible upstream adapter. Fronts any Chat Completions endpoint that
 /// speaks the OpenAI protocol: Vertex's OpenAI endpoint for Gemini, or a custom
 /// OpenAI-compatible base. Auth is a bearer token (a GCP Workload Identity token
@@ -1548,15 +2786,19 @@ pub struct OpenAiProvider {
     /// Base URL up to but excluding `/chat/completions`.
     base_url: String,
     tokens: TokenSource,
-    /// Prefix applied to the model in the forwarded body (e.g. `google/` for
-    /// Vertex), unless the model already contains a `/`.
-    model_prefix: Option<String>,
+    /// Fronts Vertex's OpenAI-compatible endpoint: the forwarded model is
+    /// [`vertex_openai_model`] of the client's.
+    vertex: bool,
+    /// Gemini thinking rules; consulted only when fronting Vertex.
+    thinking: ThinkingRules,
+    /// Send `service_tier: "default"` upstream (custom upstreams only).
+    pin_service_tier: bool,
 }
 
 impl OpenAiProvider {
     /// How this upstream reports cached prompt tokens.
     ///
-    /// Vertex's shim (the only upstream with a model prefix) was verified
+    /// Vertex's shim was verified
     /// against live responses to report them INSIDE `prompt_tokens`. A custom
     /// base URL is whatever the operator pointed it at, so it stays unverified
     /// and both classes are billed in full rather than risking an under-charge.
@@ -1565,7 +2807,7 @@ impl OpenAiProvider {
     /// the cheaper path by setting `stream`.
     #[must_use]
     pub fn cache_semantics(&self) -> CacheSemantics {
-        if self.model_prefix.is_some() {
+        if self.vertex {
             CacheSemantics::Inclusive
         } else {
             CacheSemantics::Unverified
@@ -1590,7 +2832,10 @@ impl OpenAiProvider {
             http,
             stream_http,
             base_url,
-            model_prefix: Some("google/".to_owned()),
+            vertex: true,
+            thinking: ThinkingRules::default(),
+            // Vertex drops the field instead; see `build_payload`.
+            pin_service_tier: false,
         }
     }
 
@@ -1607,9 +2852,41 @@ impl OpenAiProvider {
             tokens: TokenSource::new(api_key),
             http,
             stream_http,
+            pin_service_tier: default_pin_service_tier(&base_url),
             base_url: base_url.trim_end_matches('/').to_owned(),
-            model_prefix: None,
+            vertex: false,
+            thinking: ThinkingRules::default(),
         }
+    }
+
+    /// Override the default for `providers.openai.pin_service_tier`. Ignored
+    /// when fronting Vertex, which never gets the field.
+    #[must_use]
+    pub fn with_pin_service_tier(mut self, pin: Option<bool>) -> Self {
+        if let Some(pin) = pin {
+            self.pin_service_tier = pin && !self.fronts_vertex();
+        }
+        self
+    }
+
+    /// Replace the built-in Gemini thinking rules.
+    #[must_use]
+    pub fn with_thinking_rules(mut self, rules: ThinkingRules) -> Self {
+        self.thinking = rules;
+        self
+    }
+
+    /// Point the adapter at a local stub instead of Google.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    /// Whether this adapter fronts Vertex's OpenAI-compatible endpoint.
+    fn fronts_vertex(&self) -> bool {
+        self.vertex
     }
 
     /// Build the outbound payload: rewrite the model for the upstream, normalise
@@ -1620,22 +2897,23 @@ impl OpenAiProvider {
     fn build_payload(&self, body: &str, streaming: bool) -> Result<Value, ProviderError> {
         let mut payload: Value =
             serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
-        if let Some(prefix) = &self.model_prefix {
-            if let Some(m) = payload.get("model").and_then(Value::as_str) {
-                if !m.contains('/') {
-                    payload["model"] = Value::String(format!("{prefix}{m}"));
-                }
-            }
+        let forwarded = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|_| self.vertex)
+            .map(|m| vertex_openai_model(m).into_owned());
+        if let Some(m) = forwarded {
+            payload["model"] = Value::String(m);
         }
         let cap = openai_effective_max(&payload);
         // Choose which output-cap field to send, always pinned to the reserved cap
-        // (so reserved == enforced). On Vertex (model_prefix set) always use
+        // (so reserved == enforced). On Vertex always use
         // `max_tokens`: the Vertex OpenAI shim honors it, and it may silently ignore
         // `max_completion_tokens`, which would let generation run past our cap. On a
         // custom upstream, preserve the client's field so we don't break the o-series
         // reasoning models on OpenAI's own API, which reject `max_tokens` and require
         // `max_completion_tokens`.
-        let cap_field = if self.model_prefix.is_some() {
+        let cap_field = if self.vertex {
             "max_tokens"
         } else if payload.get("max_completion_tokens").is_some() {
             "max_completion_tokens"
@@ -1646,6 +2924,17 @@ impl OpenAiProvider {
             map.remove("max_completion_tokens");
             map.remove("max_tokens");
             map.insert(cap_field.to_owned(), Value::from(cap));
+            // An omitted tier means `auto` on OpenAI's own API, which can use
+            // priority capacity at a premium, so it is pinned where the
+            // operator says so. Vertex drops the field.
+            if self.fronts_vertex() {
+                map.remove("service_tier");
+            } else if self.pin_service_tier {
+                map.insert(
+                    "service_tier".to_owned(),
+                    Value::String("default".to_owned()),
+                );
+            }
             map.insert("stream".to_owned(), Value::Bool(streaming));
             if streaming {
                 map.insert(
@@ -1672,6 +2961,8 @@ impl OpenAiProvider {
         }
         let v: Value =
             serde_json::from_str(body).map_err(|e| ProviderError::BadRequest(e.to_string()))?;
+        // The body is re-serialised before it is forwarded (`build_payload`).
+        reject_lossy_integers(body)?;
         if !allow_stream && stream_requested(&v) {
             return Err(ProviderError::BadRequest(
                 "streaming is handled on a separate path".to_owned(),
@@ -1705,15 +2996,39 @@ impl OpenAiProvider {
             .get("model")
             .and_then(Value::as_str)
             .filter(|m| !m.is_empty())
-            .ok_or_else(|| ProviderError::BadRequest("missing model".to_owned()))?
-            .to_owned();
+            .ok_or_else(|| ProviderError::BadRequest("missing model".to_owned()))?;
+        // On Vertex, the id Vertex is sent: the price, budget scopes, ledger row
+        // and metrics then key on one id per upstream model, whichever spelling
+        // the client used. A custom upstream gets the client's id as written.
+        let model = if self.fronts_vertex() {
+            vertex_openai_model(model).into_owned()
+        } else {
+            model.to_owned()
+        };
+        let mut max_output_tokens = openai_effective_max(&v);
+        if self.fronts_vertex() {
+            reject_uppercase_keys(&v)?;
+            reject_alias_keys(&v)?;
+            reject_top_level_google_fields(&v)?;
+            check_text_only_parts(&v)?;
+            let explicit_budget = check_google_settings(&v)?;
+            max_output_tokens = self.thinking.output_leg(
+                RuleUpstream::VertexOpenAi,
+                &model,
+                max_output_tokens,
+                explicit_budget,
+            )?;
+        }
         Ok(ParsedRequest {
             model,
             estimated_input_tokens: estimate_input_tokens(body),
-            max_output_tokens: openai_effective_max(&v),
+            max_output_tokens,
             // The OpenAI Chat Completions usage object carries no cache-write
             // token field at all, so a write can never be observed on this path.
             may_cache_write: false,
+            anthropic_beta: None,
+            // Refused above.
+            external_media: false,
         })
     }
 
@@ -2388,6 +3703,13 @@ mod tests {
         let one_hour = r#"{"model":"m","max_tokens":10,"messages":[],
             "system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#;
         assert!(p.parse_request("messages", one_hour).is_err());
+        // The refusal is fixed text: the TTL is the client's.
+        let marked = r#"{"model":"m","max_tokens":10,"messages":[],
+            "system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"<script>probe"}}]}"#;
+        match p.parse_request("messages", marked) {
+            Err(ProviderError::BadRequest(m)) => assert!(!m.contains("probe"), "{m}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
         // The default TTL is fine and still marks the request cache-writing.
         let default_ttl = r#"{"model":"m","max_tokens":10,"messages":[],
             "system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}"#;
@@ -2500,7 +3822,7 @@ mod tests {
         assert!(
             p.parse_request(
                 "chat/completions",
-                r#"{"model":"m","messages":[],"modalities":["text"],"service_tier":"auto",
+                r#"{"model":"m","messages":[],"modalities":["text"],"service_tier":"default",
                     "tools":[{"type":"function","function":{"name":"f"}}]}"#
             )
             .is_ok()
@@ -2881,7 +4203,7 @@ mod tests {
         // `toolConfig`, which `:countTokens` does not accept, and every request
         // carrying it would have been refused. The live probe is the source of
         // truth for the field list; this pins what the probe found so a future
-        // edit cannot quietly re-add a rejected field.
+        // edit cannot re-add a rejected field unnoticed.
         let body = r#"{
             "contents":[{"role":"user","parts":[{"text":"hi"}]}],
             "systemInstruction":{"parts":[{"text":"be brief"}]},
@@ -2892,7 +4214,7 @@ mod tests {
             "labels":{"team":"x"},
             "cachedContent":"projects/p/locations/l/cachedContents/1"
         }"#;
-        let out = vertex_count_payload(body).expect("a valid body");
+        let out = vertex_count_payload(&serde_json::from_str(body).unwrap()).expect("a valid body");
         let obj = out.as_object().expect("object");
 
         // Accepted by the endpoint AND counted.
@@ -2915,10 +4237,10 @@ mod tests {
         // Google accepts either spelling and its own examples use the snake
         // form. Reading only the camel one drops the system prompt from the
         // count while the request still carries it: a silent under-reservation.
-        let snake = vertex_count_payload(
-            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],
-                "system_instruction":{"parts":[{"text":"be brief"}]}}"#,
-        )
+        let snake = vertex_count_payload(&serde_json::json!(
+            {"contents":[{"role":"user","parts":[{"text":"hi"}]}],
+             "system_instruction":{"parts":[{"text":"be brief"}]}}
+        ))
         .expect("valid");
         assert_eq!(
             snake.get("systemInstruction"),
@@ -2928,12 +4250,13 @@ mod tests {
 
         // An explicit null is not a value.
         let nulled =
-            vertex_count_payload(r#"{"contents":[{"role":"user"}],"tools":null}"#).expect("valid");
+            vertex_count_payload(&serde_json::json!({"contents":[{"role":"user"}],"tools":null}))
+                .expect("valid");
         assert!(!nulled.as_object().unwrap().contains_key("tools"));
 
         // No contents means nothing to count, and Vertex would refuse it too.
         assert!(matches!(
-            vertex_count_payload(r#"{"generationConfig":{}}"#),
+            vertex_count_payload(&serde_json::json!({"generationConfig":{}})),
             Err(ProviderError::BadRequest(_))
         ));
     }
@@ -3117,6 +4440,8 @@ mod tests {
             estimated_input_tokens: 1,
             max_output_tokens: 1,
             may_cache_write: false,
+            anthropic_beta: None,
+            external_media: false,
         };
         assert!(!vertex.prompt_reserve_profile(&req).may_double_bill_prompt);
 
@@ -3250,5 +4575,1710 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"candidates":[]}"#).unwrap();
         let u = parse_vertex_usage(&v);
         assert_eq!(u, Usage::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Native Vertex: gs:// allowlist, request allowlist, thinking rules
+    // -----------------------------------------------------------------------
+
+    const GENERATE: &str = "publishers/google/models/gemini-3.8-flash:generateContent";
+    const ALLOWED_BUCKET: &str = "tollgate-media";
+
+    fn vertex_test_provider() -> VertexProvider {
+        VertexProvider::new(
+            reqwest::Client::new(),
+            "p".to_owned(),
+            "global".to_owned(),
+            "t".to_owned(),
+        )
+        .with_gcs_buckets(vec![ALLOWED_BUCKET.to_owned()])
+    }
+
+    /// A minimal valid native body with `part` as the only user part.
+    fn vertex_body_with_part(part: &Value) -> String {
+        serde_json::json!({
+            "contents": [{"role": "user", "parts": [part]}],
+            "generationConfig": {"maxOutputTokens": 16}
+        })
+        .to_string()
+    }
+
+    fn vertex_parse(body: &str) -> Result<ParsedRequest, ProviderError> {
+        vertex_test_provider().parse_request(GENERATE, body)
+    }
+
+    #[test]
+    fn file_uris_are_allowed_only_from_allowlisted_buckets() {
+        let buckets = vec![ALLOWED_BUCKET.to_owned()];
+        for ok in [
+            "gs://tollgate-media/a.png",
+            "gs://tollgate-media/dir/b.pdf",
+            "gs://tollgate-media",
+        ] {
+            assert!(check_file_uri(ok, &buckets).is_ok(), "{ok} must be allowed");
+        }
+        for refused in [
+            "gs://other-bucket/a.png",
+            "gs://tollgate-media-2/a.png",
+            "gs://Tollgate-media/a.png",
+            "gs://TOLLGATE-MEDIA/a.png",
+            "gs://tollgate-media/a%2Fb.png",
+            "gs://tollgate%2Dmedia/a.png",
+            "gs://tollgate-media/../other/a.png",
+            "gs://tollgate-media\\a.png",
+            "gs:///a.png",
+            "gs://",
+            "GS://tollgate-media/a.png",
+            "ftp://example.com/a.png",
+            "http://example.com/a.png",
+            "file:///etc/passwd",
+            "",
+            " gs://tollgate-media/a.png",
+        ] {
+            assert!(
+                matches!(
+                    check_file_uri(refused, &buckets),
+                    Err(ProviderError::Forbidden(_))
+                ),
+                "{refused:?} must be forbidden"
+            );
+        }
+        // No allowlist: no gs:// at all.
+        assert!(check_file_uri("gs://tollgate-media/a.png", &[]).is_err());
+    }
+
+    /// Remote https media is a 400 until it can be bounded; Google storage and
+    /// API hosts, and any URI carrying credentials, are a 403 whatever else
+    /// is allowed, so a bucket off the allowlist is not reachable over https.
+    #[test]
+    fn https_file_uris_are_refused_and_google_storage_hosts_are_forbidden() {
+        let buckets = vec![ALLOWED_BUCKET.to_owned()];
+        for remote in [
+            "https://example.com/a.png",
+            "https://www.youtube.com/watch?v=abc",
+            "HTTPS://example.com/a.png",
+            "https://notgoogleapis.com/a.png",
+            "https://storage.googleapis.com.example.com/a.png",
+        ] {
+            match check_file_uri(remote, &buckets) {
+                Err(ProviderError::BadRequest(m)) => assert_eq!(m, REMOTE_MEDIA_UNSUPPORTED),
+                other => panic!("{remote}: expected a 400, got {other:?}"),
+            }
+        }
+        for forbidden in [
+            "https://storage.googleapis.com/operator-private/secret.pdf",
+            "https://STORAGE.GoogleAPIs.com/operator-private/secret.pdf",
+            "https://storage.googleapis.com./operator-private/secret.pdf",
+            "https://operator-private.storage.googleapis.com/secret.pdf",
+            "https://Operator-Private.Storage.Googleapis.Com./secret.pdf",
+            "https://storage.cloud.google.com/operator-private/secret.pdf",
+            "https://STORAGE.CLOUD.GOOGLE.COM./operator-private/secret.pdf",
+            "https://generativelanguage.googleapis.com/v1beta/files/abc",
+            "https://aiplatform.googleapis.com/v1/projects/p",
+            "https://googleapis.com/a",
+            "https://storage.googleapis.com:443/operator-private/secret.pdf",
+            "https:\\\\storage.googleapis.com/operator-private/secret.pdf",
+            "https://user@example.com/a.png",
+            "https://user:pass@example.com/a.png",
+            "https://:pass@example.com/a.png",
+            "http://storage.googleapis.com/operator-private/secret.pdf",
+        ] {
+            match check_file_uri(forbidden, &buckets) {
+                Err(ProviderError::Forbidden(m)) => assert_eq!(m, FORBIDDEN_SOURCE),
+                other => panic!("{forbidden}: expected a 403, got {other:?}"),
+            }
+        }
+        // Through the parser too, in the snake_case spelling, with fixed text.
+        let part = serde_json::json!({"file_data": {"mime_type": "application/pdf",
+            "file_uri": "https://operator-private.storage.googleapis.com/secret.pdf"}});
+        match vertex_parse(&vertex_body_with_part(&part)) {
+            Err(ProviderError::Forbidden(m)) => assert!(!m.contains("operator-private")),
+            other => panic!("expected a 403, got {other:?}"),
+        }
+        let part = serde_json::json!({"fileData": {"mimeType": "application/pdf",
+            "fileUri": "https://example.com/private-name.pdf"}});
+        match vertex_parse(&vertex_body_with_part(&part)) {
+            Err(ProviderError::BadRequest(m)) => assert!(!m.contains("private-name")),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_forbidden_file_uri_is_a_403_with_fixed_text_wherever_it_sits() {
+        let bad = "gs://operator-private-bucket/secret.pdf";
+        let file = serde_json::json!({"fileData": {"mimeType": "application/pdf", "fileUri": bad}});
+        let snake =
+            serde_json::json!({"file_data": {"mime_type": "application/pdf", "file_uri": bad}});
+        let bodies = [
+            vertex_body_with_part(&file),
+            vertex_body_with_part(&snake),
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "systemInstruction": {"parts": [file.clone()]},
+                "generationConfig": {"maxOutputTokens": 16}
+            })
+            .to_string(),
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"functionResponse": {
+                    "name": "f", "response": {}, "parts": [snake.clone()]
+                }}]}],
+                "generationConfig": {"maxOutputTokens": 16}
+            })
+            .to_string(),
+            // A non-string URI is not a URI Tollgate can check.
+            vertex_body_with_part(&serde_json::json!({"fileData": {"fileUri": 7}})),
+        ];
+        for body in bodies {
+            match vertex_parse(&body) {
+                Err(ProviderError::Forbidden(m)) => {
+                    assert_eq!(m, FORBIDDEN_SOURCE);
+                    assert!(!m.contains("operator-private-bucket"));
+                }
+                other => panic!("expected Forbidden for {body}, got {other:?}"),
+            }
+        }
+        // The allowlisted bucket passes, in both spellings.
+        for part in [
+            serde_json::json!({"file_data": {"mime_type": "application/pdf", "file_uri": "gs://tollgate-media/a.pdf"}}),
+            serde_json::json!({"fileData": {"mimeType": "application/pdf", "fileUri": "gs://tollgate-media/a.pdf"}}),
+        ] {
+            assert!(
+                vertex_parse(&vertex_body_with_part(&part)).is_ok(),
+                "{part}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gcs_allowlist_takes_plain_bucket_names_only() {
+        assert!(validate_gcs_buckets(&[]).is_ok());
+        assert!(validate_gcs_buckets(&["tollgate-media".to_owned(), "a.b_c-1".to_owned()]).is_ok());
+        for bad in ["", "gs://x", "x/y", "X", "a..b", "a%2f", "a\\b", "a b"] {
+            assert!(validate_gcs_buckets(&[bad.to_owned()]).is_err(), "{bad:?}");
+        }
+    }
+
+    fn assert_bad_request(body: &str, what: &str) {
+        assert!(
+            matches!(vertex_parse(body), Err(ProviderError::BadRequest(_))),
+            "{what} must be refused: {body}"
+        );
+    }
+
+    #[test]
+    fn native_vertex_refuses_top_level_fields_off_the_allowlist() {
+        for key in [
+            "cachedContent",
+            "cached_content",
+            "routingConfig",
+            "modelConfig",
+            "modelArmorConfig",
+            "model",
+            "somethingNew",
+        ] {
+            let body = serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 16},
+                key: "x"
+            })
+            .to_string();
+            assert_bad_request(&body, key);
+        }
+        // Everything on the list is accepted.
+        let ok = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "systemInstruction": {"parts": [{"text": "be brief"}]},
+            "generationConfig": {"maxOutputTokens": 16},
+            "tools": [{"functionDeclarations": [{"name": "f"}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+            "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}],
+            "labels": {"team": "x"}
+        })
+        .to_string();
+        let labelled = vertex_test_provider().with_client_labels(true);
+        assert!(labelled.parse_request(GENERATE, &ok).is_ok());
+    }
+
+    #[test]
+    fn native_vertex_refuses_every_server_side_tool() {
+        for tool in [
+            "retrieval",
+            "googleSearch",
+            "google_search",
+            "googleSearchRetrieval",
+            "codeExecution",
+            "urlContext",
+            "googleMaps",
+            "enterpriseWebSearch",
+            "computerUse",
+            "somethingNew",
+        ] {
+            let body = serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 16},
+                "tools": [{tool: {}}]
+            })
+            .to_string();
+            assert_bad_request(&body, tool);
+        }
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 16},
+            "toolConfig": {"functionCallingConfig": {}, "retrievalConfig": {}}
+        })
+        .to_string();
+        assert_bad_request(&body, "toolConfig.retrievalConfig");
+    }
+
+    fn with_generation_config(config: &Value) -> String {
+        serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": config
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn native_vertex_generation_config_is_an_allowlist() {
+        for field in [
+            "speechConfig",
+            "imageConfig",
+            "audioTimestamp",
+            "routingConfig",
+            "enableAffectiveDialog",
+            "somethingNew",
+        ] {
+            let body = with_generation_config(&serde_json::json!({
+                "maxOutputTokens": 16,
+                field: {}
+            }));
+            assert_bad_request(&body, field);
+        }
+        let refused = [
+            (
+                serde_json::json!({"maxOutputTokens": 16, "candidateCount": 2}),
+                "candidateCount 2",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "candidateCount": "1"}),
+                "candidateCount string",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "responseModalities": ["TEXT", "AUDIO"]}),
+                "audio modality",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "responseModalities": ["IMAGE"]}),
+                "image modality",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "thinkingConfig": {"thinkingBudget": -2}}),
+                "thinkingBudget -2",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "thinkingConfig": {"thinkingBudget": 1.5}}),
+                "fractional thinkingBudget",
+            ),
+            (
+                serde_json::json!({"maxOutputTokens": 16, "thinkingConfig": {"other": 1}}),
+                "unknown thinkingConfig field",
+            ),
+            (
+                serde_json::json!({"temperature": 0.2}),
+                "missing maxOutputTokens",
+            ),
+        ];
+        for (config, what) in refused {
+            assert_bad_request(&with_generation_config(&config), what);
+        }
+        let accepted = serde_json::json!({
+            "temperature": 0.2, "topP": 0.9, "topK": 40, "maxOutputTokens": 16,
+            "stopSequences": ["x"], "responseMimeType": "application/json",
+            "responseSchema": {"type": "OBJECT"}, "presencePenalty": 0.1,
+            "frequencyPenalty": 0.1, "seed": 1, "responseLogprobs": true, "logprobs": 2,
+            "mediaResolution": "MEDIA_RESOLUTION_HIGH", "candidateCount": 1,
+            "responseModalities": ["text"],
+            "thinkingConfig": {"includeThoughts": true, "thinkingBudget": -1, "thinkingLevel": "HIGH"}
+        });
+        assert!(vertex_parse(&with_generation_config(&accepted)).is_ok());
+    }
+
+    /// Labels land in the operator's billing export, so they are refused
+    /// unless the operator opted in.
+    #[test]
+    fn native_vertex_labels_need_the_operator_opt_in() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 16},
+            "labels": {"cost_center": "someone-else"}
+        })
+        .to_string();
+        match vertex_parse(&body) {
+            Err(ProviderError::BadRequest(m)) => {
+                assert!(m.contains("allow_client_labels"), "{m}");
+                assert!(!m.contains("someone-else"), "{m}");
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+        // `labels` in snake_case too: there is no other spelling.
+        let snake = body.replace("generationConfig", "generation_config");
+        assert!(vertex_parse(&snake).is_err());
+        let labelled = vertex_test_provider().with_client_labels(true);
+        assert!(labelled.parse_request(GENERATE, &body).is_ok());
+    }
+
+    #[test]
+    fn native_vertex_labels_are_bounded() {
+        let labelled = vertex_test_provider().with_client_labels(true);
+        let vertex_parse = |body: &str| labelled.parse_request(GENERATE, body);
+        let assert_bad_request = |body: &str, what: &str| {
+            assert!(
+                matches!(vertex_parse(body), Err(ProviderError::BadRequest(_))),
+                "{what} must be refused: {body}"
+            );
+        };
+        let labels = |n: usize, value: &str| {
+            let map: serde_json::Map<String, Value> = (0..n)
+                .map(|i| (format!("k{i}"), Value::String(value.to_owned())))
+                .collect();
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 16},
+                "labels": map
+            })
+            .to_string()
+        };
+        assert!(vertex_parse(&labels(64, &"v".repeat(63))).is_ok());
+        assert_bad_request(&labels(65, "v"), "65 labels");
+        assert_bad_request(&labels(1, &"v".repeat(64)), "a 64-character value");
+        // Characters, not bytes: 63 multibyte characters fit.
+        assert!(vertex_parse(&labels(1, &"é".repeat(63))).is_ok());
+        let long_key = serde_json::json!({
+            "contents": [], "generationConfig": {"maxOutputTokens": 16},
+            "labels": {"k".repeat(64): "v"}
+        })
+        .to_string();
+        assert_bad_request(&long_key, "a 64-character key");
+        let not_string =
+            r#"{"contents":[],"generationConfig":{"maxOutputTokens":16},"labels":{"k":1}}"#;
+        assert_bad_request(not_string, "a non-string label");
+    }
+
+    #[test]
+    fn both_spellings_of_one_field_are_refused_and_duplicates_too() {
+        for (body, what) in [
+            (
+                r#"{"contents":[],"generationConfig":{"maxOutputTokens":16},"generation_config":{"maxOutputTokens":16}}"#,
+                "generationConfig twice",
+            ),
+            (
+                r#"{"contents":[],"generationConfig":{"maxOutputTokens":16,"max_output_tokens":99999}}"#,
+                "maxOutputTokens twice",
+            ),
+            (
+                r#"{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"a","mime_type":"b","data":""}}]}],"generationConfig":{"maxOutputTokens":16}}"#,
+                "inlineData.mimeType twice",
+            ),
+            (
+                r#"{"contents":[],"contents":[],"generationConfig":{"maxOutputTokens":16}}"#,
+                "a duplicate top-level key",
+            ),
+            (
+                r#"{"contents":[],"generationConfig":{"maxOutputTokens":16,"maxOutputTokens":99999}}"#,
+                "a duplicate nested key",
+            ),
+            (
+                r#"{"contents":[{"role":"user","parts":[{"functionCall":{"name":"f","args":{"a":1,"a":2}}}]}],"generationConfig":{"maxOutputTokens":16}}"#,
+                "a duplicate key inside client args",
+            ),
+        ] {
+            assert_bad_request(body, what);
+        }
+    }
+
+    /// Depth stays bounded by serde_json's recursion limit: a deeply nested
+    /// body is a 400, not a stack overflow.
+    #[test]
+    fn a_deeply_nested_body_is_refused_not_a_crash() {
+        let deep = format!(
+            r#"{{"contents":[],"labels":{}{}}}"#,
+            "[".repeat(100_000),
+            "]".repeat(100_000)
+        );
+        assert_bad_request(&deep, "100,000 nested arrays");
+    }
+
+    #[test]
+    fn snake_case_is_checked_as_camel_case_and_client_maps_are_untouched() {
+        let body = r#"{
+            "contents":[{"role":"user","parts":[
+                {"text":"hi"},
+                {"function_call":{"name":"f","args":{"user_id":1,"userId":2}}},
+                {"function_response":{"name":"f","response":{"user_id":1,"userId":2}}},
+                {"inline_data":{"mime_type":"image/png","data":""}}
+            ]}],
+            "system_instruction":{"parts":[{"text":"be brief"}]},
+            "generation_config":{
+                "max_output_tokens":16,
+                "response_mime_type":"application/json",
+                "response_schema":{"type":"OBJECT","properties":{"user_id":{"type":"STRING"},"userId":{"type":"STRING"}}},
+                "thinking_config":{"thinking_budget":-1}
+            },
+            "tools":[{"function_declarations":[{"name":"f","parameters":{"type":"OBJECT","properties":{"user_id":{"type":"STRING"},"userId":{"type":"STRING"}}}}]}],
+            "tool_config":{"function_calling_config":{"mode":"AUTO"}},
+            "safety_settings":[{"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"}],
+            "labels":{"team_name":"x"}
+        }"#;
+        let p = vertex_test_provider().with_client_labels(true);
+        assert!(p.parse_request(GENERATE, body).is_ok());
+        let checked = p.checked_body(body).unwrap();
+        let want = serde_json::json!({
+            "contents":[{"role":"user","parts":[
+                {"text":"hi"},
+                {"functionCall":{"name":"f","args":{"user_id":1,"userId":2}}},
+                {"functionResponse":{"name":"f","response":{"user_id":1,"userId":2}}},
+                {"inlineData":{"mimeType":"image/png","data":""}}
+            ]}],
+            "systemInstruction":{"parts":[{"text":"be brief"}]},
+            "generationConfig":{
+                "maxOutputTokens":16,
+                "responseMimeType":"application/json",
+                "responseSchema":{"type":"OBJECT","properties":{"user_id":{"type":"STRING"},"userId":{"type":"STRING"}}},
+                "thinkingConfig":{"thinkingBudget":-1}
+            },
+            "tools":[{"functionDeclarations":[{"name":"f","parameters":{"type":"OBJECT","properties":{"user_id":{"type":"STRING"},"userId":{"type":"STRING"}}}}]}],
+            "toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},
+            "safetySettings":[{"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_NONE"}],
+            "labels":{"team_name":"x"}
+        });
+        assert_eq!(checked, want);
+        assert_eq!(camel_case("a_b_c").as_deref(), Some("aBC"));
+        assert_eq!(
+            camel_case("max_output_tokens2").as_deref(),
+            Some("maxOutputTokens2")
+        );
+        assert_eq!(
+            camel_case("maxOutputTokens").as_deref(),
+            Some("maxOutputTokens")
+        );
+        assert_eq!(camel_case("a_1b").as_deref(), Some("a1b"));
+        for loose in [
+            "Max_output_tokens",
+            "MaxOutputTokens",
+            "file__data",
+            "file_data_",
+            "_file_data",
+            "File__Data",
+            "fileData_",
+            "FILE_DATA",
+            "file_Data",
+            "fileÜri",
+            "1file",
+            "",
+        ] {
+            assert_eq!(camel_case(loose), None, "{loose:?}");
+        }
+    }
+
+    /// The reviewers' finding: the forwarded body renamed `file__data` (and
+    /// other loose spellings) to `fileData`, while fast admission read the
+    /// client's bytes and saw no media. Loose spellings are now refused, and
+    /// the client's bytes are what is forwarded, so both readings agree.
+    #[test]
+    fn fast_admission_sees_media_under_every_spelling_that_is_forwarded() {
+        let p = vertex_test_provider();
+        for key in [
+            "file__data",
+            "fileData_",
+            "file_data_",
+            "File__Data",
+            "FILE_DATA",
+        ] {
+            let body = format!(
+                r#"{{"contents":[{{"role":"user","parts":[{{"{key}":{{"mimeType":"video/mp4","fileUri":"gs://tollgate-media/x"}}}}]}}],"generationConfig":{{"maxOutputTokens":16}}}}"#
+            );
+            assert!(
+                matches!(
+                    p.parse_request(GENERATE, &body),
+                    Err(ProviderError::BadRequest(_))
+                ),
+                "{key}"
+            );
+            assert!(references_external_media(&body), "{key}");
+        }
+        for (key, uri_key) in [("file_data", "file_uri"), ("fileData", "fileUri")] {
+            let body = format!(
+                r#"{{"contents":[{{"role":"user","parts":[{{"{key}":{{"mime_type":"video/mp4","{uri_key}":"gs://tollgate-media/x"}}}}]}}],"generationConfig":{{"maxOutputTokens":16}}}}"#
+            );
+            let parsed = p.parse_request(GENERATE, &body).unwrap();
+            assert!(parsed.external_media, "{key}");
+            assert!(references_external_media(&body), "{key}");
+        }
+        let text = vertex_body_with_part(&serde_json::json!({"text": "hi"}));
+        assert!(!p.parse_request(GENERATE, &text).unwrap().external_media);
+        // The raw-body check ignores case and underscores as `loose_key` does.
+        for raw in [
+            r#"{"file__data":{}}"#,
+            r#"{"File_Uri":"x"}"#,
+            r#"{"FILEID":"x"}"#,
+            r#"{"image__url":"x"}"#,
+            r#"{"inputAudio":{}}"#,
+            r#"{"type":"Image_URL"}"#,
+            r#"{"type":"input__audio"}"#,
+        ] {
+            assert!(references_external_media(raw), "{raw}");
+        }
+    }
+
+    /// A local upstream that records each request (path, headers, body) and
+    /// answers every one with `reply`.
+    async fn recording_stub(
+        reply: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<Mutex<Vec<(String, http::HeaderMap, String)>>>,
+    ) {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |uri: http::Uri, headers: http::HeaderMap, body: String| {
+                let s = s.clone();
+                async move {
+                    s.lock()
+                        .unwrap()
+                        .push((uri.path().to_owned(), headers, body));
+                    ([(http::header::CONTENT_TYPE, "application/json")], reply)
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Tollgate forwards the client's own bytes once they are checked, so key
+    /// order in client-owned maps survives (re-serialising would sort it) and
+    /// a snake_case body goes out as sent. The fast estimate is over those
+    /// bytes; the count is a separate request built from the checked value.
+    #[tokio::test]
+    async fn vertex_forwards_the_clients_bytes_and_counts_the_checked_value() {
+        let (base, seen) = recording_stub(
+            r#"{"totalTokens":3,"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#,
+        )
+        .await;
+        let p = VertexProvider::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            "p".to_owned(),
+            "global".to_owned(),
+            "t".to_owned(),
+        )
+        .with_base(base);
+        let snake = r#"{"contents":[{"role":"user","parts":[{"text":"caf\u00e9 café"}]}],
+                       "system_instruction":{"parts":[{"text":"x"}]},
+                       "generation_config":{"max_output_tokens":16}}"#;
+        let ordered = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],
+            "generationConfig":{"maxOutputTokens":16,"responseMimeType":"application/json",
+            "responseJsonSchema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"string"},"mid":{"type":"string"}}}}}"#;
+        for body in [snake, ordered] {
+            let parsed = p.parse_request(GENERATE, body).unwrap();
+            assert_eq!(parsed.estimated_input_tokens, estimate_input_tokens(body));
+            p.count_input_tokens(GENERATE, body, &parsed).await.unwrap();
+            let resp = p.forward(GENERATE, body, &parsed).await.unwrap();
+            assert_eq!(resp.status, 200);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        for (i, body) in [(0, snake), (2, ordered)] {
+            assert!(seen[i].0.ends_with(":countTokens"), "{}", seen[i].0);
+            assert!(
+                seen[i + 1].0.ends_with(":generateContent"),
+                "{}",
+                seen[i + 1].0
+            );
+            assert_eq!(seen[i + 1].2, body, "the forwarded bytes are the client's");
+        }
+        let counted: Value = serde_json::from_str(&seen[0].2).unwrap();
+        assert!(counted.get("systemInstruction").is_some());
+        let fwd = &seen[3].2;
+        let (z, a, m) = (
+            fwd.find("\"zeta\"").unwrap(),
+            fwd.find("\"alpha\"").unwrap(),
+            fwd.find("\"mid\"").unwrap(),
+        );
+        assert!(z < a && a < m, "properties keep the client's order: {fwd}");
+    }
+
+    /// On the OpenAI-compatible route to Vertex, a bare id and its `google/`
+    /// spelling are one upstream model: one `ParsedRequest` model (so one price
+    /// row, one budget scope and one ledger key) and one thinking rule, on both
+    /// the buffered and the streaming parse. A custom upstream keeps the id.
+    #[test]
+    fn a_bare_vertex_openai_id_is_parsed_as_the_forwarded_google_id() {
+        let shim = openai_vertex_test_provider().with_thinking_rules(
+            ThinkingRules::from_config(&[rule(
+                "vertex-openai",
+                "google/gemini-2.5-pro",
+                "additive",
+                500,
+            )])
+            .unwrap(),
+        );
+        let prices = crate::pricing::PriceBook::from_prices([
+            crate::pricing::ModelPrice::new("openai", "google/gemini-2.5-pro", 7, 9),
+            crate::pricing::ModelPrice::new("openai", "gemini-2.5-pro", 1, 1),
+        ]);
+        let body = |model: &str| {
+            serde_json::json!({"model": model, "max_tokens": 100, "messages": []}).to_string()
+        };
+        for model in ["gemini-2.5-pro", "google/gemini-2.5-pro"] {
+            for parsed in [
+                shim.parse_request("chat/completions", &body(model)),
+                shim.parse_streaming("chat/completions", &body(model)),
+            ] {
+                let parsed = parsed.unwrap();
+                assert_eq!(parsed.model, "google/gemini-2.5-pro", "{model}");
+                assert_eq!(
+                    parsed.max_output_tokens, 600,
+                    "{model}: the operator's rule"
+                );
+                assert_eq!(
+                    prices
+                        .lookup("openai", &parsed.model)
+                        .map(|p| p.cost_micros(Usage::new(1_000_000, 0))),
+                    Some(7),
+                    "{model}: the google/ price row"
+                );
+            }
+            let sent = shim.build_payload(&body(model), false).unwrap();
+            assert_eq!(sent["model"], "google/gemini-2.5-pro", "{model}");
+        }
+        // The forwarded id keeps the client's case; only the rule lookup ignores it.
+        let parsed = shim
+            .parse_request("chat/completions", &body("Gemini-2.5-Pro"))
+            .unwrap();
+        assert_eq!(parsed.model, "google/Gemini-2.5-Pro");
+        assert_eq!(parsed.max_output_tokens, 600);
+        assert_eq!(
+            shim.build_payload(&body("Gemini-2.5-Pro"), false).unwrap()["model"],
+            "google/Gemini-2.5-Pro"
+        );
+        // Any other prefix is sent, and priced, as written.
+        assert_eq!(
+            shim.parse_request("chat/completions", &body("meta/llama-4"))
+                .unwrap()
+                .model,
+            "meta/llama-4"
+        );
+
+        let custom = OpenAiProvider::custom(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            "http://127.0.0.1:1".to_owned(),
+            "k".to_owned(),
+        );
+        for model in ["gpt-x", "org/gpt-x"] {
+            assert_eq!(
+                custom
+                    .parse_request("chat/completions", &body(model))
+                    .unwrap()
+                    .model,
+                model
+            );
+            assert_eq!(
+                custom.build_payload(&body(model), false).unwrap()["model"],
+                model
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_models_need_a_thinking_rule_on_both_vertex_routes() {
+        // Built in: gemini-3.8-flash on native Vertex.
+        assert_eq!(
+            vertex_parse(&with_generation_config(
+                &serde_json::json!({"maxOutputTokens": 16})
+            ))
+            .unwrap()
+            .max_output_tokens,
+            16
+        );
+        let other = vertex_test_provider().parse_request(
+            "publishers/google/models/gemini-2.5-flash:generateContent",
+            &with_generation_config(&serde_json::json!({"maxOutputTokens": 16})),
+        );
+        match other {
+            Err(ProviderError::BadRequest(m)) => assert!(m.contains("[[providers.models]]"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // A non-Gemini model has no thinking rule.
+        assert!(
+            vertex_test_provider()
+                .parse_request(
+                    "publishers/meta/models/llama-4:generateContent",
+                    &with_generation_config(&serde_json::json!({"maxOutputTokens": 16})),
+                )
+                .is_ok()
+        );
+
+        // Built in on the OpenAI-compatible route, bare and prefixed.
+        let shim = openai_vertex_test_provider();
+        for model in ["gemini-3.8-flash", "google/gemini-3.8-flash"] {
+            let body =
+                serde_json::json!({"model": model, "max_tokens": 64, "messages": []}).to_string();
+            assert_eq!(
+                shim.parse_request("chat/completions", &body)
+                    .unwrap()
+                    .max_output_tokens,
+                64,
+                "{model}"
+            );
+        }
+        for model in ["gemini-2.5-flash", "google/gemini-2.5-pro"] {
+            let body =
+                serde_json::json!({"model": model, "max_tokens": 64, "messages": []}).to_string();
+            assert!(
+                matches!(
+                    shim.parse_request("chat/completions", &body),
+                    Err(ProviderError::BadRequest(_))
+                ),
+                "{model}"
+            );
+            assert!(
+                shim.parse_streaming("chat/completions", &body).is_err(),
+                "{model}"
+            );
+        }
+        // A custom upstream has no thinking rule at all.
+        let body = r#"{"model":"gemini-2.5-flash","max_tokens":64,"messages":[]}"#;
+        assert!(
+            openai_test_provider()
+                .parse_request("chat/completions", body)
+                .is_ok()
+        );
+    }
+
+    fn openai_vertex_test_provider() -> OpenAiProvider {
+        OpenAiProvider::vertex(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            "p",
+            "global",
+            "t".to_owned(),
+        )
+    }
+
+    fn rule(
+        upstream: &str,
+        model: &str,
+        thinking: &str,
+        max: u64,
+    ) -> crate::config::ModelRuleConfig {
+        crate::config::ModelRuleConfig {
+            upstream: upstream.to_owned(),
+            model: model.to_owned(),
+            thinking: Some(thinking.to_owned()),
+            max_thinking_tokens: max,
+        }
+    }
+
+    #[test]
+    fn operator_thinking_rows_extend_and_override_the_built_ins() {
+        let rules = ThinkingRules::from_config(&[
+            rule("vertex", "gemini-2.5-flash", "within_output_cap", 0),
+            rule("vertex", "gemini-2.5-pro", "additive", 1_000),
+            rule("vertex-openai", "google/gemini-2.5-pro", "additive", 1_000),
+            rule("vertex-openai", "gemini-3.8-flash", "additive", 500),
+        ])
+        .unwrap();
+        let native = vertex_test_provider().with_thinking_rules(rules.clone());
+        let path = |m: &str| format!("publishers/google/models/{m}:generateContent");
+        let cap = |budget: Option<i64>| {
+            let mut config = serde_json::json!({"maxOutputTokens": 100});
+            if let Some(b) = budget {
+                config["thinkingConfig"] = serde_json::json!({"thinkingBudget": b});
+            }
+            with_generation_config(&config)
+        };
+        let leg = |model: &str, budget: Option<i64>| {
+            native
+                .parse_request(&path(model), &cap(budget))
+                .unwrap()
+                .max_output_tokens
+        };
+        assert_eq!(leg("gemini-2.5-flash", None), 100);
+        // Additive: the cap plus the operator's bound...
+        assert_eq!(leg("gemini-2.5-pro", None), 1_100);
+        assert_eq!(leg("gemini-2.5-pro", Some(-1)), 1_100);
+        assert_eq!(leg("gemini-2.5-pro", Some(400)), 1_100);
+        // ...raised by a larger explicit budget, which is a soft limit.
+        assert_eq!(leg("gemini-2.5-pro", Some(5_000)), 5_100);
+        // The built-in row is untouched on the route the operator did not name.
+        assert_eq!(leg("gemini-3.8-flash", None), 100);
+
+        let shim = openai_vertex_test_provider().with_thinking_rules(rules);
+        let leg = |body: Value| {
+            shim.parse_request("chat/completions", &body.to_string())
+                .unwrap()
+                .max_output_tokens
+        };
+        // The operator row overrides the built-in one for the same model:
+        // the bare id is forwarded as the `google/` one, so both spellings,
+        // in any case, take the operator's row.
+        for model in [
+            "gemini-3.8-flash",
+            "google/gemini-3.8-flash",
+            "GEMINI-3.8-Flash",
+            "Google/Gemini-3.8-Flash",
+        ] {
+            assert_eq!(
+                leg(serde_json::json!({"model": model, "max_tokens": 100, "messages": []})),
+                600,
+                "{model}"
+            );
+        }
+        // A bare id reaches the operator's `google/` row.
+        assert_eq!(
+            leg(serde_json::json!({"model": "gemini-2.5-pro", "max_tokens": 100, "messages": []})),
+            1_100
+        );
+        assert_eq!(
+            leg(
+                serde_json::json!({"model": "google/gemini-2.5-pro", "max_tokens": 100, "messages": []})
+            ),
+            1_100
+        );
+        assert_eq!(
+            leg(
+                serde_json::json!({"model": "google/gemini-2.5-pro", "max_tokens": 100, "messages": [],
+                "google": {"thinking_config": {"thinking_budget": 3_000}}})
+            ),
+            3_100
+        );
+        assert_eq!(
+            leg(
+                serde_json::json!({"model": "google/gemini-2.5-pro", "max_tokens": 100, "messages": [],
+                "extra_body": {"google": {"thinking_config": {"thinking_budget": 4_000}}}})
+            ),
+            4_100
+        );
+        // The outbound cap stays the client's: thinking is reserved, not granted.
+        let out = shim
+            .build_payload(
+                r#"{"model":"google/gemini-2.5-pro","max_tokens":100}"#,
+                false,
+            )
+            .unwrap();
+        assert_eq!(out["max_tokens"], 100);
+    }
+
+    #[test]
+    fn invalid_thinking_rows_refuse_startup() {
+        for (rows, what) in [
+            (
+                vec![rule("vertex", "gemini-2.5-pro", "additive", 0)],
+                "additive without a bound",
+            ),
+            (
+                vec![rule("vertex", "gemini-2.5-pro", "within_output_cap", 10)],
+                "a bound that is ignored",
+            ),
+            (
+                vec![rule("vertex", "gemini-2.5-pro", "sometimes", 0)],
+                "an unknown rule",
+            ),
+            (
+                vec![rule("anthropic", "claude-x", "additive", 10)],
+                "an unknown upstream",
+            ),
+            (
+                vec![rule("vertex", "", "within_output_cap", 0)],
+                "an empty model",
+            ),
+            (
+                vec![
+                    rule("vertex", "gemini-2.5-pro", "within_output_cap", 0),
+                    rule("vertex", "gemini-2.5-pro", "additive", 10),
+                ],
+                "two rows for one model",
+            ),
+            (
+                vec![
+                    rule("vertex", "gemini-2.5-pro", "additive", 10),
+                    rule("vertex", "Gemini-2.5-PRO", "additive", 20),
+                ],
+                "two rows for one model in different case",
+            ),
+            (
+                vec![
+                    rule("vertex-openai", "gemini-2.5-pro", "additive", 10),
+                    rule("vertex-openai", "google/gemini-2.5-pro", "additive", 20),
+                ],
+                "a bare and a google/ row for one forwarded model",
+            ),
+            (
+                vec![
+                    rule("vertex-openai", "GEMINI-2.5-pro", "within_output_cap", 0),
+                    rule("vertex-openai", "Google/Gemini-2.5-Pro", "additive", 20),
+                ],
+                "the same, in different case",
+            ),
+        ] {
+            assert!(ThinkingRules::from_config(&rows).is_err(), "{what}");
+        }
+        // One model id on each route is two rows, not a duplicate.
+        assert!(
+            ThinkingRules::from_config(&[
+                rule("vertex", "gemini-2.5-pro", "additive", 10),
+                rule("vertex-openai", "gemini-2.5-pro", "additive", 10),
+            ])
+            .is_ok()
+        );
+        let mut missing = rule("vertex", "gemini-2.5-pro", "additive", 10);
+        missing.thinking = None;
+        assert!(
+            ThinkingRules::from_config(&[missing]).is_err(),
+            "no thinking"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Vertex OpenAI-compatible: google / extra_body.google, service_tier
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn google_settings_are_checked_on_the_vertex_shim_only() {
+        let shim = openai_vertex_test_provider();
+        let parse = |extra: Value| {
+            let mut body =
+                serde_json::json!({"model": "gemini-3.8-flash", "max_tokens": 64, "messages": []});
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            shim.parse_request("chat/completions", &body.to_string())
+        };
+        let thinking = serde_json::json!({"thinking_config": {"include_thoughts": true, "thinking_budget": 32, "thinking_level": "low"}});
+        assert!(parse(serde_json::json!({"google": thinking})).is_ok());
+        assert!(parse(serde_json::json!({"extra_body": {"google": thinking}})).is_ok());
+        for (extra, what) in [
+            (
+                serde_json::json!({"google": thinking, "extra_body": {"google": thinking}}),
+                "both shapes",
+            ),
+            (
+                serde_json::json!({"google": {"cached_content": "projects/p/cachedContents/1"}}),
+                "google.cached_content",
+            ),
+            (
+                serde_json::json!({"extra_body": {"google": {"cached_content": "projects/p/cachedContents/1"}}}),
+                "extra_body.google.cached_content",
+            ),
+            (
+                serde_json::json!({"google": {"thinking_config": {}, "safety_settings": []}}),
+                "another google setting",
+            ),
+            (
+                serde_json::json!({"google": {"thinking_config": {"other": 1}}}),
+                "another thinking field",
+            ),
+            (
+                serde_json::json!({"google": {"thinking_config": {"thinking_budget": -3}}}),
+                "a negative budget",
+            ),
+            (
+                serde_json::json!({"extra_body": {"other": 1}}),
+                "another extra_body member",
+            ),
+            (
+                serde_json::json!({"extra_body": {"google": thinking, "other": 1}}),
+                "google beside another member",
+            ),
+            (
+                serde_json::json!({"extra_body": "x"}),
+                "a non-object extra_body",
+            ),
+            (serde_json::json!({"google": "x"}), "a non-object google"),
+            (
+                serde_json::json!({"cached_content": "projects/p/cachedContents/1"}),
+                "top-level cached_content",
+            ),
+            (
+                serde_json::json!({"candidate_count": 1}),
+                "top-level candidate_count",
+            ),
+            (
+                serde_json::json!({"candidate_count": 2}),
+                "top-level candidate_count 2",
+            ),
+            (
+                serde_json::json!({"cachedContent": "projects/p/cachedContents/1"}),
+                "top-level cachedContent",
+            ),
+            (
+                serde_json::json!({"cachedcontent": "projects/p/cachedContents/1"}),
+                "top-level cachedcontent",
+            ),
+            (
+                serde_json::json!({"candidateCount": 2}),
+                "top-level candidateCount",
+            ),
+            (
+                serde_json::json!({"candidate__count": 2}),
+                "top-level candidate__count",
+            ),
+        ] {
+            assert!(
+                matches!(parse(extra), Err(ProviderError::BadRequest(_))),
+                "{what}"
+            );
+        }
+        // A custom upstream is unchanged: these pass through to it untouched.
+        let custom = openai_test_provider();
+        let body = r#"{"model":"m","messages":[],"google":{"cached_content":"c"},"extra_body":{"other":1},"cached_content":"c","candidate_count":2}"#;
+        assert!(custom.parse_request("chat/completions", body).is_ok());
+        let out = custom.build_payload(body, false).unwrap();
+        assert_eq!(out["google"]["cached_content"], "c");
+        assert_eq!(out["cached_content"], "c");
+        assert_eq!(out["extra_body"]["other"], 1);
+    }
+
+    #[test]
+    fn an_explicit_auto_service_tier_is_refused() {
+        let p = openai_test_provider();
+        let body = r#"{"model":"m","messages":[],"service_tier":"auto"}"#;
+        assert!(matches!(
+            p.parse_request("chat/completions", body),
+            Err(ProviderError::BadRequest(_))
+        ));
+        assert!(p.parse_streaming("chat/completions", body).is_err());
+        assert!(
+            p.parse_request(
+                "chat/completions",
+                r#"{"model":"m","messages":[],"service_tier":"default"}"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_service_tier_is_pinned_where_the_operator_says_and_dropped_on_vertex() {
+        let custom = |base: &str| {
+            OpenAiProvider::custom(
+                reqwest::Client::new(),
+                reqwest::Client::new(),
+                base.to_owned(),
+                "k".to_owned(),
+            )
+        };
+        let tier = |p: &OpenAiProvider, body: &str| {
+            p.build_payload(body, false)
+                .unwrap()
+                .get("service_tier")
+                .cloned()
+        };
+        let bare = r#"{"model":"m","max_tokens":8}"#;
+        // Default: on for OpenAI's own API, off for anything else.
+        assert_eq!(
+            tier(&custom("https://api.openai.com/v1"), bare),
+            Some(Value::from("default"))
+        );
+        assert_eq!(
+            tier(&custom("https://API.OpenAI.com./v1"), bare),
+            Some(Value::from("default"))
+        );
+        assert_eq!(tier(&custom("https://example.test/v1"), bare), None);
+        // Explicit settings win, both ways.
+        let off = custom("https://api.openai.com/v1").with_pin_service_tier(Some(false));
+        assert_eq!(tier(&off, bare), None);
+        let on = custom("https://example.test/v1").with_pin_service_tier(Some(true));
+        assert_eq!(tier(&on, bare), Some(Value::from("default")));
+        assert_eq!(
+            tier(&on, r#"{"model":"m","service_tier":"default"}"#),
+            Some(Value::from("default"))
+        );
+        // Vertex never gets the field, even when the client sent it.
+        let shim = openai_vertex_test_provider().with_pin_service_tier(Some(true));
+        assert_eq!(
+            tier(
+                &shim,
+                r#"{"model":"gemini-3.8-flash","service_tier":"default"}"#
+            ),
+            None
+        );
+        let stream = shim
+            .build_payload(
+                r#"{"model":"gemini-3.8-flash","service_tier":"default"}"#,
+                true,
+            )
+            .unwrap();
+        assert!(stream.get("service_tier").is_none());
+    }
+
+    /// Model ids are matched without case for the Gemini predicate and the
+    /// rule lookup, so a client cannot skip a rule by changing case.
+    #[test]
+    fn gemini_models_are_matched_without_case() {
+        let path = |m: &str| format!("publishers/google/models/{m}:generateContent");
+        let body = with_generation_config(&serde_json::json!({"maxOutputTokens": 100}));
+        let native = vertex_test_provider();
+        for model in ["GEMINI-2.5-flash", "Gemini-2.5-Pro"] {
+            assert!(
+                matches!(
+                    native.parse_request(&path(model), &body),
+                    Err(ProviderError::BadRequest(_))
+                ),
+                "{model} has no rule"
+            );
+        }
+        assert_eq!(
+            native
+                .parse_request(&path("Gemini-3.8-FLASH"), &body)
+                .unwrap()
+                .max_output_tokens,
+            100
+        );
+        let rules =
+            ThinkingRules::from_config(&[rule("vertex", "Gemini-2.5-Pro", "additive", 1_000)])
+                .unwrap();
+        let native = vertex_test_provider().with_thinking_rules(rules);
+        for model in ["gemini-2.5-pro", "GEMINI-2.5-PRO"] {
+            assert_eq!(
+                native
+                    .parse_request(&path(model), &body)
+                    .unwrap()
+                    .max_output_tokens,
+                1_100,
+                "{model}"
+            );
+        }
+        let shim = openai_vertex_test_provider();
+        for model in [
+            "GEMINI-2.5-flash",
+            "Google/Gemini-2.5-Pro",
+            "GOOGLE/gemini-2.5-pro",
+        ] {
+            let body =
+                serde_json::json!({"model": model, "max_tokens": 64, "messages": []}).to_string();
+            assert!(
+                matches!(
+                    shim.parse_request("chat/completions", &body),
+                    Err(ProviderError::BadRequest(_))
+                ),
+                "{model} has no rule"
+            );
+        }
+    }
+
+    /// An `additive` model reserves `max_thinking_tokens` for every thinking
+    /// effort a client can ask for without a numeric budget: OpenAI's
+    /// `reasoning_effort`, `thinkingLevel` / `thinking_level`, and the
+    /// dynamic budget -1. The operator's bound must cover the highest.
+    #[test]
+    fn additive_models_reserve_the_operator_bound_for_any_thinking_effort() {
+        let rules = ThinkingRules::from_config(&[
+            rule("vertex", "gemini-2.5-pro", "additive", 1_000),
+            rule("vertex-openai", "google/gemini-2.5-pro", "additive", 1_000),
+        ])
+        .unwrap();
+        let native = vertex_test_provider().with_thinking_rules(rules.clone());
+        let path = "publishers/google/models/gemini-2.5-pro:generateContent";
+        for thinking in [
+            serde_json::json!({"thinkingLevel": "HIGH"}),
+            serde_json::json!({"thinkingLevel": "LOW"}),
+            serde_json::json!({"thinkingBudget": -1}),
+            serde_json::json!({"thinking_level": "high", "include_thoughts": true}),
+        ] {
+            let body = serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generation_config": {"max_output_tokens": 100, "thinking_config": thinking}
+            })
+            .to_string();
+            assert_eq!(
+                native.parse_request(path, &body).unwrap().max_output_tokens,
+                1_100,
+                "{thinking}"
+            );
+        }
+        let shim = openai_vertex_test_provider().with_thinking_rules(rules);
+        for extra in [
+            serde_json::json!({"reasoning_effort": "high"}),
+            serde_json::json!({"reasoning_effort": "low"}),
+            serde_json::json!({"google": {"thinking_config": {"thinking_level": "high"}}}),
+            serde_json::json!({"google": {"thinking_config": {"thinking_budget": -1}}}),
+        ] {
+            for model in ["gemini-2.5-pro", "google/gemini-2.5-pro"] {
+                let mut body =
+                    serde_json::json!({"model": model, "max_tokens": 100, "messages": []});
+                for (k, v) in extra.as_object().unwrap() {
+                    body[k] = v.clone();
+                }
+                let body = body.to_string();
+                assert_eq!(
+                    shim.parse_request("chat/completions", &body)
+                        .unwrap()
+                        .max_output_tokens,
+                    1_100,
+                    "{body}"
+                );
+                assert_eq!(
+                    shim.parse_streaming("chat/completions", &body)
+                        .unwrap()
+                        .max_output_tokens,
+                    1_100,
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_service_tier_other_than_the_exact_default_string_is_refused() {
+        let custom = openai_test_provider();
+        let shim = openai_vertex_test_provider();
+        for tier in [
+            "null",
+            "5",
+            "0",
+            "true",
+            r#"["priority"]"#,
+            r#"{"tier":"default"}"#,
+            r#""auto""#,
+            r#""priority""#,
+            r#""flex""#,
+            r#""Default""#,
+            r#"" default""#,
+        ] {
+            for p in [&custom, &shim] {
+                let body = format!(
+                    r#"{{"model":"gemini-3.8-flash","max_tokens":8,"messages":[],"service_tier":{tier}}}"#
+                );
+                assert!(
+                    matches!(
+                        p.parse_request("chat/completions", &body),
+                        Err(ProviderError::BadRequest(_))
+                    ),
+                    "{tier}"
+                );
+                assert!(
+                    p.parse_streaming("chat/completions", &body).is_err(),
+                    "{tier}"
+                );
+            }
+        }
+    }
+
+    /// On the Vertex shim a content array carries text parts only, so no
+    /// spelling of a media or file part reaches Vertex.
+    #[test]
+    fn the_vertex_shim_accepts_only_text_content_parts() {
+        let shim = openai_vertex_test_provider();
+        let with_content = |content: Value| {
+            serde_json::json!({
+                "model": "gemini-3.8-flash", "max_tokens": 8,
+                "messages": [{"role": "system", "content": "be brief"},
+                             {"role": "user", "content": content}]
+            })
+            .to_string()
+        };
+        for ok in [
+            serde_json::json!("plain string content"),
+            serde_json::json!([{"type": "text", "text": "hi"}, {"type": "text", "text": "there"}]),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                shim.parse_request("chat/completions", &with_content(ok.clone()))
+                    .is_ok(),
+                "{ok}"
+            );
+        }
+        for refused in [
+            serde_json::json!([{"type": "file", "file": {"file_url": "gs://other/x"}}]),
+            serde_json::json!([{"type": "input_file", "file_url": "gs://other/x"}]),
+            serde_json::json!([{"type": "file_url", "file_url": "gs://other/x"}]),
+            serde_json::json!([{"type": "imageUrl", "imageUrl": {"url": "gs://other/x"}}]),
+            serde_json::json!([{"type": "text", "text": "hi", "file_url": "gs://other/x"}]),
+            serde_json::json!([{"type": "text", "text": "hi", "cache_control": {}}]),
+            serde_json::json!([{"type": "TEXT", "text": "hi"}]),
+            serde_json::json!([{"type": "text"}]),
+            serde_json::json!([{"type": "text", "text": 5}]),
+            serde_json::json!([{"text": "hi"}]),
+            serde_json::json!(["hi"]),
+        ] {
+            let body = with_content(refused.clone());
+            assert!(
+                matches!(
+                    shim.parse_request("chat/completions", &body),
+                    Err(ProviderError::BadRequest(_))
+                ),
+                "{refused}"
+            );
+            assert!(
+                shim.parse_streaming("chat/completions", &body).is_err(),
+                "{refused}"
+            );
+        }
+        // An assistant turn's array is checked too.
+        let body = r#"{"model":"gemini-3.8-flash","max_tokens":8,"messages":[{"role":"assistant","content":[{"type":"input_file","file_url":"gs://other/x"}]}]}"#;
+        assert!(shim.parse_request("chat/completions", body).is_err());
+        // A custom upstream is unchanged.
+        let body = with_content(serde_json::json!([{"type": "refusal", "refusal": "no"}]));
+        assert!(
+            openai_test_provider()
+                .parse_request("chat/completions", &body)
+                .is_ok()
+        );
+    }
+
+    /// serde_json reads an integer past 64 bits as the nearest float, so a
+    /// re-serialised body would carry another number. Refused on every
+    /// adapter that re-serialises.
+    #[test]
+    fn integers_outside_64_bits_are_refused_not_forwarded_as_floats() {
+        let big = "123456789012345678901234567890";
+        let native = vertex_test_provider();
+        let body = format!(
+            r#"{{"contents":[{{"role":"user","parts":[{{"functionCall":{{"name":"f","args":{{"big":{big}}}}}}}]}}],"generationConfig":{{"maxOutputTokens":16}}}}"#
+        );
+        match native.parse_request(GENERATE, &body) {
+            Err(ProviderError::BadRequest(m)) => assert!(!m.contains(big), "{m}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+        for n in ["-9223372036854775809", "18446744073709551616"] {
+            let body = format!(
+                r#"{{"contents":[],"generationConfig":{{"maxOutputTokens":16,"seed":{n}}}}}"#
+            );
+            assert!(native.parse_request(GENERATE, &body).is_err(), "{n}");
+        }
+        let openai = format!(r#"{{"model":"m","max_tokens":8,"messages":[],"user":{big}}}"#);
+        assert!(
+            openai_test_provider()
+                .parse_request("chat/completions", &openai)
+                .is_err()
+        );
+        let anthropic = format!(r#"{{"model":"m","max_tokens":8,"messages":[],"x":{big}}}"#);
+        assert!(
+            anthropic_test_provider()
+                .parse_request("messages", &anthropic)
+                .is_err()
+        );
+        // In range, fractions, exponents, and digits inside strings all pass.
+        for ok in [
+            "-9223372036854775808",
+            "18446744073709551615",
+            "-0",
+            "1.5",
+            "1e30",
+            "123456789012345678901234567890.0",
+            r#""123456789012345678901234567890""#,
+            r#""a\"123456789012345678901234567890""#,
+        ] {
+            assert!(reject_lossy_integers(&format!("[{ok}]")).is_ok(), "{ok}");
+        }
+        assert!(reject_lossy_integers("[1, 123456789012345678901234567890]").is_err());
+    }
+
+    #[test]
+    fn path_refusals_do_not_echo_the_path() {
+        for path in [
+            "../secret-name",
+            "publishers/google/secret-name:generateContent",
+        ] {
+            match vertex_test_provider().parse_request(path, "{}") {
+                Err(ProviderError::BadRequest(m)) => assert!(!m.contains("secret-name"), "{m}"),
+                other => panic!("expected a 400, got {other:?}"),
+            }
+        }
+        match safe_rest_path("/secret-name") {
+            Err(ProviderError::BadRequest(m)) => assert!(!m.contains("secret-name"), "{m}"),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Anthropic betas
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn betas_are_joined_trimmed_and_deduplicated_across_header_instances() {
+        assert_eq!(joined_anthropic_betas([]), None);
+        assert_eq!(joined_anthropic_betas([" , "]), None);
+        assert_eq!(
+            joined_anthropic_betas([
+                "prompt-caching-2024-07-31, pdfs-2024-09-25",
+                "pdfs-2024-09-25",
+                " interleaved-thinking-2025-05-14 ,prompt-caching-2024-07-31",
+            ])
+            .as_deref(),
+            Some("prompt-caching-2024-07-31,pdfs-2024-09-25,interleaved-thinking-2025-05-14")
+        );
+    }
+
+    /// Betas go on the Messages call, buffered and streamed, and never on the
+    /// token count.
+    #[tokio::test]
+    async fn betas_are_forwarded_on_messages_and_not_on_the_count() {
+        let (base, seen) = recording_stub(
+            r#"{"type":"message","input_tokens":3,"usage":{"input_tokens":3,"output_tokens":1}}"#,
+        )
+        .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let p = AnthropicProvider::new(
+            client.clone(),
+            client,
+            "k".to_owned(),
+            base,
+            "2023-06-01".to_owned(),
+        );
+        let body = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
+        let mut parsed = p.parse_request("messages", body).unwrap();
+        parsed.anthropic_beta = Some("prompt-caching-2024-07-31,pdfs-2024-09-25".to_owned());
+        p.count_input_tokens("messages", body, &parsed)
+            .await
+            .unwrap();
+        p.forward("messages", body, &parsed).await.unwrap();
+        p.forward_stream(body, parsed.anthropic_beta.as_deref())
+            .await
+            .unwrap();
+        p.forward_stream(body, None).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let beta = |i: usize| {
+            seen[i]
+                .1
+                .get_all("anthropic-beta")
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].0, "/v1/messages/count_tokens");
+        assert!(beta(0).is_empty(), "the count carries no beta");
+        for i in [1, 2] {
+            assert_eq!(seen[i].0, "/v1/messages");
+            assert_eq!(beta(i), vec!["prompt-caching-2024-07-31,pdfs-2024-09-25"]);
+        }
+        assert!(beta(3).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 2 regressions (ported from the reviewer's probes)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn keys_differing_only_in_case_or_underscores_are_refused() {
+        let cfg = r#""generationConfig":{"maxOutputTokens":16}"#;
+        for (body, what) in [
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"fileDATA":{{"fileUri":"gs://other-media/big"}},"fileData":{{"fileUri":"gs://tollgate-media/a"}}}}]}}],{cfg}}}"#
+                ),
+                "fileDATA beside fileData",
+            ),
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"text":"hi"}}],"pARTS":[{{"text":"long"}}]}}],{cfg}}}"#
+                ),
+                "pARTS beside parts",
+            ),
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"text":"x","videoMetadata":{{"start_offset":"1s","startOffset":"0s"}}}}]}}],{cfg}}}"#
+                ),
+                "videoMetadata.startOffset in two spellings",
+            ),
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"executableCode":{{"code":"a","cODE":"b"}}}}]}}],{cfg}}}"#
+                ),
+                "executableCode.code in two cases",
+            ),
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"codeExecutionResult":{{"output":"a","oUTPUT":"b"}}}}]}}],{cfg}}}"#
+                ),
+                "codeExecutionResult.output in two cases",
+            ),
+            (
+                format!(
+                    r#"{{"contents":[{{"role":"user","parts":[{{"functionResponse":{{"name":"f","response":{{}},"parts":[{{"inlineData":{{"mimeType":"a","mIMEType":"b","data":""}}}}]}}}}]}}],{cfg}}}"#
+                ),
+                "functionResponse.parts[].inlineData.mimeType in two cases",
+            ),
+            (
+                r#"{"contents":[],"generationConfig":{"maxOutputTokens":16},"gENERATIONCONFIG":{"maxOutputTokens":16}}"#.to_owned(),
+                "a top-level key in two cases",
+            ),
+        ] {
+            match vertex_parse(&body) {
+                Err(ProviderError::BadRequest(m)) => {
+                    assert!(m.contains("differ only in case"), "{what}: {m}");
+                }
+                other => panic!("{what} must be a 400, got {other:?}"),
+            }
+        }
+        // Client-owned maps are not Google's: `args` may carry both.
+        let args = vertex_body_with_part(
+            &serde_json::json!({"functionCall": {"name": "f", "args": {"userId": 1, "user_id": 2}}}),
+        );
+        assert!(vertex_parse(&args).is_ok());
+        // One spelling of each new sub-object is accepted.
+        let video = vertex_body_with_part(
+            &serde_json::json!({"text": "x", "videoMetadata": {"start_offset": "1s"}}),
+        );
+        assert!(vertex_parse(&video).is_ok());
+    }
+
+    #[test]
+    fn a_file_data_that_is_not_an_object_is_refused() {
+        for (file_data, what) in [
+            (serde_json::json!("gs://evil/a"), "a string"),
+            (serde_json::json!([{"fileUri": "gs://evil/a"}]), "an array"),
+            (Value::Null, "null"),
+            (serde_json::json!(1), "a number"),
+        ] {
+            for key in ["fileData", "file_data"] {
+                let body = vertex_body_with_part(&serde_json::json!({ key: file_data.clone() }));
+                assert!(
+                    matches!(vertex_parse(&body), Err(ProviderError::Forbidden(_))),
+                    "{key} as {what} must be refused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_vertex_refuses_a_zero_output_cap() {
+        let body = r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}],"generationConfig":{"maxOutputTokens":0}}"#;
+        assert_bad_request(body, "maxOutputTokens 0");
+        let snake = r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}],"generation_config":{"max_output_tokens":0}}"#;
+        assert_bad_request(snake, "max_output_tokens 0");
+        let one = r#"{"contents":[{"role":"user","parts":[{"text":"x"}]}],"generationConfig":{"maxOutputTokens":1}}"#;
+        assert!(vertex_parse(one).is_ok());
+    }
+
+    #[test]
+    fn vertex_openai_refuses_camel_case_keys() {
+        let p = openai_vertex_test_provider();
+        let refused = |body: &str, what: &str| match p.parse_request("chat/completions", body) {
+            Err(ProviderError::BadRequest(m)) => {
+                assert!(m.contains("must be snake_case"), "{what}: {m}");
+            }
+            other => panic!("{what} must be a 400, got {other:?}"),
+        };
+        for (extra, what) in [
+            (r#""maxTokens":100000"#, "maxTokens"),
+            (
+                r#""extraBody":{"google":{"thinkingConfig":{"thinkingBudget":24000}}}"#,
+                "extraBody",
+            ),
+            (r#""candidateCount":4"#, "candidateCount"),
+            (r#""serviceTier":"priority""#, "serviceTier"),
+            (r#""Model":"gemini-2.5-pro""#, "an uppercase first letter"),
+            (
+                r#""google":{"thinkingConfig":{"thinking_budget":24000}}"#,
+                "google.thinkingConfig",
+            ),
+            (
+                r#""extra_body":{"google":{"thinkingConfig":{"thinking_budget":24000}}}"#,
+                "extra_body.google.thinkingConfig",
+            ),
+            (
+                r#""extra_body":{"Google":{"thinking_config":{}}}"#,
+                "extra_body.Google",
+            ),
+            (
+                r#""google":{"thinking_config":{"thinkingBudget":24000}}"#,
+                "thinking_config.thinkingBudget",
+            ),
+            (
+                r#""extra_body":{"google":{"thinking_config":{"includeThoughts":true}}}"#,
+                "extra_body.google.thinking_config.includeThoughts",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"model":"gemini-3.8-flash","max_tokens":16,{extra},"messages":[{{"role":"user","content":"x"}}]}}"#
+            );
+            refused(&body, what);
+        }
+        // Client-owned content is not a key: a schema property in camelCase
+        // and camelCase text stay accepted.
+        let schema = r#"{"model":"gemini-3.8-flash","max_tokens":16,"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"userId":{"type":"string"}}}}}],"messages":[{"role":"user","content":"maxTokens"}]}"#;
+        assert!(p.parse_request("chat/completions", schema).is_ok());
+        // A custom upstream is unchanged.
+        let custom = r#"{"model":"gpt-x","max_tokens":16,"maxTokens":100000,"messages":[]}"#;
+        assert!(
+            openai_test_provider()
+                .parse_request("chat/completions", custom)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn vertex_openai_refuses_loose_respellings_of_checked_fields() {
+        let p = openai_vertex_test_provider();
+        let refused = |body: &str, what: &str| match p.parse_request("chat/completions", body) {
+            Err(ProviderError::BadRequest(m)) => {
+                assert!(m.contains("must be spelled exactly"), "{what}: {m}");
+            }
+            other => panic!("{what} must be a 400, got {other:?}"),
+        };
+        for (extra, what) in [
+            (r#""maxtokens":100000"#, "maxtokens"),
+            (r#""max__tokens":100000"#, "max__tokens"),
+            (r#""max_tokens_":100000"#, "max_tokens_"),
+            (r#""maxcompletiontokens":100000"#, "maxcompletiontokens"),
+            (r#""service__tier":"priority""#, "service__tier"),
+            (r#""extra__body":{"google":{}}"#, "extra__body"),
+            (r#""reasoningeffort":"high""#, "reasoningeffort"),
+            (r#""google":{"cachedcontent":"c"}"#, "google.cachedcontent"),
+            (
+                r#""extra_body":{"google":{"cachedcontent":"c"}}"#,
+                "extra_body.google.cachedcontent",
+            ),
+            (
+                r#""google":{"thinking_config":{"thinkingbudget":24000}}"#,
+                "thinking_config.thinkingbudget",
+            ),
+            (r#""_n":4"#, "_n"),
+        ] {
+            let body = format!(
+                r#"{{"model":"gemini-3.8-flash","max_tokens":16,{extra},"messages":[{{"role":"user","content":"x"}}]}}"#
+            );
+            refused(&body, what);
+        }
+        // Two keys with one loose form, neither a checked field.
+        refused(
+            r#"{"model":"gemini-3.8-flash","max_tokens":16,"top_k":1,"topk":2,"messages":[]}"#,
+            "top_k beside topk",
+        );
+        // Ordinary snake_case fields still pass.
+        let ok = r#"{"model":"gemini-3.8-flash","max_tokens":16,"temperature":0.2,"metadata":{"a":"b"},"user":"u","store":false,"top_p":0.9,"messages":[{"role":"user","content":"x"}]}"#;
+        assert!(p.parse_request("chat/completions", ok).is_ok());
+        // A custom upstream is unchanged.
+        let custom = r#"{"model":"gpt-x","max_tokens":16,"maxtokens":100000,"messages":[]}"#;
+        assert!(
+            openai_test_provider()
+                .parse_request("chat/completions", custom)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn openai_zero_output_cap_is_replaced_by_the_default_not_forwarded() {
+        // 0 is not passed through: the reservation and the outbound cap are
+        // both the default.
+        for field in ["max_tokens", "max_completion_tokens"] {
+            let body = format!(r#"{{"model":"gemini-3.8-flash","{field}":0,"messages":[]}}"#);
+            let p = openai_vertex_test_provider();
+            let parsed = p.parse_request("chat/completions", &body).unwrap();
+            let payload = p.build_payload(&body, false).unwrap();
+            assert_eq!(payload["max_tokens"], OPENAI_DEFAULT_MAX_OUTPUT, "{field}");
+            assert!(payload.get("max_completion_tokens").is_none(), "{field}");
+            assert!(
+                parsed.max_output_tokens >= OPENAI_DEFAULT_MAX_OUTPUT,
+                "{field}"
+            );
+        }
     }
 }

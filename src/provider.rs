@@ -31,6 +31,17 @@ pub struct ParsedRequest {
     /// request body, so a request that cannot write is not reserved as if it
     /// could. Defaults false; erring toward true only over-reserves.
     pub may_cache_write: bool,
+    /// The client's `anthropic-beta` values, already checked against the
+    /// allowlist, deduplicated and joined with `,`. Set by the native
+    /// `/v1/messages` handler (the only route that validates them) and sent on
+    /// the Messages call only, never on the token count.
+    pub anthropic_beta: Option<String>,
+    /// Whether the body, as it will be forwarded, references external media
+    /// (see [`crate::providers::references_external_media`]). Set by an
+    /// adapter that rewrites the body before forwarding it, so the decision
+    /// is made on what the provider receives; the gateway also checks the
+    /// client's bytes.
+    pub external_media: bool,
 }
 
 /// A provider response: upstream status, JSON body (returned to the client only
@@ -262,6 +273,13 @@ pub fn log_upstream_refusal(
 pub enum ProviderError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// The request names a source Tollgate will not let the provider read on
+    /// the operator's behalf (a `gs://` bucket off the allowlist, or a URI
+    /// scheme the provider would fetch on the operator's behalf). A 403
+    /// with `x-tollgate-reason: forbidden_source`. The text is fixed and never
+    /// carries the URI.
+    #[error("forbidden source: {0}")]
+    Forbidden(String),
     /// The call failed BEFORE the provider could have served it: connect, DNS or
     /// TLS failure, or a failure building or authorising the request. Nothing was
     /// billed upstream, so the reservation is released in full.
@@ -302,7 +320,9 @@ pub trait Provider: Send + Sync {
     /// `/v1/{provider}/`; `body` is the raw request body.
     ///
     /// # Errors
-    /// Returns [`ProviderError::BadRequest`] if the body cannot be parsed.
+    /// Returns [`ProviderError::BadRequest`] if the body cannot be parsed, and
+    /// [`ProviderError::Forbidden`] if it names a source the operator has not
+    /// allowed.
     fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError>;
 
     /// Forward the request to the upstream and return the response with usage.
@@ -412,6 +432,8 @@ impl Provider for MockProvider {
             estimated_input_tokens: Self::estimate_input_tokens(&b.prompt),
             max_output_tokens: b.max_output_tokens,
             may_cache_write: false,
+            anthropic_beta: None,
+            external_media: false,
         })
     }
 
