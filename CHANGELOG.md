@@ -30,6 +30,16 @@ Notable changes per release.
 
 ### Changed
 
+- When a `/v1/chat/completions` stream reports usage more than once, it is
+  charged the dearest of its reports, each costed whole, rather than the last.
+  A stream whose prompt or output count falls from one report to the next is
+  treated as self-contradictory and charged the reservation.
+- Every stream settled by the relay logs a `stream settled` line with how it
+  ended (`done`, `eof`, `client_gone`, `slow_client`, `idle_or_max`,
+  `upstream_error`, `drain_expired`, `drain_aborted`), whether the finish, usage
+  and end marker were seen, and the decision: at `debug` for a stream that was
+  measured, ended at the provider's end marker and was not drained, `info`
+  otherwise. Client disconnects were previously logged only at `debug`.
 - When Vertex is in use, `serve` refuses a location that is not lowercase
   letters, digits and hyphens, and a project that is neither a project number
   nor a project ID, before connecting to anything. Both are built into the URL,
@@ -51,6 +61,21 @@ Notable changes per release.
 
 ### Fixed
 
+- Streams on `/v1/chat/completions` that finished but whose client then
+  disconnected or stopped reading are now charged their measured usage instead
+  of their full reservation. The common case is a client that stops reading as
+  soon as it sees `finish_reason`, before `data: [DONE]`: once the finish has
+  arrived, Tollgate now keeps reading the upstream for up to 10 seconds after
+  it notices the client has stopped, to receive the usage and `[DONE]`. An
+  upstream error or timeout after the finish still charges the reservation.
+- A stream on `/v1/chat/completions` is now measured only when the upstream
+  sent a non-empty `finish_reason` with no output after it, a usage report in or
+  after that chunk, and `data: [DONE]`. A connection that closed cleanly without
+  them used to be treated as finished, which under-charged a stream cut
+  mid-generation on an upstream that reports usage on every chunk. Some rows
+  that read `allowed` before may now read `estimated`, and a custom upstream
+  that never sends `finish_reason` or `[DONE]` is charged its reservation on
+  every stream. Usage is assumed to be cumulative across a stream.
 - Vertex requests for the `global`, `us` and `eu` locations now go to the hosts
   Google documents for them: `aiplatform.googleapis.com` for `global` and
   `aiplatform.{us,eu}.rep.googleapis.com` for the multi-regions, instead of a
