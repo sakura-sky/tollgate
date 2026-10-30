@@ -24,4 +24,5 @@ pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod routes;
+pub mod sse_redact;
 pub mod telemetry;

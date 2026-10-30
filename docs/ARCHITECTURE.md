@@ -84,6 +84,7 @@ sequenceDiagram
     T->>DB: append usage row (cost, tokens, overhead)
     T-->>C: 200 (buffered: + x-tollgate-cost, x-tollgate-overhead-us)
     Note over T,C: a provider non-2xx is settled as reported (zero on a stream or an unparseable body),<br/>then the client gets 400/413/422, 429 or 502 with a fixed body, never the provider's
+    Note over T,C: on a stream, only events the relay classifies as safe reach the client,<br/>an error ends the client's stream with one fixed event, metering reads on
   end
 ```
 

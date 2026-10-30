@@ -85,7 +85,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # inert dependency and a misleading one.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "http2", "rustls"] }
 
-# Streaming relay for the OpenAI-compatible endpoint (SSE pass-through + metering).
+# Streaming relay for the OpenAI-compatible endpoint (SSE relay, filtered event by event, + metering).
 bytes = "1"
 futures-util = "0.3"
 tokio-stream = "0.1"

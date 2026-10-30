@@ -37,9 +37,19 @@ drops startup options (see Changed).
   classified by fault, a reason header and a fixed message (see Changed). The
   provider's error type and code are logged, and the first 2 KiB of its body
   only at TRACE on request. The same applies to a pre-flight count refusal,
-  whose message `exact` admission used to pass back inside a `400`. An error
-  event inside a stream that began with `200` is still relayed; it is not yet
-  rewritten.
+  whose message `exact` admission used to pass back inside a `400`.
+- Error events inside a stream that began with `200` no longer reach the
+  client verbatim. The relay used to forward the provider's bytes unchanged;
+  it now forwards only events it can classify as safe (parsing CR, LF and CRLF
+  line ends and multi-line data per the SSE specification), and ends the
+  client's stream with one fixed error event on an error or anything it cannot
+  classify. Metering still reads the provider's original stream to its end
+  (within the idle and maximum-duration limits), even if the client
+  disconnects after that.
+- A `200` on a stream route that is not an event stream (or is compressed) is
+  a `502` `upstream_error` before the stream starts, charged its reservation.
+  A buffered `200` whose body is an error (not a JSON object, a non-null
+  top-level `error`, or Anthropic's `"type": "error"`) is a `502` too.
 
 ### Added
 
@@ -64,6 +74,17 @@ drops startup options (see Changed).
 
 ### Changed
 
+- Streams: the client receives only `data:` and `event:` lines from the
+  provider, re-terminated with LF; provider comments, `id:` and `retry:` lines
+  are dropped (Tollgate
+  sends its own `:` keepalive, at most every 15 seconds, when it drops a
+  provider's). An event name outside the protocol's known set ends the
+  client's stream; on `/v1/chat/completions` any event name does, as neither
+  OpenAI nor Vertex sends one. The `stream settled` log line gains
+  `client_ended`.
+- The stream meters' line splitting is linear in the bytes received however
+  they are chunked (it rescanned the held line on every chunk), and the Anthropic meter now
+  discards the rest of an over-long line, as the OpenAI meter did.
 - Provider refusals are classified by fault on every route:
   - `400`, `413` and `422` keep their status, with `bad_request`;
   - `429` stays `429`, with `upstream_rate_limited`;
