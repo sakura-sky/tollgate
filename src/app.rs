@@ -44,16 +44,25 @@ use crate::gateway::{
 };
 use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
 use crate::provider::{MockProvider, Provider, ProviderError};
-use crate::providers::{CacheSemantics, OpenAiProvider, stream_requested, usage_from_sse_data};
+use crate::providers::{CacheSemantics, OpenAiProvider, stream_requested};
 use crate::routes::health;
 
 /// Cap the SSE line-reassembly buffer so an upstream that never emits a newline
 /// cannot grow it without bound.
 const MAX_SSE_LINE_BUFFER: usize = 1024 * 1024;
-/// Idle timeout: abort a stream if no upstream chunk arrives within this window.
+/// Idle timeout. Each chunk's upstream read and its send to the client share one
+/// window of this length: the stream ends if no upstream chunk arrives within
+/// it, or if the client has not accepted the chunk when it closes. After the
+/// provider's finish (OpenAI streams only), a client that disconnects or misses
+/// the window is drained instead.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on total stream duration.
 const STREAM_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
+/// How long the relay keeps reading after a client stops, once the provider has
+/// signalled its finish, to receive the final usage and the end marker. Short,
+/// because nothing billable is expected after the finish; the drain stops if
+/// more output arrives without a new finish.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -876,8 +885,8 @@ fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
 /// verbatim so OpenAI clients, LiteLLM, and ADK agents work unchanged.
 ///
 /// Streaming (`stream: true`) is dispatched to [`openai_chat_stream`], which
-/// relays the upstream SSE and meters usage from the terminal chunk. Buffered
-/// requests run the shared [`GatewayCore::evaluate`] flow unchanged.
+/// relays the upstream SSE and meters usage as [`OpenAiStreamMeter`] describes.
+/// Buffered requests run the shared [`GatewayCore::evaluate`] flow unchanged.
 async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
     // Peek whether the client asked for streaming. A body that does not parse is
     // treated as non-streaming so the buffered path returns a proper OpenAI error
@@ -904,11 +913,10 @@ async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: St
 /// to the estimate. Anthropic has `count_tokens`, on the same body that gets
 /// forwarded, so refusing would punish exactly the operators who chose strictness.
 ///
-/// Metering uses the Anthropic meter, not the OpenAI one, because Anthropic's
-/// usage is not terminal: `message_start` carries a placeholder `output_tokens:
-/// 1`, and an error event arrives on an otherwise-healthy 200 stream followed by
-/// a normal close. Treating transport EOF as success would settle a failed
-/// stream on one output token.
+/// Metering uses the Anthropic meter because the protocol differs:
+/// `message_start` carries a small placeholder `output_tokens`, completion is
+/// signalled by `message_stop` rather than `[DONE]`, and an error event arrives
+/// on an otherwise-healthy 200 stream followed by a normal close.
 async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
     let started = Instant::now();
     let core = state.core.load_full();
@@ -1083,7 +1091,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
         reserve_micros,
         key_id,
         "anthropic".to_owned(),
-        parsed.model,
+        parsed.model.clone(),
         overhead_micros,
     );
 
@@ -1122,6 +1130,8 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             line_buf: Vec::new(),
             meter: crate::providers::AnthropicStreamMeter::new(),
         },
+        "anthropic",
+        parsed.model,
     ));
 
     (
@@ -1138,10 +1148,14 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
 /// Streaming path for `/v1/chat/completions`. Authenticates, prices, and reserves
 /// the worst case up front (fast admission), opens the upstream SSE stream, then
 /// spawns [`relay_stream`] to pass chunks through to the client while metering
-/// usage from the terminal chunk. Settlement is owned by a [`Settlement`]
-/// guard that charges the observed cost on a clean finish and the FULL reservation
-/// on any abnormal end (client/upstream disconnect, idle/duration timeout, panic),
-/// so a stream is never under-charged.
+/// usage. Settlement is owned by a [`Settlement`] guard that charges the measured
+/// cost once the provider has reported its finish, usage and `[DONE]` (see
+/// [`OpenAiStreamMeter`]) and the FULL reservation otherwise: for example a
+/// client disconnect or stall before the finish, an upstream error or close
+/// before `[DONE]`, a drain that expires or is aborted by more output, an
+/// idle/duration timeout, missing, implausible or contradictory usage, or a
+/// panic. Usage on OpenAI-protocol streams is assumed cumulative: an upstream
+/// that reports per-chunk deltas would be measured low.
 async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
     let started = Instant::now();
     let core = state.core.load_full();
@@ -1275,7 +1289,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         reserve_micros,
         key_id,
         "openai".to_owned(),
-        parsed.model,
+        parsed.model.clone(),
         overhead_micros,
     );
 
@@ -1309,6 +1323,12 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     // upstream reads). The spawned task owns the guard and settles at its single
     // exit point.
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    // The meter costs each usage reading to keep the dearest, so it needs the
+    // price; the relay keeps its own copy for the settlement.
+    let meter = StreamMeter::OpenAi(OpenAiStreamMeter::new(
+        provider.cache_semantics(),
+        price.clone(),
+    ));
     tokio::spawn(relay_stream(
         upstream,
         tx,
@@ -1316,16 +1336,11 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         price,
         reserve_micros,
         // Unused on this path: the OpenAI meter has no pre-generation signal, so
-        // every abnormal end charges the full reservation.
+        // there is no prompt-leg discount.
         reserve_micros,
-        StreamMeter::OpenAi {
-            line_buf: Vec::new(),
-            // The SAME semantics the buffered path uses for this upstream. If
-            // these ever diverge, a caller picks the cheaper metering by
-            // setting stream:true.
-            semantics: provider.cache_semantics(),
-            seen: None,
-        },
+        meter,
+        "openai",
+        parsed.model,
     ));
 
     (
@@ -1339,11 +1354,70 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         .into_response()
 }
 
-/// Relay upstream SSE chunks to the client while metering usage. Runs to a single
-/// exit point that settles the [`Settlement`] guard: observed cost on a
-/// clean finish with a terminal usage chunk, otherwise the FULL reservation (never
-/// under-charge). Enforces an idle timeout, a max total duration, and a bounded
-/// line-reassembly buffer so a hostile or hung upstream cannot grief the gateway.
+/// The relay's time limits. Passed in rather than read from the constants, so
+/// tests can drive every exit without waiting on a real clock.
+#[derive(Debug, Clone, Copy)]
+struct RelayLimits {
+    idle: Duration,
+    max: Duration,
+    drain: Duration,
+}
+
+const RELAY_LIMITS: RelayLimits = RelayLimits {
+    idle: STREAM_IDLE_TIMEOUT,
+    max: STREAM_MAX_DURATION,
+    drain: STREAM_DRAIN_GRACE,
+};
+
+/// Why the relay stopped reading the upstream. Logged with every settlement, so
+/// an operator can see why a stream was charged as estimated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// The upstream closed the connection.
+    Eof,
+    /// The provider's own end marker arrived (`[DONE]`, or `message_stop`).
+    Done,
+    /// The client disconnected.
+    ClientGone,
+    /// The client did not accept a chunk before the idle or max-duration
+    /// deadline.
+    SlowClient,
+    /// The upstream went quiet for the idle timeout, or the stream hit its
+    /// maximum duration.
+    IdleOrMax,
+    /// The upstream connection failed mid-body.
+    UpstreamError,
+    /// The client stopped reading after the provider's finish, and the end
+    /// marker did not arrive within the drain grace period or before the
+    /// stream's maximum duration.
+    DrainExpired,
+    /// More output arrived while draining, so the finish was not final and the
+    /// drain stopped at once rather than keep an unread continuation running.
+    DrainAborted,
+}
+
+impl StreamEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eof => "eof",
+            Self::Done => "done",
+            Self::ClientGone => "client_gone",
+            Self::SlowClient => "slow_client",
+            Self::IdleOrMax => "idle_or_max",
+            Self::UpstreamError => "upstream_error",
+            Self::DrainExpired => "drain_expired",
+            Self::DrainAborted => "drain_aborted",
+        }
+    }
+}
+
+/// Relay upstream SSE chunks to the client while metering usage, then settle the
+/// [`Settlement`] guard exactly once: the measured cost when the meter says the
+/// provider reported its final usage and finished, otherwise the FULL
+/// reservation (never under-charge). Enforces an idle timeout, a max total
+/// duration, and a bounded line-reassembly buffer so a hostile or hung upstream
+/// cannot grief the gateway.
+#[allow(clippy::too_many_arguments)]
 async fn relay_stream(
     upstream: reqwest::Response,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
@@ -1355,105 +1429,179 @@ async fn relay_stream(
     // input token count is known.
     prompt_floor_micros: i64,
     mut meter: StreamMeter,
+    provider: &'static str,
+    model: String,
 ) {
-    let mut stream = upstream.bytes_stream();
-    let mut transport_eof = false;
-    let deadline = tokio::time::Instant::now() + STREAM_MAX_DURATION;
+    let (end, drained) = relay_body(upstream.bytes_stream(), &tx, &mut meter, RELAY_LIMITS).await;
+    if meter.is_clean() && !meter.usage_seen() {
+        tracing::warn!("stream ended cleanly without any usage; charging reservation");
+    }
+    let (actual, usage, decision) =
+        choose_settlement(&meter, &price, reserve_micros, prompt_floor_micros);
+    log_stream_settlement(provider, &model, end, drained, &meter, decision);
+    guard.settle(actual, usage, decision).await;
+}
 
+/// The relay loop, separated from settlement so tests can drive it with a
+/// scripted upstream. Returns why it stopped, and whether it was draining.
+///
+/// Every chunk is metered BEFORE it is relayed: what the provider sent is what
+/// it bills, whether or not the client is still there to receive it.
+///
+/// The drain exists because the client chooses when to disconnect. Once the
+/// provider has signalled its finish, nothing billable is left to generate, but
+/// the final usage and the end marker may still be in flight. A client that
+/// stops reading at that point would otherwise turn a fully measured stream
+/// into a reservation charge. So after the finish, a failed or timed-out send
+/// stops forwarding but keeps reading the upstream, for at most
+/// [`RelayLimits::drain`], until the end marker. Before the finish it stops at
+/// once, as it always has: draining mid-generation would make the provider bill
+/// an answer nobody reads.
+async fn relay_body<S, E>(
+    mut stream: S,
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    meter: &mut StreamMeter,
+    limits: RelayLimits,
+) -> (StreamEnd, bool)
+where
+    S: futures_util::stream::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let deadline = tokio::time::Instant::now() + limits.max;
+    let mut drain_until: Option<tokio::time::Instant> = None;
     loop {
-        let wait_until = (tokio::time::Instant::now() + STREAM_IDLE_TIMEOUT).min(deadline);
+        let mut wait_until = (tokio::time::Instant::now() + limits.idle).min(deadline);
+        if let Some(d) = drain_until {
+            wait_until = wait_until.min(d);
+        }
+        let draining = drain_until.is_some();
         match tokio::time::timeout_at(wait_until, stream.next()).await {
-            // Idle timeout or max-duration hit: abnormal end.
+            // Idle timeout, max duration, or the drain grace ran out.
             Err(_) => {
+                if draining {
+                    tracing::warn!(
+                        "stream drain ended before the provider's end marker; \
+                         charging the reservation"
+                    );
+                    return (StreamEnd::DrainExpired, true);
+                }
                 tracing::warn!("stream aborted: idle timeout or max duration exceeded");
-                break;
+                return (StreamEnd::IdleOrMax, false);
             }
-            // Upstream finished normally.
             Ok(None) => {
-                transport_eof = true;
-                break;
+                meter.finish_input();
+                return (StreamEnd::Eof, draining);
             }
-            // Upstream stream error: abnormal end.
             Ok(Some(Err(e))) => {
-                tracing::warn!(detail = %e.to_string(), "stream upstream error mid-body");
-                break;
+                tracing::warn!(detail = %e, "stream upstream error mid-body");
+                return (StreamEnd::UpstreamError, draining);
             }
             Ok(Some(Ok(chunk))) => {
                 meter.observe(&chunk);
-                // Nothing billable follows Anthropic's message_stop, so exit
-                // there rather than holding the upstream connection and the
-                // reservation open until the idle timeout fires.
                 let finished = meter.finished();
+                if draining {
+                    if finished {
+                        return (StreamEnd::Done, true);
+                    }
+                    if !meter.drain_eligible() {
+                        tracing::warn!(
+                            "stream produced more output after its finish while draining; \
+                             charging the reservation"
+                        );
+                        return (StreamEnd::DrainAborted, true);
+                    }
+                    continue;
+                }
                 // Relay downstream, bounded by the SAME idle/duration deadline as
                 // the upstream read: a client that stops reading fills the bounded
                 // channel and would otherwise park this task (and hold the
-                // reservation and upstream connection) indefinitely. On send error
-                // (client gone) or timeout, end abnormally and charge the full
-                // reservation.
-                match tokio::time::timeout_at(wait_until, tx.send(Ok(chunk))).await {
-                    Ok(Ok(())) => {}
+                // reservation and upstream connection) indefinitely.
+                let cut = match tokio::time::timeout_at(wait_until, tx.send(Ok(chunk))).await {
+                    Ok(Ok(())) => None,
                     Ok(Err(_)) => {
                         tracing::debug!("stream client disconnected");
-                        break;
+                        Some(StreamEnd::ClientGone)
                     }
                     Err(_) => {
-                        tracing::warn!(
-                            "stream aborted: client too slow to drain (idle/max duration)"
-                        );
-                        break;
+                        tracing::warn!("stream client too slow to drain (idle/max duration)");
+                        Some(StreamEnd::SlowClient)
                     }
-                }
+                };
+                // Nothing billable follows the end marker, so exit there rather
+                // than hold the upstream connection and the reservation open
+                // until the idle timeout fires.
                 if finished {
-                    transport_eof = true;
-                    break;
+                    return (StreamEnd::Done, false);
+                }
+                if let Some(cut) = cut {
+                    if meter.drain_eligible() {
+                        tracing::info!(
+                            cause = cut.as_str(),
+                            "client stopped reading after the provider's finish; \
+                             reading on to the end marker"
+                        );
+                        drain_until =
+                            Some((tokio::time::Instant::now() + limits.drain).min(deadline));
+                        continue;
+                    }
+                    return (cut, false);
                 }
             }
         }
     }
+}
 
-    let clean = meter.is_clean(transport_eof);
-    let seen_usage = meter.usage();
-    if clean && seen_usage.is_none() {
-        tracing::warn!("stream ended cleanly without any usage; charging reservation");
+/// One line per settled stream: why it ended, what the meter saw, and how it was
+/// charged. A measured stream that ended normally logs at debug; anything else
+/// at info, because those are the rows an operator reconciling against an
+/// invoice will ask about.
+fn log_stream_settlement(
+    provider: &str,
+    model: &str,
+    end: StreamEnd,
+    drained: bool,
+    meter: &StreamMeter,
+    decision: &str,
+) {
+    let finish_seen = meter.finish_seen();
+    let usage_seen = meter.usage_seen();
+    let done_seen = meter.is_clean();
+    if decision == "allowed" && end == StreamEnd::Done && !drained {
+        tracing::debug!(
+            provider,
+            model,
+            end = end.as_str(),
+            drained,
+            finish_seen,
+            usage_seen,
+            done_seen,
+            decision,
+            "stream settled"
+        );
+    } else {
+        tracing::info!(
+            provider,
+            model,
+            end = end.as_str(),
+            drained,
+            finish_seen,
+            usage_seen,
+            done_seen,
+            decision,
+            "stream settled"
+        );
     }
-    // Anthropic delivers `overloaded_error` as an event on an otherwise-200
-    // stream, BEFORE message_start, so nothing was generated and nothing billed.
-    // Charging the full worst-case reservation there is punitive, and SDK
-    // retries multiply it through an overload window, so charge the reserved
-    // PROMPT leg instead.
-    //
-    // Strictly Anthropic-only, and that restriction is load-bearing. On the
-    // OpenAI path `started` can only become true when the TERMINAL usage chunk
-    // arrives, so a client that reads an entire response and then disconnects
-    // before that chunk looks identical to one that never started. Applying
-    // this branch there would hand out a full generation for the price of the
-    // prompt, on demand and repeatably. Every other abnormal end charges the
-    // full reservation.
-    let (actual, usage, decision) = choose_settlement(
-        &meter,
-        clean,
-        seen_usage,
-        &price,
-        reserve_micros,
-        prompt_floor_micros,
-    );
-    guard.settle(actual, usage, decision).await;
 }
 
 /// Per-provider stream metering, so the relay stays protocol-agnostic.
 ///
 /// The two protocols disagree about what "finished" means, and getting that
-/// wrong is a silent under-charge. OpenAI's usage arrives in a terminal chunk,
-/// so transport EOF is a fair proxy for completion. Anthropic's does not:
-/// `message_start` carries a placeholder `output_tokens: 1`, an error event
-/// arrives on an otherwise-healthy 200 stream and is followed by a normal close,
-/// and nothing billable follows `message_stop`.
+/// wrong is a silent under-charge. Anthropic's `message_start` carries a small
+/// placeholder `output_tokens`, an error event arrives on an otherwise-healthy
+/// 200 stream and is followed by a normal close, and nothing billable follows
+/// `message_stop`. The OpenAI protocol's rules are on [`OpenAiStreamMeter`].
 pub enum StreamMeter {
-    OpenAi {
-        line_buf: Vec<u8>,
-        semantics: CacheSemantics,
-        seen: Option<Usage>,
-    },
+    OpenAi(OpenAiStreamMeter),
     Anthropic {
         line_buf: Vec<u8>,
         meter: crate::providers::AnthropicStreamMeter,
@@ -1463,15 +1611,7 @@ pub enum StreamMeter {
 impl StreamMeter {
     fn observe(&mut self, chunk: &[u8]) {
         match self {
-            Self::OpenAi {
-                line_buf,
-                semantics,
-                seen,
-            } => {
-                if let Some(u) = scan_sse_for_usage(line_buf, chunk, *semantics) {
-                    *seen = Some(u);
-                }
-            }
+            Self::OpenAi(m) => m.observe(chunk),
             Self::Anthropic { line_buf, meter } => {
                 line_buf.extend_from_slice(chunk);
                 while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
@@ -1487,72 +1627,302 @@ impl StreamMeter {
         }
     }
 
-    /// Whether the stream genuinely completed. `transport_eof` is only a proxy,
-    /// and only a sound one for OpenAI.
-    fn is_clean(&self, transport_eof: bool) -> bool {
+    /// The upstream closed. Lets the OpenAI meter parse a final line that had
+    /// no trailing newline. The Anthropic path is unchanged.
+    fn finish_input(&mut self) {
+        if let Self::OpenAi(m) = self {
+            m.flush();
+        }
+    }
+
+    /// Whether the provider's own end marker arrived. Transport EOF is not
+    /// evidence of completion on either protocol: a proxy can close cleanly
+    /// mid-generation.
+    fn is_clean(&self) -> bool {
         match self {
-            Self::OpenAi { .. } => transport_eof,
+            Self::OpenAi(m) => m.done_seen,
             Self::Anthropic { meter, .. } => meter.is_clean(),
         }
     }
 
-    /// Whether the relay can stop reading now. Only Anthropic has an explicit
-    /// terminal event; OpenAI is finished when the transport says so.
+    /// Whether the relay can stop reading now.
     fn finished(&self) -> bool {
+        self.is_clean()
+    }
+
+    /// Whether a client that stops reading now should be drained rather than
+    /// cut: the provider has signalled its finish and the end marker is still
+    /// to come. OpenAI only; the Anthropic path is unchanged.
+    fn drain_eligible(&self) -> bool {
         match self {
-            Self::OpenAi { .. } => false,
+            Self::OpenAi(m) => m.finish_seen && !m.done_seen,
+            Self::Anthropic { .. } => false,
+        }
+    }
+
+    fn finish_seen(&self) -> bool {
+        match self {
+            Self::OpenAi(m) => m.finish_seen,
             Self::Anthropic { meter, .. } => meter.is_clean(),
+        }
+    }
+
+    fn usage_seen(&self) -> bool {
+        match self {
+            Self::OpenAi(m) => m.best.is_some(),
+            Self::Anthropic { meter, .. } => meter.usage().is_some(),
         }
     }
 
     // No `started()` here on purpose. It existed to feed the prompt-leg
     // discount, and having it at this level is what made that discount
-    // applicable to OpenAI, where "started" cannot be distinguished from "client
-    // disconnected before the terminal usage chunk". `choose_settlement` now
-    // reaches the Anthropic meter directly, so the discount cannot be spread to
-    // a provider that has no pre-generation signal.
-
-    fn usage(&self) -> Option<Usage> {
-        match self {
-            Self::OpenAi { seen, .. } => *seen,
-            Self::Anthropic { meter, .. } => meter.usage(),
-        }
-    }
+    // applicable to OpenAI, where a stream cut before its finish carries either
+    // no usage or only a partial count, so the gateway cannot tell how much the
+    // provider generated and will bill. `choose_settlement` reaches
+    // the Anthropic meter directly, so the discount cannot be spread to a
+    // provider that has no pre-generation signal.
 }
 
-/// Append a chunk to the SSE line-reassembly buffer and return the usage from the
-/// most recent complete `data:` line that carried one (usage can arrive split
-/// across chunk boundaries). Complete lines are drained; a partial line longer
-/// than [`MAX_SSE_LINE_BUFFER`] is dropped so a newline-starved upstream cannot
-/// grow the buffer without bound (worst case: the usage chunk is missed and the
-/// caller settles the full reservation).
+/// Meter for an OpenAI-protocol stream.
 ///
-/// `semantics` must be the upstream's, matching what the buffered path uses.
-fn scan_sse_for_usage(
-    line_buf: &mut Vec<u8>,
-    chunk: &[u8],
+/// A stream is charged its measured usage only when the provider has said it is
+/// finished and reported usage for the finished generation:
+///
+/// - a non-empty `finish_reason`, with no output after it;
+/// - a usage reading in or after that finish chunk;
+/// - `data: [DONE]`.
+///
+/// Anything less charges the reservation. Transport EOF is not enough: a proxy
+/// or load balancer can close cleanly mid-generation, and on an upstream that
+/// reports cumulative usage on every chunk, the last reading before that close
+/// is a partial count.
+///
+/// In live captures of Vertex's OpenAI-compatible endpoint (one run per
+/// shape), usage arrived once, on the same line as `finish_reason`, then
+/// `[DONE]`. OpenAI's own convention sends the usage on a separate
+/// `choices: []` chunk after the finish. Both satisfy the rule. Usage is assumed
+/// to be cumulative: an upstream that reported per-chunk deltas would be
+/// measured low, or charged the reservation where a delta is smaller than the
+/// one before.
+///
+/// Every reading is kept whole and never merged field by field: `input_tokens`
+/// is derived (prompt minus cached), so mixing fields from different readings
+/// can cost more than any reading the provider sent. The settled reading is the
+/// one with the highest cost, later readings winning ties, so a disagreement
+/// between readings settles on the dearer side. A fall in the total prompt or
+/// in the output between readings is itself a contradiction and charges the
+/// reservation, as does any untrustworthy reading.
+pub struct OpenAiStreamMeter {
+    line_buf: Vec<u8>,
+    /// Set after a line overflowed the buffer, so the rest of that line is
+    /// discarded up to its newline instead of being parsed as a line of its own.
+    discarding: bool,
+    /// The SAME semantics the buffered path uses for this upstream. If these
+    /// ever diverge, a caller picks the cheaper metering by setting stream:true.
     semantics: CacheSemantics,
-) -> Option<Usage> {
-    line_buf.extend_from_slice(chunk);
-    let mut found = None;
-    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-        let line: Vec<u8> = line_buf.drain(..=pos).collect();
-        if let Ok(s) = std::str::from_utf8(&line) {
-            if let Some(u) = usage_from_sse_data(s.trim_end(), semantics) {
-                found = Some(u);
+    price: ModelPrice,
+    finish_seen: bool,
+    /// A usage reading arrived since the current finish was set. Cleared with
+    /// the finish, so a finish followed by more output and a second finish
+    /// without usage never reuses the first finish's reading.
+    reading_since_finish: bool,
+    done_seen: bool,
+    best: Option<(Usage, i64)>,
+    last: Option<Usage>,
+    untrustworthy: bool,
+}
+
+impl OpenAiStreamMeter {
+    #[must_use]
+    pub fn new(semantics: CacheSemantics, price: ModelPrice) -> Self {
+        Self {
+            line_buf: Vec::new(),
+            discarding: false,
+            semantics,
+            price,
+            finish_seen: false,
+            reading_since_finish: false,
+            done_seen: false,
+            best: None,
+            last: None,
+            untrustworthy: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        if self.done_seen {
+            // Nothing after the end marker counts.
+            return;
+        }
+        self.line_buf.extend_from_slice(chunk);
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            if std::mem::take(&mut self.discarding) {
+                continue;
+            }
+            self.observe_line_bytes(&line);
+            if self.done_seen {
+                self.line_buf.clear();
+                return;
             }
         }
+        if self.line_buf.len() > MAX_SSE_LINE_BUFFER {
+            self.line_buf.clear();
+            self.discarding = true;
+        }
     }
-    if line_buf.len() > MAX_SSE_LINE_BUFFER {
-        line_buf.clear();
+
+    /// Parse a final line the upstream closed without terminating.
+    fn flush(&mut self) {
+        let rest = std::mem::take(&mut self.line_buf);
+        if !self.done_seen && !std::mem::take(&mut self.discarding) && !rest.is_empty() {
+            self.observe_line_bytes(&rest);
+        }
     }
-    found
+
+    fn observe_line_bytes(&mut self, line: &[u8]) {
+        if let Ok(s) = std::str::from_utf8(line) {
+            self.observe_line(s.trim_end());
+        }
+    }
+
+    fn observe_line(&mut self, line: &str) {
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            self.done_seen = true;
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        // Order matters within a line. Vertex sends its last text, the finish
+        // and the usage on ONE line, so: clear on output, then set the finish,
+        // then record the usage against it.
+        if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+            if choices.iter().any(choice_carries_output) {
+                self.finish_seen = false;
+                self.reading_since_finish = false;
+            }
+            if choices.iter().any(|c| {
+                c.get("finish_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| !r.is_empty())
+            }) {
+                self.finish_seen = true;
+            }
+        }
+        if let Some(u) = crate::providers::usage_from_sse_value(&v, self.semantics) {
+            self.record(u);
+        }
+    }
+
+    fn record(&mut self, u: Usage) {
+        if u.is_untrustworthy() {
+            self.untrustworthy = true;
+        }
+        if let Some(prev) = self.last {
+            if u.total_prompt_tokens() < prev.total_prompt_tokens()
+                || u.output_tokens < prev.output_tokens
+            {
+                tracing::warn!(
+                    prev_prompt = prev.total_prompt_tokens(),
+                    prompt = u.total_prompt_tokens(),
+                    prev_output = prev.output_tokens,
+                    output = u.output_tokens,
+                    "stream usage DECREASED between readings; usage is self-contradictory"
+                );
+                self.untrustworthy = true;
+            }
+        }
+        self.last = Some(u);
+        let cost = self.price.cost_micros(u);
+        if self.best.is_none_or(|(_, c)| cost >= c) {
+            self.best = Some((u, cost));
+        }
+        if self.finish_seen {
+            self.reading_since_finish = true;
+        }
+    }
+
+    fn settlement(&self, reserve_micros: i64) -> (i64, Usage, &'static str) {
+        let Some((usage, cost)) = self.best else {
+            return (reserve_micros, Usage::default(), "estimated");
+        };
+        // An implausible or contradictory count is a metering FAILURE, not an
+        // expensive stream. Costing it can saturate to i64::MAX, which the
+        // budget counter has no path back down from, and the ledger row it
+        // writes overflows SUM(cost_micros) on every later startup reconcile.
+        if self.untrustworthy {
+            tracing::error!(
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                cache_read_tokens = usage.cache_read_tokens,
+                cache_write_tokens = usage.cache_write_tokens,
+                "stream usage is implausible or self-contradictory; charging the reservation"
+            );
+            return (reserve_micros, Usage::default(), "estimated");
+        }
+        if self.finish_seen && self.reading_since_finish && self.done_seen {
+            warn_if_unpriced_long_context(&self.price, usage);
+            return (cost.max(1), usage, "allowed");
+        }
+        // Charged the reservation, so `estimated`; the tokens seen still go to
+        // the ledger so the row shows what was observed.
+        (reserve_micros, usage, "estimated")
+    }
 }
 
-/// Decide how to settle a finished stream. A clean finish with a metered terminal
-/// chunk charges the observed cost (floored to 1 micro). A clean finish with no
-/// usage chunk, or ANY abnormal end (disconnect, upstream error, idle/duration
-/// timeout), charges the FULL reservation so a stream is never under-charged.
+/// Whether a choice carries generated output, so a finish seen before it was
+/// not final. A deny-list on purpose: missing a continuation is the
+/// under-charge direction, so every field except the bookkeeping ones counts,
+/// unless it is empty. On `delta`, every key except `role` counts.
+fn choice_carries_output(choice: &Value) -> bool {
+    fn has_value(v: &Value) -> bool {
+        match v {
+            Value::Null => false,
+            Value::String(s) => !s.is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            Value::Object(o) => !o.is_empty(),
+            Value::Bool(_) | Value::Number(_) => true,
+        }
+    }
+    let Some(obj) = choice.as_object() else {
+        return false;
+    };
+    obj.iter().any(|(k, v)| match k.as_str() {
+        "index" | "finish_reason" | "logprobs" => false,
+        "delta" => v
+            .as_object()
+            .is_some_and(|d| d.iter().any(|(k, v)| k != "role" && has_value(v))),
+        _ => has_value(v),
+    })
+}
+
+/// Same visibility as the buffered path. Streams are the bulk of real traffic,
+/// so warning only in `evaluate` would leave the gap invisible for most
+/// requests, which defeats the point of a default that reports the gap rather
+/// than guessing at it.
+fn warn_if_unpriced_long_context(price: &ModelPrice, usage: Usage) {
+    if price
+        .long_context
+        .is_unpriced_long_context(usage.threshold_prompt_tokens())
+    {
+        tracing::warn!(
+            provider = %price.provider,
+            model = %price.model,
+            prompt_tokens = usage.threshold_prompt_tokens(),
+            classes_overlap = usage.classes_overlap,
+            "streamed prompt exceeds the long-context threshold and no tier is \
+             configured for this model; if it re-rates long requests, this is an \
+             UNDER-charge. Set it with `admin price set --long-context-threshold \
+             --long-context-input-permille --long-context-output-permille`"
+        );
+    }
+}
+
 /// Pick the settlement for a finished relay.
 ///
 /// Extracted as a pure function so the discount path is testable. It previously
@@ -1561,43 +1931,52 @@ fn scan_sse_for_usage(
 /// exercised `stream_settlement` and would have passed against the bug.
 fn choose_settlement(
     meter: &StreamMeter,
-    clean: bool,
-    seen: Option<Usage>,
     price: &ModelPrice,
     reserve_micros: i64,
     prompt_floor_micros: i64,
 ) -> (i64, Usage, &'static str) {
-    // Anthropic delivers `overloaded_error` as an event on an otherwise-200
-    // stream, before message_start, so nothing was generated and nothing billed.
-    // Charging the full worst-case reservation there is punitive, and SDK
-    // retries multiply it through an overload window, so charge the prompt leg.
-    //
-    // Three conditions, all load-bearing:
-    //
-    // - Anthropic only. On the OpenAI path `started` can only become true when
-    //   the TERMINAL usage chunk arrives, so a client that reads a whole
-    //   response then disconnects looks identical to one that never started.
-    // - Nothing started.
-    // - The provider EXPLICITLY errored. Without this, any 200 that is not an
-    //   SSE stream at all (an upstream ignoring `stream`, a proxy rewriting the
-    //   response) is relayed to the client in full and then discounted, because
-    //   it contains neither message_start nor message_stop.
-    if let StreamMeter::Anthropic { meter: m, .. } = meter {
-        if !clean && !m.started() && m.errored() {
-            tracing::warn!(
-                "anthropic stream reported an error before generating anything; \
-                 charging the prompt leg"
-            );
-            return (
-                prompt_floor_micros.min(reserve_micros).max(1),
-                Usage::default(),
-                "estimated",
-            );
+    match meter {
+        StreamMeter::OpenAi(m) => m.settlement(reserve_micros),
+        StreamMeter::Anthropic { meter: m, .. } => {
+            let clean = m.is_clean();
+            // Anthropic delivers `overloaded_error` as an event on an
+            // otherwise-200 stream, before message_start, so nothing was
+            // generated and nothing billed. Charging the full worst-case
+            // reservation there is punitive, and SDK retries multiply it
+            // through an overload window, so charge the prompt leg.
+            //
+            // Three conditions, all load-bearing:
+            //
+            // - Anthropic only. The OpenAI meter has no start signal, and a
+            //   stream cut before its finish carries either no usage or only a
+            //   partial count, so the gateway cannot tell how much the provider
+            //   generated and will bill.
+            // - Nothing started.
+            // - The provider EXPLICITLY errored. Without this, any 200 that is
+            //   not an SSE stream at all (an upstream ignoring `stream`, a proxy
+            //   rewriting the response) is relayed to the client in full and
+            //   then discounted, because it contains neither message_start nor
+            //   message_stop.
+            if !clean && !m.started() && m.errored() {
+                tracing::warn!(
+                    "anthropic stream reported an error before generating anything; \
+                     charging the prompt leg"
+                );
+                return (
+                    prompt_floor_micros.min(reserve_micros).max(1),
+                    Usage::default(),
+                    "estimated",
+                );
+            }
+            stream_settlement(clean, m.usage(), price, reserve_micros)
         }
     }
-    stream_settlement(clean, seen, price, reserve_micros)
 }
 
+/// Settle an Anthropic stream. A clean finish with metered usage charges the
+/// observed cost (floored to 1 micro). A clean finish with no usage, or ANY
+/// abnormal end (disconnect, upstream error, idle/duration timeout), charges the
+/// FULL reservation so a stream is never under-charged.
 fn stream_settlement(
     clean: bool,
     seen: Option<Usage>,
@@ -1609,9 +1988,9 @@ fn stream_settlement(
         // Costing it saturates to i64::MAX, which the budget counter has no path
         // back down from, and the ledger row it writes overflows SUM(cost_micros)
         // on every later startup reconcile. The buffered path already guards
-        // this; the terminal usage chunk is the same untrusted input, and it
-        // reaches this function through a client-selected code path, so a caller
-        // could otherwise pick the unguarded one by setting stream:true.
+        // this; the stream's usage events are the same untrusted input, and they reach
+        // this function through a client-selected code path, so a caller could
+        // otherwise pick the unguarded one by setting stream:true.
         (_, Some(usage)) if usage.is_untrustworthy() => {
             tracing::error!(
                 input_tokens = usage.input_tokens,
@@ -1625,25 +2004,7 @@ fn stream_settlement(
         }
         // Measured: the only branch that costs what the provider reported.
         (true, Some(usage)) => {
-            // Same visibility as the buffered path. Streams are the bulk of real
-            // traffic, so warning only in `evaluate` would leave the gap
-            // invisible for most requests, which defeats the point of a default
-            // that reports the gap rather than guessing at it.
-            if price
-                .long_context
-                .is_unpriced_long_context(usage.threshold_prompt_tokens())
-            {
-                tracing::warn!(
-                    provider = %price.provider,
-                    model = %price.model,
-                    prompt_tokens = usage.threshold_prompt_tokens(),
-                    classes_overlap = usage.classes_overlap,
-                    "streamed prompt exceeds the long-context threshold and no tier is \
-                     configured for this model; if it re-rates long requests, this is an \
-                     UNDER-charge. Set it with `admin price set --long-context-threshold \
-                     --long-context-input-permille --long-context-output-permille`"
-                );
-            }
+            warn_if_unpriced_long_context(price, usage);
             (price.cost_micros(usage).max(1), usage, "allowed")
         }
         // The remaining branches all charge the RESERVATION, so they are
@@ -2261,49 +2622,9 @@ mod tests {
     }
 
     #[test]
-    fn scan_sse_detects_usage_split_across_chunk_boundaries() {
-        let mut buf = Vec::new();
-        // The terminal usage line arrives split across two upstream chunks with no
-        // newline in the first: no usage yet, buffer holds the partial.
-        assert!(
-            scan_sse_for_usage(
-                &mut buf,
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens",
-                CacheSemantics::Inclusive
-            )
-            .is_none()
-        );
-        let u = scan_sse_for_usage(
-            &mut buf,
-            b"\":5,\"completion_tokens\":2}}\n",
-            CacheSemantics::Inclusive,
-        )
-        .unwrap();
-        assert_eq!(u.input_tokens, 5);
-        assert_eq!(u.output_tokens, 2);
-        assert!(buf.is_empty(), "completed line should be drained");
-    }
-
-    #[test]
-    fn scan_sse_ignores_deltas_done_and_bounds_the_buffer() {
-        let mut buf = Vec::new();
-        let sem = CacheSemantics::Inclusive;
-        assert!(
-            scan_sse_for_usage(&mut buf, b"data: {\"choices\":[{\"delta\":{}}]}\n", sem).is_none()
-        );
-        assert!(scan_sse_for_usage(&mut buf, b"data: [DONE]\n", sem).is_none());
-        assert!(buf.is_empty());
-        // A single line larger than the cap with no newline is dropped, so a
-        // newline-starved upstream cannot grow the buffer without bound.
-        let big = vec![b'x'; MAX_SSE_LINE_BUFFER + 10];
-        assert!(scan_sse_for_usage(&mut buf, &big, sem).is_none());
-        assert!(buf.is_empty(), "oversized partial line must be dropped");
-    }
-
-    #[test]
     fn stream_settlement_never_undercharges() {
         // $1 per million tokens on both legs => 1 micro/token.
-        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
         let reserve = 999;
 
         // Clean finish with usage: charge the observed cost (15 tokens => 15 micros).
@@ -2312,8 +2633,8 @@ mod tests {
         assert_eq!(actual, 15);
         assert_eq!(decision, "allowed");
 
-        // Clean finish, no usage chunk: charge the full reservation, not zero,
-        // and label it estimated because nothing was measured.
+        // Clean finish, no usage: charge the full reservation, not zero, and
+        // label it estimated because nothing was measured.
         let (actual, _u, decision) = stream_settlement(true, None, &price, reserve);
         assert_eq!(actual, reserve);
         assert_eq!(decision, "estimated");
@@ -2330,13 +2651,9 @@ mod tests {
     /// The bypass bug lived in the arm that skips `stream_settlement` entirely,
     /// so a test calling `stream_settlement` directly passed against it. These
     /// go through `choose_settlement` with a real meter.
-    fn settle_via_meter(
-        meter: &StreamMeter,
-        clean: bool,
-        seen: Option<Usage>,
-    ) -> (i64, &'static str) {
+    fn settle_via_meter(meter: &StreamMeter) -> (i64, &'static str) {
         let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
-        let (actual, _u, decision) = choose_settlement(meter, clean, seen, &price, 999, 100);
+        let (actual, _u, decision) = choose_settlement(meter, &price, 999, 100);
         (actual, decision)
     }
 
@@ -2356,7 +2673,7 @@ mod tests {
         // The intended case: the provider said it failed before generating.
         let errored =
             anthropic_meter(&[r#"data: {"type":"error","error":{"type":"overloaded_error"}}"#]);
-        assert_eq!(settle_via_meter(&errored, false, None), (100, "estimated"));
+        assert_eq!(settle_via_meter(&errored), (100, "estimated"));
 
         // A 200 that is not an SSE stream at all: an upstream that ignored
         // `stream`, or a proxy that rewrote the response. It has no
@@ -2365,58 +2682,28 @@ mod tests {
         // the output leg on every request.
         let not_a_stream =
             anthropic_meter(&[r#"data: {"id":"msg_x","content":[{"text":"hello"}]}"#]);
-        assert_eq!(
-            settle_via_meter(&not_a_stream, false, None),
-            (999, "estimated")
-        );
+        assert_eq!(settle_via_meter(&not_a_stream), (999, "estimated"));
 
         // Nothing at all: connection died before a single complete line.
         let silent = anthropic_meter(&[]);
-        assert_eq!(settle_via_meter(&silent, false, None), (999, "estimated"));
+        assert_eq!(settle_via_meter(&silent), (999, "estimated"));
 
         // Generation started, then failed: the provider did work, charge in full.
         let started_then_died = anthropic_meter(&[
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}"#,
         ]);
-        assert_eq!(
-            settle_via_meter(&started_then_died, false, None),
-            (999, "estimated")
-        );
+        assert_eq!(settle_via_meter(&started_then_died), (999, "estimated"));
     }
 
     #[test]
     fn the_prompt_leg_discount_never_applies_to_openai() {
-        // On the OpenAI path `started` only becomes true at the TERMINAL usage
-        // chunk, so a client that reads a full response then disconnects is
-        // indistinguishable from one that never started. Applying the discount
-        // there handed out a whole generation for a token of budget.
-        let openai = StreamMeter::OpenAi {
-            line_buf: Vec::new(),
-            semantics: crate::providers::CacheSemantics::Inclusive,
-            seen: None,
-        };
-        assert_eq!(settle_via_meter(&openai, false, None), (999, "estimated"));
-    }
-
-    #[test]
-    fn openai_stream_cut_before_the_usage_chunk_still_charges_the_reservation() {
-        // A client can read an entire response and disconnect before the
-        // terminal usage chunk. On the OpenAI path that is indistinguishable
-        // from a stream that never started, because `started` only becomes true
-        // when that chunk arrives.
-        //
-        // An earlier version applied Anthropic's "nothing was generated, charge
-        // the prompt leg" rule to both providers, which handed out a full
-        // generation for a token of budget, on demand and repeatably. Every
-        // abnormal end on this path charges the full reservation.
-        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
-        let reserve = 999;
-        let (actual, _u, decision) = stream_settlement(false, None, &price, reserve);
-        assert_eq!(
-            actual, reserve,
-            "a stream cut before its usage chunk must not be cheap"
-        );
-        assert_eq!(decision, "estimated");
+        // The OpenAI meter has no start signal, and a stream cut before its
+        // finish carries either no usage or only a partial count, so the
+        // gateway cannot tell how much the provider generated and will bill.
+        // Applying the discount there handed out a whole generation for a
+        // token of budget.
+        let openai = StreamMeter::OpenAi(openai_meter());
+        assert_eq!(settle_via_meter(&openai), (999, "estimated"));
     }
 
     #[test]
@@ -2426,7 +2713,7 @@ mod tests {
         // let a caller pick the code path where a hostile terminal chunk
         // saturates the cost to i64::MAX and pins a budget counter that nothing
         // can lower. Charge the reservation and record an error instead.
-        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
         let reserve = 999;
         let absurd = Usage::new(1, u64::MAX);
         assert!(absurd.is_implausible());
@@ -2443,5 +2730,417 @@ mod tests {
         assert!(!ok.is_implausible());
         let (_actual, _u, decision) = stream_settlement(true, Some(ok), &price, reserve);
         assert_eq!(decision, "allowed");
+    }
+
+    // ---- OpenAI-protocol stream metering ----------------------------------
+    //
+    // Line shapes follow live captures of Vertex's OpenAI-compatible endpoint
+    // (one run per shape): usage arrived once, on the same line as
+    // `finish_reason`, then `[DONE]`. OpenAI's own convention (usage on a separate `choices: []`
+    // chunk) is covered too.
+
+    const RESERVE: i64 = 999;
+    const CONTENT: &str = r#"data: {"choices":[{"delta":{"content":"hi","role":"assistant"},"finish_reason":null,"index":0,"logprobs":null}],"usage":null}"#;
+    const DONE: &str = "data: [DONE]";
+
+    /// $1 per million on both legs, so cost in micros equals tokens.
+    fn openai_meter() -> OpenAiStreamMeter {
+        OpenAiStreamMeter::new(
+            CacheSemantics::Inclusive,
+            ModelPrice::new("openai", "m", 1_000_000, 1_000_000),
+        )
+    }
+
+    /// Vertex's finish line: empty content, a thought signature, the finish,
+    /// and the usage, all on one line.
+    fn finish_with_usage(prompt: u64, completion: u64, total: u64) -> String {
+        format!(
+            r#"data: {{"choices":[{{"delta":{{"content":"","extra_content":{{"google":{{"thought_signature":"AY89"}}}},"role":"assistant"}},"finish_reason":"stop","index":0,"logprobs":null}}],"usage":{{"completion_tokens":{completion},"prompt_tokens":{prompt},"total_tokens":{total}}}}}"#
+        )
+    }
+
+    fn usage_only(prompt: u64, completion: u64) -> String {
+        format!(
+            r#"data: {{"choices":[],"usage":{{"prompt_tokens":{prompt},"completion_tokens":{completion}}}}}"#
+        )
+    }
+
+    const FINISH_NO_USAGE: &str = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}],"usage":null}"#;
+
+    fn feed(m: &mut OpenAiStreamMeter, lines: &[&str]) {
+        for l in lines {
+            m.observe(format!("{l}\n").as_bytes());
+        }
+    }
+
+    fn settle(lines: &[&str]) -> (i64, Usage, &'static str) {
+        let mut m = openai_meter();
+        feed(&mut m, lines);
+        m.settlement(RESERVE)
+    }
+
+    #[test]
+    fn vertex_stream_with_finish_usage_and_done_is_measured() {
+        let fin = finish_with_usage(9, 509, 518);
+        let (actual, usage, decision) = settle(&[CONTENT, CONTENT, &fin, DONE]);
+        assert_eq!((actual, decision), (518, "allowed"));
+        assert_eq!((usage.input_tokens, usage.output_tokens), (9, 509));
+    }
+
+    #[test]
+    fn vertex_thinking_tokens_are_billed_as_output() {
+        // Live capture, reasoning_effort=high: completion_tokens excludes the
+        // 1000 thinking tokens, total_tokens includes them.
+        let fin = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}],"usage":{"completion_tokens":272,"completion_tokens_details":{"reasoning_tokens":1000},"prompt_tokens":13,"total_tokens":1285}}"#;
+        let (actual, usage, decision) = settle(&[CONTENT, fin, DONE]);
+        assert_eq!((actual, decision), (1285, "allowed"));
+        assert_eq!(usage.output_tokens, 1272);
+    }
+
+    #[test]
+    fn openai_convention_usage_after_finish_is_measured() {
+        let u = usage_only(10, 5);
+        assert_eq!(
+            settle(&[CONTENT, FINISH_NO_USAGE, &u, DONE]).2,
+            "allowed",
+            "usage on a separate chunk after the finish"
+        );
+    }
+
+    #[test]
+    fn a_stream_without_done_charges_the_reservation() {
+        // The usage arrived, but the end marker did not: an upstream-side cut
+        // or a proxy close can fall between a partial reading and a final one.
+        let fin = finish_with_usage(9, 509, 518);
+        let (actual, usage, decision) = settle(&[CONTENT, &fin]);
+        assert_eq!((actual, decision), (RESERVE, "estimated"));
+        // What was observed still reaches the ledger.
+        assert_eq!(usage.output_tokens, 509);
+    }
+
+    #[test]
+    fn usage_seen_only_before_the_finish_is_not_final() {
+        // Cumulative usage on every chunk, then a finish with none.
+        let early = r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#;
+        assert_eq!(
+            settle(&[early, FINISH_NO_USAGE, DONE]).0,
+            RESERVE,
+            "a reading from before the finish may be partial"
+        );
+    }
+
+    #[test]
+    fn output_after_a_finish_clears_it() {
+        let fin = finish_with_usage(9, 100, 109);
+        assert_eq!(settle(&[CONTENT, &fin, CONTENT, DONE]).0, RESERVE);
+        // A second finish without usage must not reuse the first finish's
+        // partial reading.
+        assert_eq!(
+            settle(&[CONTENT, &fin, CONTENT, FINISH_NO_USAGE, DONE]).0,
+            RESERVE
+        );
+    }
+
+    #[test]
+    fn the_dearest_reading_wins_and_a_falling_one_is_a_contradiction() {
+        // Rising: the later, dearer reading is charged.
+        let fin = finish_with_usage(9, 100, 109);
+        let more = usage_only(9, 200);
+        assert_eq!(settle(&[&fin, &more, DONE]), {
+            let mut m = openai_meter();
+            feed(&mut m, &[&fin, &more]);
+            (209, m.best.unwrap().0, "allowed")
+        });
+        // Falling output between readings contradicts itself: reservation.
+        let early = r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"usage":{"prompt_tokens":9,"completion_tokens":900}}"#;
+        let fin_low = finish_with_usage(9, 300, 309);
+        let (actual, usage, decision) = settle(&[early, &fin_low, DONE]);
+        assert_eq!((actual, decision), (RESERVE, "estimated"));
+        assert_eq!(usage, Usage::default());
+    }
+
+    #[test]
+    fn moving_prompt_tokens_into_the_cache_is_not_a_contradiction() {
+        // Inclusive semantics: the same 1000-token prompt, first with nothing
+        // cached, then with 800 cached. The total prompt does not fall, so it is
+        // not flagged; the dearer whole reading settles.
+        let r1 = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":1000,"completion_tokens":10}}"#;
+        let r2 = r#"data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":800}}}"#;
+        // Cache reads at a tenth of the input rate, so the two readings cost
+        // different amounts and the EARLIER one is dearer: last-wins would
+        // under-charge here.
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000).with_cache_rates(
+            Some(100_000),
+            None,
+            crate::pricing::CacheRateFallback::default(),
+        );
+        let mut m = OpenAiStreamMeter::new(CacheSemantics::Inclusive, price.clone());
+        feed(&mut m, &[r1, r2, DONE]);
+        let c1 = price.cost_micros(Usage::with_cache(1000, 10, 0, 0));
+        let c2 = price.cost_micros(Usage::with_cache(200, 10, 800, 0));
+        assert!(c1 > c2);
+        // A reserve above both readings, so the test does not depend on whether
+        // settlement may exceed the reservation.
+        let (actual, _u, decision) = m.settlement(1_000_000);
+        assert_eq!(decision, "allowed");
+        assert_eq!(actual, c1);
+    }
+
+    #[test]
+    fn one_untrustworthy_reading_charges_the_reservation() {
+        // Audio tokens have no rate, so that reading is suspect. A later clean
+        // reading must not wash the flag out.
+        let audio = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"audio_tokens":600}}}"#;
+        let clean = usage_only(10, 5);
+        assert_eq!(settle(&[audio, &clean, DONE]).0, RESERVE);
+        // Implausible counts: reservation, and a zeroed ledger row.
+        let absurd = finish_with_usage(1, u64::MAX / 2, u64::MAX / 2);
+        let (actual, usage, _) = settle(&[&absurd, DONE]);
+        assert_eq!((actual, usage), (RESERVE, Usage::default()));
+    }
+
+    #[test]
+    fn an_empty_finish_reason_is_not_a_finish() {
+        // Some upstreams send "" on every chunk.
+        let line = r#"data: {"choices":[{"delta":{"content":"a"},"finish_reason":"","index":0}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
+        assert_eq!(settle(&[line, line, DONE]).0, RESERVE);
+    }
+
+    #[test]
+    fn which_deltas_count_as_output() {
+        let carries = |delta: &str| {
+            let v: Value = serde_json::from_str(&format!(
+                r#"{{"index":0,"finish_reason":null,"logprobs":null,"delta":{delta}}}"#
+            ))
+            .unwrap();
+            choice_carries_output(&v)
+        };
+        for empty in [
+            r#"{"role":"assistant"}"#,
+            r#"{"content":""}"#,
+            r#"{"content":null}"#,
+            r#"{"tool_calls":[]}"#,
+            r#"{}"#,
+        ] {
+            assert!(!carries(empty), "{empty} must not clear a finish");
+        }
+        for output in [
+            r#"{"content":"x"}"#,
+            r#"{"tool_calls":[{"index":0,"function":{"arguments":""}}]}"#,
+            r#"{"reasoning_content":"thinking"}"#,
+            r#"{"extra_content":{"google":{"thought_signature":"s"}}}"#,
+            r#"{"refusal":"no"}"#,
+        ] {
+            assert!(carries(output), "{output} must clear a finish");
+        }
+        // Output outside `delta` counts too.
+        let v: Value = serde_json::from_str(r#"{"index":0,"text":"x"}"#).unwrap();
+        assert!(choice_carries_output(&v));
+    }
+
+    #[test]
+    fn line_boundaries_do_not_change_the_result() {
+        let fin = finish_with_usage(9, 509, 518);
+        let whole = format!("{CONTENT}\r\n{fin}\r\n{DONE}\r\n");
+        // Every split point, including inside `[DONE]` and the usage, with CRLF.
+        for cut in 1..whole.len() {
+            let mut m = openai_meter();
+            m.observe(&whole.as_bytes()[..cut]);
+            m.observe(&whole.as_bytes()[cut..]);
+            assert_eq!(m.settlement(RESERVE).2, "allowed", "split at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_final_line_without_a_newline_is_read_at_eof() {
+        let fin = finish_with_usage(9, 509, 518);
+        let mut m = openai_meter();
+        m.observe(format!("{fin}\n{DONE}").as_bytes());
+        assert_eq!(m.settlement(RESERVE).2, "estimated", "not yet terminated");
+        m.flush();
+        assert_eq!(m.settlement(RESERVE).2, "allowed");
+    }
+
+    #[test]
+    fn an_oversized_line_is_discarded_up_to_its_newline() {
+        let fin = finish_with_usage(9, 509, 518);
+        let mut m = openai_meter();
+        m.observe(&vec![b'x'; MAX_SSE_LINE_BUFFER + 10]);
+        // The tail of the oversized line must not be parsed as a line of its own,
+        // even though here it is a complete, valid usage line.
+        m.observe(format!("{fin}\n").as_bytes());
+        assert!(m.best.is_none(), "an overflow tail was parsed");
+        feed(&mut m, &[&fin, DONE]);
+        assert_eq!(m.settlement(RESERVE).2, "allowed");
+    }
+
+    #[test]
+    fn nothing_after_done_counts() {
+        let late = usage_only(9, 5);
+        assert_eq!(settle(&[CONTENT, FINISH_NO_USAGE, DONE, &late]).0, RESERVE);
+    }
+
+    // ---- The relay loop, driven by a scripted upstream ----------------------
+
+    fn upstream(
+        lines: &[&str],
+        hold_open: bool,
+    ) -> futures_util::stream::BoxStream<'static, Result<Bytes, std::io::Error>> {
+        let items: Vec<Result<Bytes, std::io::Error>> = lines
+            .iter()
+            .map(|l| {
+                if *l == "ERR" {
+                    Err(std::io::Error::other("upstream reset"))
+                } else {
+                    Ok(Bytes::from(format!("{l}\n")))
+                }
+            })
+            .collect();
+        let s = futures_util::stream::iter(items);
+        if hold_open {
+            s.chain(futures_util::stream::pending()).boxed()
+        } else {
+            s.boxed()
+        }
+    }
+
+    const TEST_LIMITS: RelayLimits = RelayLimits {
+        idle: Duration::from_millis(100),
+        max: Duration::from_secs(5),
+        drain: Duration::from_millis(100),
+    };
+
+    /// Run the relay against `lines`. `client` is how the receiving side
+    /// behaves. Returns the end, whether it drained, and the settlement.
+    async fn relay(
+        lines: &[&str],
+        hold_open: bool,
+        client: Client,
+    ) -> (StreamEnd, bool, (i64, Usage, &'static str)) {
+        let mut meter = StreamMeter::OpenAi(openai_meter());
+        let (tx, rx) = mpsc::channel(match client {
+            Client::Reads => 64,
+            Client::Gone | Client::Stalls => 1,
+        });
+        let _rx = match client {
+            Client::Gone => {
+                drop(rx);
+                None
+            }
+            Client::Reads | Client::Stalls => Some(rx),
+        };
+        let (end, drained) =
+            relay_body(upstream(lines, hold_open), &tx, &mut meter, TEST_LIMITS).await;
+        let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
+        (
+            end,
+            drained,
+            choose_settlement(&meter, &price, RESERVE, RESERVE),
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum Client {
+        Reads,
+        Gone,
+        /// Holds the receiver but never reads: the first chunk fills the
+        /// channel and every later send times out.
+        Stalls,
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stalls_at_the_finish_is_drained_and_measured() {
+        // The client never reads: the first chunk fills the one-slot channel,
+        // the send of the finish line times out, and the drain receives [DONE].
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, drained, (actual, _, decision)) =
+            relay(&[CONTENT, &fin, DONE], false, Client::Stalls).await;
+        assert_eq!((end, drained), (StreamEnd::Done, true));
+        assert_eq!((actual, decision), (518, "allowed"));
+    }
+
+    #[tokio::test]
+    async fn a_client_gone_when_the_finish_is_forwarded_is_drained_and_measured() {
+        // Vertex shape: finish and usage on one line. The client is already gone
+        // when that line is forwarded, so the send fails after the finish.
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, drained, (actual, _, decision)) = relay(&[&fin, DONE], false, Client::Gone).await;
+        assert_eq!((end, drained), (StreamEnd::Done, true));
+        assert_eq!((actual, decision), (518, "allowed"));
+
+        // OpenAI shape: the usage is on its own chunk after the finish, and is
+        // only received because the relay drains.
+        let usage = usage_only(9, 509);
+        let (end, drained, (actual, _, decision)) =
+            relay(&[FINISH_NO_USAGE, &usage, DONE], false, Client::Gone).await;
+        assert_eq!((end, drained), (StreamEnd::Done, true));
+        assert_eq!((actual, decision), (518, "allowed"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_of_the_end_marker_still_measures() {
+        // The finish and [DONE] arrive in one upstream chunk and the client is
+        // gone: the meter has already seen [DONE] when the send fails.
+        let fin = finish_with_usage(9, 509, 518);
+        let both = format!("{fin}\n{DONE}");
+        let (end, drained, (actual, _, decision)) = relay(&[&both], false, Client::Gone).await;
+        assert_eq!((end, drained), (StreamEnd::Done, false));
+        assert_eq!((actual, decision), (518, "allowed"));
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_never_sees_done_charges_the_reservation() {
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, drained, (actual, _, decision)) =
+            relay(&[CONTENT, &fin], true, Client::Stalls).await;
+        assert_eq!((end, drained), (StreamEnd::DrainExpired, true));
+        assert_eq!((actual, decision), (RESERVE, "estimated"));
+    }
+
+    #[tokio::test]
+    async fn output_during_a_drain_stops_it_at_once() {
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, _, (actual, _, _)) =
+            relay(&[CONTENT, &fin, CONTENT, DONE], false, Client::Stalls).await;
+        assert_eq!(end, StreamEnd::DrainAborted);
+        assert_eq!(actual, RESERVE);
+    }
+
+    #[tokio::test]
+    async fn a_client_gone_before_the_finish_is_not_drained() {
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, drained, (actual, _, _)) =
+            relay(&[CONTENT, &fin, DONE], false, Client::Gone).await;
+        assert_eq!((end, drained), (StreamEnd::ClientGone, false));
+        assert_eq!(actual, RESERVE);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_before_done_charges_the_reservation() {
+        let fin = finish_with_usage(9, 509, 518);
+        let (end, _, (actual, _, _)) = relay(&[CONTENT, &fin, "ERR"], false, Client::Reads).await;
+        assert_eq!(end, StreamEnd::UpstreamError);
+        assert_eq!(actual, RESERVE);
+    }
+
+    #[tokio::test]
+    async fn the_relay_stops_at_done_even_if_the_upstream_holds_the_socket() {
+        let fin = finish_with_usage(9, 509, 518);
+        // `Done`, not `IdleOrMax`: the relay stopped at [DONE] rather than
+        // waiting out the idle timeout on the held-open socket.
+        let (end, _, (_, _, decision)) = relay(&[CONTENT, &fin, DONE], true, Client::Reads).await;
+        assert_eq!(end, StreamEnd::Done);
+        assert_eq!(decision, "allowed");
+    }
+
+    #[tokio::test]
+    async fn a_clean_close_mid_generation_is_not_measured() {
+        // Cumulative usage on every chunk, then the connection closes cleanly
+        // with no finish and no [DONE]. The old rule treated EOF as completion
+        // and charged the partial count.
+        let early = r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null,"index":0}],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#;
+        let (end, _, (actual, _, decision)) = relay(&[early, early], false, Client::Reads).await;
+        assert_eq!(end, StreamEnd::Eof);
+        assert_eq!((actual, decision), (RESERVE, "estimated"));
     }
 }

@@ -542,8 +542,9 @@ impl AnthropicProvider {
 /// than "some event carried a usage object". A stream that dies after
 /// `message_start` has a usage object in hand reporting ONE output token for
 /// what may have been a full response. Treating that as a clean finish would
-/// under-charge by the entire output leg, which is precisely the shape of bug
-/// the OpenAI path is immune to only because its usage chunk is terminal.
+/// under-charge by the entire output leg. The OpenAI path guards the same shape
+/// by requiring a finish, a usage report in or after it, and `[DONE]` (see
+/// `app::OpenAiStreamMeter`).
 #[derive(Debug, Default)]
 pub struct AnthropicStreamMeter {
     start: Option<Usage>,
@@ -1749,8 +1750,15 @@ pub fn usage_from_sse_data(line: &str, semantics: CacheSemantics) -> Option<Usag
         return None;
     }
     let v: Value = serde_json::from_str(data).ok()?;
+    usage_from_sse_value(&v, semantics)
+}
+
+/// As [`usage_from_sse_data`], for a line the caller has already parsed. The
+/// stream meter reads `choices` from the same object, so it parses each line once.
+#[must_use]
+pub fn usage_from_sse_value(v: &Value, semantics: CacheSemantics) -> Option<Usage> {
     match v.get("usage") {
-        Some(u) if !u.is_null() => Some(parse_openai_usage(&v, semantics)),
+        Some(u) if !u.is_null() => Some(parse_openai_usage(v, semantics)),
         _ => None,
     }
 }
@@ -1989,7 +1997,7 @@ mod tests {
 
     #[test]
     fn usage_from_sse_data_parses_only_real_usage() {
-        // Terminal chunk with usage.
+        // A usage chunk.
         let u = usage_from_sse_data(
             r#"data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}"#,
             CacheSemantics::Inclusive,
@@ -3165,10 +3173,11 @@ mod tests {
 
     #[test]
     fn buffered_and_streaming_agree_on_the_same_usage_payload() {
-        // The streaming path meters through usage_from_sse_data while the
-        // buffered path meters through parse_openai_usage. If they ever diverge,
-        // a caller can pick the cheaper one by setting stream:true. Pin them
-        // together on the exact terminal-chunk shape the live shim emits.
+        // The streaming path meters through usage_from_sse_value (reached via
+        // usage_from_sse_data here) while the buffered path meters through
+        // parse_openai_usage. If they ever diverge, a caller can pick the
+        // cheaper one by setting stream:true. Pin them together on OpenAI's
+        // separate usage-chunk shape.
         // The payload MUST carry cached_tokens, or the two semantics produce
         // identical numbers and the loop below proves nothing.
         let usage = r#"{"prompt_tokens":29,"completion_tokens":491,
@@ -3183,7 +3192,7 @@ mod tests {
         // it is charged.
         for sem in [CacheSemantics::Inclusive, CacheSemantics::Unverified] {
             let from_buffered = parse_openai_usage(&buffered, sem);
-            let from_stream = usage_from_sse_data(&sse, sem).expect("terminal chunk carries usage");
+            let from_stream = usage_from_sse_data(&sse, sem).expect("usage chunk carries usage");
             assert_eq!(from_buffered, from_stream, "paths diverged under {sem:?}");
             assert_eq!(from_stream.output_tokens, 560);
         }
