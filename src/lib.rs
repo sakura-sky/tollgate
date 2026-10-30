@@ -10,6 +10,7 @@
 
 pub mod apikey;
 pub mod app;
+pub mod auth_gate;
 pub mod backends;
 pub mod budget;
 pub mod cli;

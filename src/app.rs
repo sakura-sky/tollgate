@@ -18,7 +18,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -33,6 +33,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::apikey::KeyHasher;
+use crate::auth_gate::Authed;
 use crate::backends::{
     PgKeyStore, PgSpendLedger, PgUsageSink, RedisBudgetBackend, SpendLedger, budget_spent,
     load_budgets, load_prices,
@@ -482,9 +483,35 @@ pub async fn serve(cfg: Config) -> Result<()> {
     }
     let redis_client = redis::Client::open(cfg.redis.url.as_str()).context("parsing Redis URL")?;
 
+    // `serve` takes a share of the connections for API-key lookups, so the total
+    // stays `max_connections`. Admin commands keep the whole pool.
+    let Some((shared_connections, key_connections)) =
+        crate::db::split_connections(cfg.database.max_connections)
+    else {
+        anyhow::bail!(
+            "TOLLGATE_DATABASE__MAX_CONNECTIONS must be at least {} for `serve` (got {}): a \
+             quarter of the connections, at most 4, is kept for API-key lookups so a flood of \
+             them cannot starve the ledger, and each pool needs at least one",
+            crate::db::MIN_SERVE_CONNECTIONS,
+            cfg.database.max_connections
+        );
+    };
+    let Some(key_timeout_ms) = crate::db::statement_timeout_ms(cfg.database.acquire_timeout) else {
+        anyhow::bail!(
+            "TOLLGATE_DATABASE__ACQUIRE_TIMEOUT must be between 1ms and 2147483647ms (got {:?}): \
+             it is also the server-side statement_timeout of every API-key lookup, and Postgres \
+             accepts nothing outside that range (0 would switch the timeout off)",
+            cfg.database.acquire_timeout
+        );
+    };
+
     // Every check that can fail on config alone goes above this line; the test
     // `config_errors_are_reported_before_postgres_is_touched` pins the order.
-    let db = crate::db::build_pool(&cfg.database).await?;
+    let db = crate::db::build_pool_sized(&cfg.database, shared_connections).await?;
+    // Before migrating: it refuses to start if Postgres does not apply the
+    // lookups' statement_timeout, and a process that cannot bound its key
+    // lookups must exit without touching the schema.
+    let key_db = crate::db::build_key_pool(&cfg.database, key_connections, key_timeout_ms).await?;
     // DEV ONLY (the compose stack): apply migrations at boot. It runs after the
     // config checks above, so a mistake in any of those never touches the schema.
     // Production keeps migrations an explicit `admin migrate` step, and the
@@ -615,7 +642,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let parts = CoreParts {
         hasher,
         dummy_hash,
-        keys: Arc::new(PgKeyStore::new(db.clone())),
+        keys: Arc::new(PgKeyStore::new(key_db)),
         usage: Arc::new(PgUsageSink::new(db.clone())),
         providers,
         admission_exact,
@@ -667,7 +694,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
         openai: openai_handle,
         anthropic: anthropic_handle,
     };
-    let app = router(state, cfg.http.request_timeout);
+    let app = router(
+        state,
+        cfg.http.request_timeout,
+        cfg.database.acquire_timeout,
+    );
 
     let listener = TcpListener::bind(cfg.http.bind)
         .await
@@ -675,10 +706,13 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     tracing::info!(addr = %cfg.http.bind, "tollgate listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cfg.http.shutdown_grace))
-        .await
-        .context("http server error")
+    axum::serve(
+        listener,
+        axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
+    )
+    .with_graceful_shutdown(shutdown_signal(cfg.http.shutdown_grace))
+    .await
+    .context("http server error")
 }
 
 /// Background task: reload budgets and prices from Postgres on an interval and
@@ -776,7 +810,37 @@ fn spawn_maintenance_task(db: PgPool, window: Duration) {
     });
 }
 
-pub fn router(state: AppState, request_timeout: Duration) -> Router {
+/// Build the HTTP service: the routes, wrapped by the authentication gate.
+///
+/// Outermost first:
+///
+/// 1. a response conversion, so the service's response type is axum's;
+/// 2. a panic guard for the gate itself;
+/// 3. the gate ([`crate::auth_gate::require_key`]), outside routing so it also
+///    answers unknown paths and wrong methods under `/v1` and `/console/`
+///    before the router can (a `Router::layer` gate would leak `Allow` on a
+///    405);
+/// 4. tracing, inside the gate, so unauthenticated probes are counted on
+///    `/metrics` rather than traced one by one;
+/// 5. a panic guard around the routes, inside the trace span;
+/// 6. the routes.
+///
+/// `key_lookup_timeout` is `database.acquire_timeout`: the gate's deadline for
+/// a key lookup is that plus [`crate::auth_gate::DEADLINE_MARGIN`].
+pub fn router(
+    state: AppState,
+    request_timeout: Duration,
+    key_lookup_timeout: Duration,
+) -> impl tower::Service<
+    axum::extract::Request,
+    Response = Response,
+    Error = std::convert::Infallible,
+    Future: Send + 'static,
+> + Clone
++ Send
++ 'static {
+    let gate = crate::auth_gate::GateState::new(state.core.clone(), key_lookup_timeout);
+
     // Local routes: bounded by the HTTP timeout, because nothing else bounds
     // them. They do their own work and should never run long.
     let local = Router::new()
@@ -816,39 +880,53 @@ pub fn router(state: AppState, request_timeout: Duration) -> Router {
         .route("/v1/messages/{*rest}", post(anthropic_messages_unsupported))
         .route("/v1/{provider}/{*rest}", post(gateway));
 
-    local
+    let routes = local
         .merge(proxied)
         .with_state(state)
         // Applied around the routes, so it sees a panic from anywhere inside
-        // them, including from a dependency. `TraceLayer` sits outside it and is
-        // unaffected. A panic on one request for one key must fail that request,
+        // them, including from a dependency, and logs it inside the request's
+        // trace span. A panic on one request for one key must fail that request,
         // not the process: this gateway is the thing standing between every
         // client and its provider, so a total outage is the most expensive
         // failure it has. The binary is built to unwind rather than abort for
         // exactly this reason.
-        //
-        // The response body is fixed text. A panic message can carry anything
-        // that was in scope, so it is logged and never returned.
-        .layer(CatchPanicLayer::custom(|_| {
-            tracing::error!("a request panicked; failing that request, not the process");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("x-tollgate-reason", "backend_error")],
-                Json(json!({"error": "internal error"})),
-            )
-                .into_response()
-        }))
-        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::custom(panic_response))
+        .layer(TraceLayer::new_for_http());
+
+    tower::ServiceBuilder::new()
+        .map_response(IntoResponse::into_response)
+        // The same guard again, for a panic in the gate (outside the routes).
+        .layer(CatchPanicLayer::custom(panic_response))
+        .layer(axum::middleware::from_fn_with_state(
+            gate,
+            crate::auth_gate::require_key,
+        ))
+        .service(routes)
+}
+
+/// The response for a request that panicked. The body is fixed text: a panic
+/// message can carry anything that was in scope, so it is logged and never
+/// returned.
+fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    tracing::error!("a request panicked; failing that request, not the process");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [("x-tollgate-reason", "backend_error")],
+        Json(json!({"error": "internal error"})),
+    )
+        .into_response()
 }
 
 async fn gateway(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     Path((provider, rest)): Path<(String, String)>,
-    headers: HeaderMap,
     body: String,
 ) -> Response {
     let core = state.core.load_full();
-    let outcome = core.evaluate(&provider, &rest, &headers, &body).await;
+    let outcome = core
+        .evaluate_authenticated(&authed.key_id, authed.auth_elapsed, &provider, &rest, &body)
+        .await;
     outcome_response(outcome)
 }
 
@@ -857,7 +935,11 @@ async fn gateway(
 /// `count_tokens` is free but unmetered, and `batches` bills asynchronously in a
 /// way no per-request ledger row can capture. Without this they fall into the
 /// catch-all as provider "messages" and write an unpriced row per call.
-async fn anthropic_messages_unsupported() -> Response {
+///
+/// Behind the gate like every `/v1` path, so only an authenticated caller sees
+/// this 404. It takes `Authed` only so that, like every gated handler, it fails
+/// closed if the gate is ever missing.
+async fn anthropic_messages_unsupported(Extension(_authed): Extension<Authed>) -> Response {
     anthropic_error(
         StatusCode::NOT_FOUND,
         "not_found_error",
@@ -881,18 +963,12 @@ async fn anthropic_messages_unsupported() -> Response {
 /// at all: routing through it would silently under-count every cached request.
 async fn anthropic_messages(
     State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // Accept `x-api-key` as a Tollgate key on THIS ROUTE ONLY, by rewriting it
-    // into the header the gateway already reads. Widening `presented_key`
-    // instead would quietly accept it on /console/* and every other route.
-    let mut headers = headers;
-    if !headers.contains_key(crate::gateway::KEY_HEADER) {
-        if let Some(v) = headers.get("x-api-key").cloned() {
-            headers.insert(crate::gateway::KEY_HEADER, v);
-        }
-    }
+    // `x-api-key` is read as a Tollgate key by the gate, on `/v1/messages` and
+    // the paths under it only (see `crate::auth_gate::require_key`).
 
     // A beta can change the billing rate: the 1M-context beta bills input above
     // 200k tokens at twice standard, which one input rate cannot express. Refuse
@@ -923,11 +999,17 @@ async fn anthropic_messages(
         .map(|v| stream_requested(&v))
         .unwrap_or(false);
     if wants_stream {
-        return anthropic_messages_stream(state, headers, body).await;
+        return anthropic_messages_stream(state, authed, body).await;
     }
     let core = state.core.load_full();
     let outcome = core
-        .evaluate(PROVIDER_ANTHROPIC, "messages", &headers, &body)
+        .evaluate_authenticated(
+            &authed.key_id,
+            authed.auth_elapsed,
+            PROVIDER_ANTHROPIC,
+            "messages",
+            &body,
+        )
         .await;
     anthropic_outcome_response(outcome)
 }
@@ -1019,7 +1101,7 @@ fn anthropic_error_reason(
 
 /// Map an [`Outcome`] to a native Anthropic response: the upstream body verbatim
 /// on success, Anthropic's error envelope on refusal.
-fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
+pub(crate) fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
     use crate::gateway::Outcome;
     match outcome {
         Outcome::Allowed {
@@ -1080,7 +1162,11 @@ fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
 /// Streaming (`stream: true`) is dispatched to [`openai_chat_stream`], which
 /// relays the upstream SSE and meters usage as [`OpenAiStreamMeter`] describes.
 /// Buffered requests run the shared [`GatewayCore::evaluate`] flow unchanged.
-async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+async fn openai_chat(
+    State(state): State<AppState>,
+    Extension(authed): Extension<Authed>,
+    body: String,
+) -> Response {
     // Peek whether the client asked for streaming. A body that does not parse is
     // treated as non-streaming so the buffered path returns a proper OpenAI error
     // envelope (rather than opening an event-stream for a malformed request).
@@ -1088,11 +1174,17 @@ async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: St
         .map(|v| stream_requested(&v))
         .unwrap_or(false);
     if wants_stream {
-        return openai_chat_stream(state, headers, body).await;
+        return openai_chat_stream(state, authed, body).await;
     }
     let core = state.core.load_full();
     let outcome = core
-        .evaluate(PROVIDER_OPENAI, "chat/completions", &headers, &body)
+        .evaluate_authenticated(
+            &authed.key_id,
+            authed.auth_elapsed,
+            PROVIDER_OPENAI,
+            "chat/completions",
+            &body,
+        )
         .await;
     openai_outcome_response(outcome)
 }
@@ -1110,8 +1202,10 @@ async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: St
 /// `message_start` carries a small placeholder `output_tokens`, completion is
 /// signalled by `message_stop` rather than `[DONE]`, and an error event arrives
 /// on an otherwise-healthy 200 stream followed by a normal close.
-async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
-    let started = Instant::now();
+async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String) -> Response {
+    // Authentication is part of the overhead, as it was when it ran here.
+    let started = crate::gateway::backdate(authed.auth_elapsed);
+    let key_id = authed.key_id;
     let core = state.core.load_full();
     let Some(provider) = state.anthropic.clone() else {
         return anthropic_error_reason(
@@ -1119,14 +1213,6 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             "api_error",
             "backend_error",
             "anthropic upstream is not configured",
-        );
-    };
-
-    let Some(key_id) = core.authenticate(&headers).await else {
-        return anthropic_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "invalid or missing API key",
         );
     };
 
@@ -1353,8 +1439,10 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
 /// idle/duration timeout, missing, implausible or contradictory usage, or a
 /// panic. Usage on OpenAI-protocol streams is assumed cumulative: an upstream
 /// that reports per-chunk deltas would be measured low.
-async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -> Response {
-    let started = Instant::now();
+async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Response {
+    // Authentication is part of the overhead, as it was when it ran here.
+    let started = crate::gateway::backdate(authed.auth_elapsed);
+    let key_id = authed.key_id;
     let core = state.core.load_full();
     let Some(provider) = state.openai.clone() else {
         // The endpoint is registered even when the openai upstream is disabled;
@@ -1379,14 +1467,6 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
              non-streaming endpoint",
         );
     }
-
-    let Some(key_id) = core.authenticate(&headers).await else {
-        return openai_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated",
-            "invalid or missing API key",
-        );
-    };
 
     let parsed = match provider.parse_streaming("chat/completions", &body) {
         Ok(p) => p,
@@ -2234,7 +2314,7 @@ fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Resp
 /// Map a gateway [`Outcome`] to an OpenAI-shaped HTTP response. On success the
 /// upstream body is returned verbatim; refusals use OpenAI's `{"error": {...}}`
 /// envelope with an `x-tollgate-reason` header.
-fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Response {
+pub(crate) fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Response {
     use crate::gateway::Outcome;
     match outcome {
         Outcome::Allowed {
@@ -2303,23 +2383,55 @@ fn budget_label(b: &Budget) -> String {
     }
 }
 
-fn unauthorized() -> Response {
+/// The console's 401. Every console refusal carries `x-tollgate-reason`, like
+/// every other route's.
+pub(crate) fn console_unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
+        [("x-tollgate-reason", "unauthenticated")],
         Json(json!({"error": "the console requires a valid API key"})),
     )
         .into_response()
 }
 
+/// The body of the console's 503 when the gateway cannot answer: the key store,
+/// or the request timeout. Shared with the gate, which puts it on the request
+/// timeout's otherwise empty 503.
+pub(crate) const CONSOLE_UNAVAILABLE_BODY: &str = r#"{"error":"gateway temporarily unavailable"}"#;
+
+/// The console's 503 when the gateway cannot answer.
+pub(crate) fn console_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            ("x-tollgate-reason", "backend_error"),
+            ("content-type", "application/json"),
+        ],
+        CONSOLE_UNAVAILABLE_BODY,
+    )
+        .into_response()
+}
+
+/// A console ledger read failed. Kept apart from [`console_unavailable`] so the
+/// body still says which read.
+fn console_read_failed(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("x-tollgate-reason", "backend_error")],
+        Json(json!({ "error": message })),
+    )
+        .into_response()
+}
+
 /// Read-only budgets view: current-period spend and limit per configured budget,
-/// summed from the durable ledger. Authenticated by any valid key: Tollgate is
-/// single-tenant per deployment, so any key in the deployment may observe its
-/// budgets and usage. Per-tenant scoping is an Enterprise-edition concern.
-async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let core = state.core.load_full();
-    if core.authenticate(&headers).await.is_none() {
-        return unauthorized();
-    }
+/// summed from the durable ledger. Authenticated by any valid key, in the gate:
+/// Tollgate is single-tenant per deployment, so any key in the deployment may
+/// observe its budgets and usage. Per-tenant scoping is an Enterprise-edition
+/// concern.
+async fn console_budgets(
+    State(state): State<AppState>,
+    Extension(_authed): Extension<Authed>,
+) -> Response {
     let budgets = state.budgets.load_full();
     let now = Utc::now();
     let mut out = Vec::with_capacity(budgets.len());
@@ -2328,11 +2440,7 @@ async fn console_budgets(State(state): State<AppState>, headers: HeaderMap) -> R
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "console: budget spend query failed");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"error": "budget read failed"})),
-                )
-                    .into_response();
+                return console_read_failed("budget read failed");
             }
         };
         out.push(json!({
@@ -2365,11 +2473,10 @@ struct UsageRow {
 /// Read-only usage view: the 100 most recent ledger rows, oldest-first so the
 /// console can number them chronologically. Authenticated by any valid key (see
 /// `console_budgets`). Cost is a plain decimal string, never raw micros.
-async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let core = state.core.load_full();
-    if core.authenticate(&headers).await.is_none() {
-        return unauthorized();
-    }
+async fn console_usage(
+    State(state): State<AppState>,
+    Extension(_authed): Extension<Authed>,
+) -> Response {
     let rows = sqlx::query_as::<_, UsageRow>(
         "SELECT provider, model, input_tokens, output_tokens, cache_read_tokens, \
                 cache_write_tokens, cost_micros, gateway_micros, decision \
@@ -2384,11 +2491,7 @@ async fn console_usage(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "console: usage query failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "usage read failed"})),
-            )
-                .into_response();
+            return console_read_failed("usage read failed");
         }
     };
     let events: Vec<_> = rows
@@ -2467,6 +2570,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         ("unpriced", load(&m.unpriced)),
         ("error", load(&m.errors)),
         ("unauthenticated", load(&m.unauthenticated)),
+        ("key_store_error", load(&m.key_store_error)),
     ] {
         let _ = writeln!(
             body,
@@ -2630,7 +2734,7 @@ mod tests {
         assert!(msg.contains("connecting to Postgres"), "control: {msg}");
 
         type Case = (&'static str, &'static str, fn(&mut Config));
-        let cases: [Case; 14] = [
+        let cases: [Case; 18] = [
             ("short pepper", "at least 16 bytes", |c| {
                 c.security.api_key_pepper = "short".to_owned();
             }),
@@ -2731,6 +2835,34 @@ mod tests {
             ("non-redis URL scheme", "parsing Redis URL", |c| {
                 c.redis.url = "http://127.0.0.1:6379".to_owned();
             }),
+            (
+                "too few connections to split",
+                "MAX_CONNECTIONS must be at least 4",
+                |c| {
+                    c.database.max_connections = 3;
+                },
+            ),
+            (
+                "zero acquire timeout",
+                "ACQUIRE_TIMEOUT must be between 1ms and 2147483647ms",
+                |c| {
+                    c.database.acquire_timeout = Duration::ZERO;
+                },
+            ),
+            (
+                "sub-millisecond acquire timeout",
+                "ACQUIRE_TIMEOUT must be between 1ms and 2147483647ms",
+                |c| {
+                    c.database.acquire_timeout = Duration::from_micros(500);
+                },
+            ),
+            (
+                "acquire timeout beyond statement_timeout's range",
+                "ACQUIRE_TIMEOUT must be between 1ms and 2147483647ms",
+                |c| {
+                    c.database.acquire_timeout = Duration::from_millis(2_147_483_648);
+                },
+            ),
         ];
 
         for (label, want, break_it) in cases {
@@ -3488,5 +3620,968 @@ mod tests {
             "the fix is reported"
         );
         assert_eq!(m.unmatchable_budgets.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// The authentication gate, driven through the real service stack: in-memory
+/// keys, lazy Postgres and Valkey handles pointing at a closed port, and
+/// providers pointing at the same. Nothing here needs a database, so it all
+/// runs in CI.
+#[cfg(test)]
+mod gate_tests {
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use axum::http::{HeaderValue, Method, header};
+    use tower::ServiceExt;
+    use tower::util::BoxCloneService;
+
+    use super::*;
+    use crate::auth_gate::{Surface, store_unavailable, unauthenticated};
+    use crate::budget::{Budgets, Period};
+    use crate::gateway::{KeyRecord, KeyStoreError, MemKeyStore, MemUsageSink};
+
+    type Svc = BoxCloneService<axum::extract::Request, Response, Infallible>;
+    /// A response reduced to what a caller can compare: status, headers, body.
+    type Observed = (StatusCode, Vec<(String, String)>, Vec<u8>);
+    /// A credential to present: label, header, lookups expected on the
+    /// Anthropic surface, lookups expected elsewhere.
+    type Cred = (&'static str, Option<(&'static str, String)>, u64, u64);
+    /// Headers to present, and whether the caller should be authenticated.
+    type Precedence = (&'static str, Vec<(&'static str, String)>, bool);
+
+    const CLOSED_PG: &str = "postgres://tollgate:tollgate@127.0.0.1:1/tollgate";
+    const CLOSED_HTTP: &str = "http://127.0.0.1:1";
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum StoreMode {
+        Answer,
+        Fail,
+        Hang,
+    }
+
+    /// A key store that counts lookups and can fail or hang on demand.
+    struct TestKeys {
+        inner: MemKeyStore,
+        mode: StoreMode,
+        lookups: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl KeyStore for TestKeys {
+        async fn lookup(&self, prefix: &str) -> Result<Option<KeyRecord>, KeyStoreError> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            match self.mode {
+                StoreMode::Answer => self.inner.lookup(prefix).await,
+                StoreMode::Fail => Err(KeyStoreError::new("test_failure")),
+                StoreMode::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Everything about a deployment that an unauthenticated caller must not be
+    /// able to observe.
+    #[derive(Clone, Copy, Debug)]
+    struct Deployment {
+        openai: bool,
+        anthropic: bool,
+        exact: bool,
+        priced: bool,
+        budgets: bool,
+    }
+
+    fn deployments() -> Vec<Deployment> {
+        (0u8..32)
+            .map(|b| Deployment {
+                openai: b & 1 != 0,
+                anthropic: b & 2 != 0,
+                exact: b & 4 != 0,
+                priced: b & 8 != 0,
+                budgets: b & 16 != 0,
+            })
+            .collect()
+    }
+
+    struct Harness {
+        svc: Svc,
+        keys: Arc<TestKeys>,
+        metrics: Arc<Metrics>,
+        usage: Arc<MemUsageSink>,
+        /// A valid key.
+        key: String,
+        /// The valid key's prefix with a different, well-formed secret.
+        wrong_secret: String,
+    }
+
+    impl Harness {
+        async fn send(&self, req: axum::extract::Request) -> Response {
+            self.svc.clone().oneshot(req).await.expect("infallible")
+        }
+        fn lookups(&self) -> u64 {
+            self.keys.lookups.load(Ordering::Relaxed)
+        }
+        fn unauthenticated(&self) -> u64 {
+            self.metrics.unauthenticated.load(Ordering::Relaxed)
+        }
+        fn key_store_errors(&self) -> u64 {
+            self.metrics.key_store_error.load(Ordering::Relaxed)
+        }
+    }
+
+    fn lazy_pool(acquire_timeout: Duration) -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(CLOSED_PG)
+            .expect("a lazy pool parses its URL only")
+    }
+
+    struct Options {
+        deployment: Deployment,
+        mode: StoreMode,
+        request_timeout: Duration,
+        key_lookup_timeout: Duration,
+        /// Use the real Postgres key store over a closed port instead of
+        /// `TestKeys`.
+        pg_keys: Option<Duration>,
+        db_acquire_timeout: Duration,
+    }
+
+    impl Default for Options {
+        fn default() -> Self {
+            Self {
+                deployment: Deployment {
+                    openai: true,
+                    anthropic: true,
+                    exact: false,
+                    priced: true,
+                    budgets: true,
+                },
+                mode: StoreMode::Answer,
+                request_timeout: Duration::from_secs(30),
+                key_lookup_timeout: Duration::from_secs(5),
+                pg_keys: None,
+                db_acquire_timeout: Duration::from_millis(300),
+            }
+        }
+    }
+
+    fn harness(opts: Options) -> Harness {
+        let d = opts.deployment;
+        let hasher = KeyHasher::random();
+        let generated = hasher.generate();
+        let other = hasher.generate();
+        let (prefix, _) = crate::apikey::parse_strict(&generated.plaintext).unwrap();
+        let (_, other_secret) = crate::apikey::parse_strict(&other.plaintext).unwrap();
+        let wrong_secret = format!("{prefix}_{other_secret}");
+
+        let mut mem = MemKeyStore::new();
+        mem.insert(
+            generated.prefix.clone(),
+            KeyRecord {
+                id: "8f0c6a4e-0d7e-4c2b-9b1a-2f6d3c5e7a91".to_owned(),
+                key_hash: generated.key_hash.clone(),
+            },
+        );
+        let keys = Arc::new(TestKeys {
+            inner: mem,
+            mode: opts.mode,
+            lookups: AtomicU64::new(0),
+        });
+        let key_store: Arc<dyn KeyStore> = match opts.pg_keys {
+            Some(t) => Arc::new(PgKeyStore::new(lazy_pool(t))),
+            None => keys.clone(),
+        };
+
+        let http = reqwest::Client::new();
+        let openai = d.openai.then(|| {
+            Arc::new(OpenAiProvider::custom(
+                http.clone(),
+                http.clone(),
+                CLOSED_HTTP.to_owned(),
+                "test-key".to_owned(),
+            ))
+        });
+        let anthropic = d.anthropic.then(|| {
+            Arc::new(crate::providers::AnthropicProvider::new(
+                http.clone(),
+                http.clone(),
+                "test-key".to_owned(),
+                CLOSED_HTTP.to_owned(),
+                "2023-06-01".to_owned(),
+            ))
+        });
+        let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(PROVIDER_MOCK.to_owned(), Arc::new(MockProvider));
+        if let Some(p) = &openai {
+            providers.insert(PROVIDER_OPENAI.to_owned(), p.clone() as Arc<dyn Provider>);
+        }
+        if let Some(p) = &anthropic {
+            providers.insert(
+                PROVIDER_ANTHROPIC.to_owned(),
+                p.clone() as Arc<dyn Provider>,
+            );
+        }
+        let prices = if d.priced {
+            PriceBook::from_prices(vec![
+                ModelPrice::new(PROVIDER_MOCK, "demo", 3_000_000, 15_000_000),
+                ModelPrice::new(PROVIDER_ANTHROPIC, "m", 3_000_000, 15_000_000),
+                ModelPrice::new(PROVIDER_OPENAI, "m", 3_000_000, 15_000_000),
+            ])
+        } else {
+            PriceBook::from_prices(Vec::new())
+        };
+        let budget_list = if d.budgets {
+            vec![Budget {
+                scope: Scope::Global,
+                period: Period::Monthly,
+                limit_micros: 1_000_000,
+                hard_stop: true,
+            }]
+        } else {
+            Vec::new()
+        };
+        let metrics = Arc::new(Metrics::default());
+        let usage = Arc::new(MemUsageSink::new());
+        let core = GatewayCore {
+            dummy_hash: hasher.hash("dummy"),
+            hasher,
+            keys: key_store,
+            budgets: Arc::new(Budgets::new(budget_list.clone())),
+            usage: usage.clone(),
+            prices: Arc::new(prices),
+            providers,
+            admission_exact: d.exact,
+            metrics: metrics.clone(),
+        };
+        let redis = ConnectionManager::new_lazy_with_config(
+            redis::Client::open("redis://127.0.0.1:1").expect("parses"),
+            redis::aio::ConnectionManagerConfig::new(),
+        )
+        .expect("a lazy connection manager does not connect");
+        let state = AppState {
+            db: lazy_pool(opts.db_acquire_timeout),
+            redis,
+            core: Arc::new(ArcSwap::from_pointee(core)),
+            budgets: Arc::new(ArcSwap::from_pointee(budget_list)),
+            openai,
+            anthropic,
+        };
+        let svc =
+            BoxCloneService::new(router(state, opts.request_timeout, opts.key_lookup_timeout));
+        Harness {
+            svc,
+            keys,
+            metrics,
+            usage,
+            key: generated.plaintext,
+            wrong_secret,
+        }
+    }
+
+    fn request(method: &Method, path: &str, body: Body) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method(method.clone())
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .expect("request builds")
+    }
+
+    fn with(
+        mut req: axum::extract::Request,
+        name: &'static str,
+        value: &str,
+    ) -> axum::extract::Request {
+        req.headers_mut()
+            .append(name, HeaderValue::from_str(value).expect("header value"));
+        req
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// A well-formed key nobody issued.
+    fn unknown_key() -> String {
+        KeyHasher::random().generate().plaintext
+    }
+
+    fn surface_of(path: &str) -> Surface {
+        crate::auth_gate::surface_for(path).expect("a gated path")
+    }
+
+    const GATED_PATHS: [&str; 13] = [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/messages/batches",
+        "/v1/anthropic/messages",
+        "/v1/nosuch/x",
+        "/v1/models",
+        "/v1",
+        "/v1/",
+        "/v1/%FF/x",
+        "/console/budgets",
+        "/console/usage",
+        "/console/nosuch",
+    ];
+
+    fn golden_401(surface: Surface) -> Value {
+        match surface {
+            Surface::Anthropic => json!({"type": "error", "error": {
+                "type": "authentication_error", "message": "invalid or missing API key"}}),
+            Surface::OpenAi => json!({"error": {
+                "message": "invalid or missing API key", "type": "unauthenticated"}}),
+            Surface::Legacy => {
+                json!({"error": "invalid or missing API key", "header": "x-tollgate-key"})
+            }
+            Surface::Console => json!({"error": "the console requires a valid API key"}),
+        }
+    }
+
+    fn golden_503(surface: Surface) -> Value {
+        match surface {
+            Surface::Anthropic => json!({"type": "error", "error": {
+                "type": "api_error", "message": "gateway backend unavailable"}}),
+            Surface::OpenAi => json!({"error": {
+                "message": "gateway temporarily unavailable", "type": "backend_error"}}),
+            Surface::Legacy | Surface::Console => {
+                json!({"error": "gateway temporarily unavailable"})
+            }
+        }
+    }
+
+    /// The only headers a gate refusal may carry. `content-length` is allowed
+    /// but not required: whether it is set before hyper writes the response is
+    /// not something a caller can use to tell deployments apart, because it is
+    /// the same for every request here.
+    fn assert_refusal_headers(resp: &Response, reason: &str, ctx: &str) {
+        for name in resp.headers().keys() {
+            assert!(
+                [header::CONTENT_TYPE, header::CONTENT_LENGTH].contains(name)
+                    || name == "x-tollgate-reason",
+                "{ctx}: unexpected header {name}"
+            );
+        }
+        assert_eq!(resp.headers()["x-tollgate-reason"], reason, "{ctx}");
+        assert!(
+            resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"),
+            "{ctx}"
+        );
+    }
+
+    /// Every gated path, method, credential and body, in every deployment,
+    /// gets the same 401 for its surface, with no lookup unless a well-formed
+    /// key was presented, one count on `unauthenticated` and no ledger row.
+    #[tokio::test]
+    async fn unauthenticated_callers_see_one_401_per_surface_in_every_deployment() {
+        let methods = [
+            Method::POST,
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PUT,
+        ];
+        let three_mib = "x".repeat(3 * 1024 * 1024);
+        let mut seen: HashMap<(Surface, bool), Observed> = HashMap::new();
+
+        for d in deployments() {
+            let h = harness(Options {
+                deployment: d,
+                ..Options::default()
+            });
+            let creds: Vec<Cred> = vec![
+                ("none", None, 0, 0),
+                (
+                    "bearer junk",
+                    Some(("authorization", "Bearer nope".to_owned())),
+                    0,
+                    0,
+                ),
+                (
+                    "malformed tollgate key",
+                    Some(("x-tollgate-key", "tgk_a_b".to_owned())),
+                    0,
+                    0,
+                ),
+                ("unknown key", Some(("x-tollgate-key", unknown_key())), 1, 1),
+                (
+                    "unknown bearer",
+                    Some(("authorization", format!("Bearer {}", unknown_key()))),
+                    1,
+                    1,
+                ),
+                (
+                    "wrong secret",
+                    Some(("x-tollgate-key", h.wrong_secret.clone())),
+                    1,
+                    1,
+                ),
+                (
+                    "unknown x-api-key",
+                    Some(("x-api-key", unknown_key())),
+                    1,
+                    0,
+                ),
+                (
+                    "malformed x-api-key",
+                    Some(("x-api-key", "sk-ant-nope".to_owned())),
+                    0,
+                    0,
+                ),
+            ];
+            let mut cases: Vec<(String, axum::extract::Request, u64)> = Vec::new();
+            for path in GATED_PATHS {
+                let anthropic = surface_of(path) == Surface::Anthropic;
+                for m in &methods {
+                    for (label, cred, on_anthropic, elsewhere) in &creds {
+                        let mut req =
+                            request(m, path, Body::from(r#"{"stream":true,"model":"m"}"#));
+                        if let Some(&(name, ref value)) = cred.as_ref() {
+                            req = with(req, name, value);
+                        }
+                        let lookups = if anthropic { *on_anthropic } else { *elsewhere };
+                        cases.push((format!("{m} {path} {label}"), req, lookups));
+                    }
+                }
+                // Bodies and betas, with and without a well-formed key.
+                let bodies: [(&str, Body); 5] = [
+                    ("stream body", Body::from(r#"{"stream":true,"model":"m"}"#)),
+                    ("empty object", Body::from("{}")),
+                    ("not json", Body::from("not json")),
+                    ("invalid utf-8", Body::from(vec![0xff_u8, 0xfe, 0xfd])),
+                    ("3 MiB", Body::from(three_mib.clone())),
+                ];
+                for (body_label, body) in bodies {
+                    let bytes = axum::body::to_bytes(body, 4 << 20).await.unwrap();
+                    for beta in [None, Some("bogus"), Some("\u{fffd}")] {
+                        for keyed in [false, true] {
+                            let mut req = request(&Method::POST, path, Body::from(bytes.clone()));
+                            if let Some(b) = beta {
+                                req.headers_mut().insert(
+                                    "anthropic-beta",
+                                    HeaderValue::from_bytes(b.as_bytes()).unwrap(),
+                                );
+                            }
+                            if keyed {
+                                req = with(req, "x-tollgate-key", &unknown_key());
+                            }
+                            cases.push((
+                                format!("POST {path} {body_label} beta={beta:?} keyed={keyed}"),
+                                req,
+                                u64::from(keyed),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for (ctx, req, want_lookups) in cases {
+                let path = req.uri().path().to_owned();
+                let surface = surface_of(&path);
+                let (l0, u0) = (h.lookups(), h.unauthenticated());
+                let resp = h.send(req).await;
+                let ctx = format!("{d:?} {ctx}");
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{ctx}");
+                assert!(resp.headers().get(header::ALLOW).is_none(), "{ctx}");
+                assert_refusal_headers(&resp, "unauthenticated", &ctx);
+                assert_eq!(h.lookups() - l0, want_lookups, "{ctx}: lookups");
+                assert_eq!(h.unauthenticated() - u0, 1, "{ctx}: unauthenticated count");
+                let status = resp.status();
+                let headers: Vec<(String, String)> = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+                    .collect();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let v: Value = serde_json::from_slice(&body).expect("json");
+                assert_eq!(v, golden_401(surface), "{ctx}");
+                // Byte-identical across every request on the surface, in every
+                // deployment. Keyed on whether a lookup ran only to keep the
+                // map small; the expected value is the same either way.
+                let entry = seen
+                    .entry((surface, want_lookups > 0))
+                    .or_insert_with(|| (status, headers.clone(), body.to_vec()));
+                assert_eq!(*entry, (status, headers, body.to_vec()), "{ctx}: differs");
+            }
+            assert_eq!(h.key_store_errors(), 0, "{d:?}");
+            assert!(h.usage.snapshot().is_empty(), "{d:?}: ledger rows");
+        }
+    }
+
+    /// A store that fails, or does not answer, is a 503 `backend_error` on every
+    /// surface and in every deployment, counted once as `key_store_error` and
+    /// never as `unauthenticated`.
+    ///
+    /// The hanging store runs in real time (the crate does not enable tokio's
+    /// `test-util`), so it covers the two extreme deployments only; the failing
+    /// store covers all of them, and the gate's response does not depend on
+    /// which of the two happened.
+    #[tokio::test]
+    async fn a_key_store_that_fails_or_hangs_is_a_503_never_a_401() {
+        let lookup_timeout = Duration::from_millis(100);
+        let deadline = lookup_timeout + crate::auth_gate::DEADLINE_MARGIN;
+        let all = deployments();
+        let extremes = vec![all[0], all[all.len() - 1]];
+        for (mode, ds) in [(StoreMode::Fail, all.clone()), (StoreMode::Hang, extremes)] {
+            for d in ds {
+                let h = harness(Options {
+                    deployment: d,
+                    mode,
+                    key_lookup_timeout: lookup_timeout,
+                    ..Options::default()
+                });
+                for path in [
+                    "/v1/messages",
+                    "/v1/chat/completions",
+                    "/v1/mock/generate",
+                    "/console/budgets",
+                ] {
+                    let surface = surface_of(path);
+                    let (k0, u0) = (h.key_store_errors(), h.unauthenticated());
+                    let started = Instant::now();
+                    let resp = h
+                        .send(with(
+                            request(&Method::POST, path, Body::from("{}")),
+                            "x-tollgate-key",
+                            &h.key,
+                        ))
+                        .await;
+                    let ctx = format!("{mode:?} {d:?} {path}");
+                    if mode == StoreMode::Hang {
+                        // The gate's deadline: the lookup timeout plus the margin.
+                        let took = started.elapsed();
+                        assert!(
+                            (deadline..deadline + Duration::from_secs(5)).contains(&took),
+                            "{ctx}: took {took:?}"
+                        );
+                    }
+                    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{ctx}");
+                    assert_refusal_headers(&resp, "backend_error", &ctx);
+                    assert_eq!(body_json(resp).await, golden_503(surface), "{ctx}");
+                    assert_eq!(h.key_store_errors() - k0, 1, "{ctx}");
+                    assert_eq!(h.unauthenticated() - u0, 0, "{ctx}");
+                }
+                // A malformed key never reaches the store, so it stays a 401.
+                let resp = h
+                    .send(with(
+                        request(&Method::POST, "/v1/messages", Body::from("{}")),
+                        "x-tollgate-key",
+                        "tgk_a_b",
+                    ))
+                    .await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{mode:?} {d:?}");
+                assert!(h.usage.snapshot().is_empty());
+            }
+        }
+    }
+
+    /// The real Postgres key store against a closed port: a 503 and one
+    /// `key_store_error`, never the 401 that once hid a database outage.
+    #[tokio::test]
+    async fn the_postgres_key_store_failing_is_a_503() {
+        let h = harness(Options {
+            pg_keys: Some(Duration::from_millis(300)),
+            key_lookup_timeout: Duration::from_millis(300),
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(&Method::POST, "/v1/chat/completions", Body::from("{}")),
+                "authorization",
+                &format!("Bearer {}", h.key),
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["x-tollgate-reason"], "backend_error");
+        assert_eq!(h.key_store_errors(), 1);
+        assert_eq!(h.unauthenticated(), 0);
+
+        // And it is on /metrics, which needs no key.
+        let resp = h
+            .send(request(&Method::GET, "/metrics", Body::empty()))
+            .await;
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            text.contains("tollgate_requests_total{decision=\"key_store_error\"} 1\n"),
+            "{text}"
+        );
+    }
+
+    /// The checks that used to run before authentication still run, for an
+    /// authenticated caller, and each request makes exactly one lookup: no
+    /// handler authenticates again.
+    #[tokio::test]
+    async fn authenticated_callers_still_get_every_check_that_moved() {
+        let three_mib = "x".repeat(3 * 1024 * 1024);
+        let base = Options::default().deployment;
+        let exact = || Options {
+            deployment: Deployment {
+                exact: true,
+                ..base
+            },
+            ..Options::default()
+        };
+        let no_anthropic = || Options {
+            deployment: Deployment {
+                anthropic: false,
+                ..base
+            },
+            ..Options::default()
+        };
+
+        let stream = r#"{"stream":true,"model":"m","max_tokens":10,"messages":[]}"#;
+        type Check = (
+            &'static str,
+            Options,
+            Method,
+            &'static str,
+            Body,
+            Option<(&'static str, &'static str)>,
+            StatusCode,
+            Option<&'static str>,
+        );
+        let checks: Vec<Check> = vec![
+            (
+                "count_tokens",
+                Options::default(),
+                Method::POST,
+                "/v1/messages/count_tokens",
+                Body::from("{}"),
+                None,
+                StatusCode::NOT_FOUND,
+                Some("bad_request"),
+            ),
+            (
+                "wrong method",
+                Options::default(),
+                Method::GET,
+                "/v1/messages",
+                Body::empty(),
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                None,
+            ),
+            (
+                "unknown path",
+                Options::default(),
+                Method::GET,
+                "/v1/models",
+                Body::empty(),
+                None,
+                StatusCode::NOT_FOUND,
+                None,
+            ),
+            (
+                "anthropic not enabled",
+                no_anthropic(),
+                Method::POST,
+                "/v1/messages",
+                Body::from(stream),
+                None,
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("backend_error"),
+            ),
+            (
+                "exact admission stream",
+                exact(),
+                Method::POST,
+                "/v1/chat/completions",
+                Body::from(stream),
+                None,
+                StatusCode::NOT_IMPLEMENTED,
+                Some("unsupported"),
+            ),
+            (
+                "bogus beta",
+                Options::default(),
+                Method::POST,
+                "/v1/messages",
+                Body::from("{}"),
+                Some(("anthropic-beta", "bogus")),
+                StatusCode::BAD_REQUEST,
+                Some("bad_request"),
+            ),
+            (
+                "3 MiB body",
+                Options::default(),
+                Method::POST,
+                "/v1/chat/completions",
+                Body::from(three_mib),
+                None,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                None,
+            ),
+            (
+                "invalid utf-8 body",
+                Options::default(),
+                Method::POST,
+                "/v1/chat/completions",
+                Body::from(vec![0xff_u8, 0xfe]),
+                None,
+                StatusCode::BAD_REQUEST,
+                None,
+            ),
+            (
+                "undecodable path",
+                Options::default(),
+                Method::POST,
+                "/v1/%FF/x",
+                Body::from("{}"),
+                None,
+                StatusCode::BAD_REQUEST,
+                None,
+            ),
+            (
+                "console unknown path",
+                Options::default(),
+                Method::GET,
+                "/console/nosuch",
+                Body::empty(),
+                None,
+                StatusCode::NOT_FOUND,
+                Some("bad_request"),
+            ),
+            (
+                "console wrong method",
+                Options::default(),
+                Method::POST,
+                "/console/budgets",
+                Body::empty(),
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                Some("bad_request"),
+            ),
+        ];
+        for (label, opts, method, path, body, extra, want, reason) in checks {
+            let h = harness(opts);
+            let mut req = with(request(&method, path, body), "x-tollgate-key", &h.key);
+            if let Some((name, value)) = extra {
+                req = with(req, name, value);
+            }
+            let resp = h.send(req).await;
+            assert_eq!(resp.status(), want, "{label}");
+            assert_eq!(
+                resp.headers()
+                    .get("x-tollgate-reason")
+                    .map(|v| v.to_str().unwrap()),
+                reason,
+                "{label}"
+            );
+            if want == StatusCode::METHOD_NOT_ALLOWED {
+                assert!(resp.headers().get(header::ALLOW).is_some(), "{label}");
+            }
+            assert_eq!(h.lookups(), 1, "{label}: lookups");
+            assert_eq!(h.unauthenticated(), 0, "{label}");
+        }
+    }
+
+    /// Which header wins, pinned. `x-api-key` is a Tollgate key on the
+    /// Anthropic surface only, and only when `x-tollgate-key` is absent.
+    #[tokio::test]
+    async fn key_header_precedence_is_pinned() {
+        let h = harness(Options::default());
+        let junk = unknown_key();
+        let bearer = |k: &str| format!("Bearer {k}");
+        // (path, headers, authenticated?)
+        let cases: Vec<Precedence> = vec![
+            (
+                "/v1/messages/count_tokens",
+                vec![("x-api-key", h.key.clone())],
+                true,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-tollgate-key", h.key.clone()),
+                    ("x-api-key", junk.clone()),
+                ],
+                true,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-tollgate-key", junk.clone()),
+                    ("x-api-key", h.key.clone()),
+                ],
+                false,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-api-key", h.key.clone()),
+                    ("authorization", bearer(&junk)),
+                ],
+                true,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-api-key", junk.clone()),
+                    ("authorization", bearer(&h.key)),
+                ],
+                false,
+            ),
+            // An empty x-tollgate-key blocks the rewrite but falls through to
+            // Bearer.
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-tollgate-key", String::new()),
+                    ("x-api-key", h.key.clone()),
+                ],
+                false,
+            ),
+            (
+                "/v1/messages/count_tokens",
+                vec![
+                    ("x-tollgate-key", String::new()),
+                    ("authorization", bearer(&h.key)),
+                ],
+                true,
+            ),
+            // Elsewhere x-api-key is ignored.
+            ("/v1/models", vec![("x-api-key", h.key.clone())], false),
+            (
+                "/v1/chat/completions",
+                vec![("x-api-key", h.key.clone())],
+                false,
+            ),
+            ("/console/nosuch", vec![("x-api-key", h.key.clone())], false),
+            ("/v1/models", vec![("authorization", bearer(&h.key))], true),
+            (
+                "/v1/models",
+                vec![
+                    ("x-tollgate-key", h.key.clone()),
+                    ("authorization", bearer(&junk)),
+                ],
+                true,
+            ),
+        ];
+        for (path, headers, authed) in cases {
+            let mut req = request(&Method::GET, path, Body::empty());
+            if path == "/v1/messages/count_tokens" {
+                *req.method_mut() = Method::POST;
+            }
+            for &(name, ref value) in &headers {
+                req = with(req, name, value);
+            }
+            let status = h.send(req).await.status();
+            let ctx = format!("{path} {headers:?}");
+            if authed {
+                assert_ne!(status, StatusCode::UNAUTHORIZED, "{ctx}");
+            } else {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{ctx}");
+            }
+        }
+    }
+
+    /// Every console refusal carries `x-tollgate-reason`, including the request
+    /// timeout's 503, whose empty body is replaced without leaving a stale
+    /// `content-length`.
+    #[tokio::test]
+    async fn every_console_refusal_carries_a_reason() {
+        // The request timeout fires while the ledger read waits for a
+        // connection that never comes.
+        let h = harness(Options {
+            request_timeout: Duration::from_millis(100),
+            db_acquire_timeout: Duration::from_secs(5),
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(&Method::GET, "/console/budgets", Body::empty()),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["x-tollgate-reason"], "backend_error");
+        let length = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        if let Some(length) = length {
+            assert_eq!(length, bytes.len().to_string(), "stale content-length");
+        }
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error": "gateway temporarily unavailable"})
+        );
+
+        // The ledger read itself failing: its own message, and the header.
+        let h = harness(Options {
+            request_timeout: Duration::from_secs(30),
+            db_acquire_timeout: Duration::from_millis(200),
+            ..Options::default()
+        });
+        for (path, message) in [
+            ("/console/budgets", "budget read failed"),
+            ("/console/usage", "usage read failed"),
+        ] {
+            let resp = h
+                .send(with(
+                    request(&Method::GET, path, Body::empty()),
+                    "x-tollgate-key",
+                    &h.key,
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(
+                resp.headers()["x-tollgate-reason"],
+                "backend_error",
+                "{path}"
+            );
+            assert_eq!(body_json(resp).await, json!({ "error": message }), "{path}");
+        }
+    }
+
+    /// The gate's own refusals use the shared vocabulary on every surface.
+    #[test]
+    fn gate_refusals_use_the_shared_reason_words() {
+        for surface in [
+            Surface::Anthropic,
+            Surface::OpenAi,
+            Surface::Legacy,
+            Surface::Console,
+        ] {
+            assert_eq!(
+                unauthenticated(surface).headers()["x-tollgate-reason"],
+                "unauthenticated",
+                "{surface:?}"
+            );
+            assert_eq!(
+                unauthenticated(surface).status(),
+                StatusCode::UNAUTHORIZED,
+                "{surface:?}"
+            );
+            assert_eq!(
+                store_unavailable(surface).headers()["x-tollgate-reason"],
+                "backend_error",
+                "{surface:?}"
+            );
+            assert_eq!(
+                store_unavailable(surface).status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{surface:?}"
+            );
+        }
     }
 }

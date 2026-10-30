@@ -35,6 +35,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 http = "1"
 humantime-serde = "1"
+# For sqlx's logging levels (`LevelFilter`), which take the `log` crate's type.
+log = "0.4"
 # Defaults off: they carry `acl`, `streams`, `geospatial` and `num-bigint`, none
 # of which this uses. Only `script` matters, because the reserve and settle paths
 # are Lua. Run the live enforcement battery after changing this list; it is the
@@ -45,7 +47,7 @@ serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["trace", "request-id", "timeout", "set-header", "util", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

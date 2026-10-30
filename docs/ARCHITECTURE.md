@@ -13,6 +13,7 @@ flowchart TB
   end
 
   subgraph tollgate["Tollgate gateway (single binary)"]
+    gate["Auth gate<br/>every /v1 and /console/* request"]
     router["HTTP router (axum)"]
     core["GatewayCore<br/>auth · pricing · admission · settle"]
     console["Read-only console<br/>/console, /console/budgets, /console/usage"]
@@ -27,9 +28,10 @@ flowchart TB
 
   prov["Anthropic / Vertex / OpenAI-compatible upstream"]
 
-  app -->|"x-tollgate-key<br/>Bearer, or x-api-key"| router --> core
-  ops --> console
-  core -->|"verify key"| pg
+  app -->|"x-tollgate-key<br/>Bearer, or x-api-key"| gate --> router --> core
+  ops -->|"key, for /console/*"| gate
+  router --> console
+  gate -->|"verify key (own small pool)"| pg
   core <-->|"reserve / settle (atomic Lua)"| vk
   pg -.->|"rebuild a counter Valkey lost"| vk
   core -->|"append usage"| pg
@@ -42,7 +44,8 @@ flowchart TB
 
 The whole gateway is one Rust binary. The same request flow (`GatewayCore`) backs
 both `tollgate demo` (in-memory) and `tollgate serve` (Postgres + Valkey), so the
-demo exercises the real logic.
+demo exercises the real logic, except the authentication gate in front of the
+router, which only `serve` has.
 
 ## Request lifecycle
 
@@ -54,13 +57,16 @@ sequenceDiagram
   participant V as Valkey
   participant P as Provider
   C->>T: POST /v1/messages | /v1/chat/completions | /v1/{provider}/{path}
-  T->>T: parse key, HMAC-SHA256 verify (constant time)
+  Note over T: auth gate, before routing: a malformed or missing key -> 401, no lookup
+  T->>DB: look up key prefix (key-lookup pool)
+  T->>T: HMAC-SHA256 verify (constant time)
+  Note over T,DB: wrong key -> 401<br/>store error or deadline -> 503 backend_error
   Note over T: unknown provider/model -> 400 (fail closed)
   T->>T: price by token (integer micros)
   Note over T: unpriced model -> record, then 400 (fail closed)
   opt admission = exact
     T->>P: pre-flight count_tokens
-    Note over T,P: a failed count is UPSTREAM (502), never a backend error;<br/>a 400/413/422 from it is the caller's body (400)
+    Note over T,P: a failed count is UPSTREAM (502), never a backend error,<br/>a 400/413/422 from it is the caller's body (400)
   end
   T->>V: reserve worst-case cost (atomic check + incr)
   opt counter absent (flush, failover, eviction, new period)
@@ -183,7 +189,9 @@ anybody; see `SECURITY.md`.
   and the rest is reported by the gauge.
 - **Auth.** Keys are `tgk_<pub>_<secret>`; only an HMAC of the secret under a
   server-side pepper is stored, compared in constant time, with a dummy-hash
-  verify on prefix miss so hit and miss cost the same.
+  verify on a prefix miss and on a store failure, so every lookup costs the same
+  hashing. In `serve` this runs in the gate, before routing, and only the exact
+  issued shape (`tgk_`, 16 lowercase hex, `_`, 48 lowercase hex) is looked up.
 
 ## Storage split
 

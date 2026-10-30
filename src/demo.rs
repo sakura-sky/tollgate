@@ -29,7 +29,9 @@ use tokio::net::TcpListener;
 use crate::apikey::KeyHasher;
 use crate::budget::{Budget, Budgets, Period, Scope};
 use crate::config::Config;
-use crate::gateway::{GatewayCore, KEY_HEADER, KeyRecord, MemKeyStore, MemUsageSink, Outcome};
+use crate::gateway::{
+    AuthError, GatewayCore, KEY_HEADER, KeyRecord, MemKeyStore, MemUsageSink, Outcome,
+};
 use crate::pricing::{ModelPrice, PriceBook, format_micros};
 use crate::provider::{MockProvider, Provider};
 
@@ -216,17 +218,42 @@ async fn gateway(
     }
 }
 
+/// The demo console's refusal for a caller without a valid key, or `None`.
+/// The in-memory key store cannot fail, but a store failure is still a 503 and
+/// never a 401, as in production.
+async fn console_refusal(
+    state: &DemoState,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    match state.core.authenticate(headers).await {
+        Ok(_) => None,
+        Err(AuthError::Unauthenticated) => {
+            state.unauthenticated.fetch_add(1, Ordering::Relaxed);
+            Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "the console requires a valid API key"})),
+                )
+                    .into_response(),
+            )
+        }
+        Err(AuthError::StoreUnavailable(_)) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("x-tollgate-reason", "backend_error")],
+                Json(json!({"error": "gateway temporarily unavailable"})),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 async fn admin_usage(
     State(state): State<Arc<DemoState>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if state.core.authenticate(&headers).await.is_none() {
-        state.unauthenticated.fetch_add(1, Ordering::Relaxed);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "the console requires a valid API key"})),
-        )
-            .into_response();
+    if let Some(refusal) = console_refusal(&state, &headers).await {
+        return refusal;
     }
     let events = state.usage.snapshot();
     let total: i64 = events.iter().map(|e| e.cost_micros).sum();
@@ -242,13 +269,8 @@ async fn admin_budgets(
     State(state): State<Arc<DemoState>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if state.core.authenticate(&headers).await.is_none() {
-        state.unauthenticated.fetch_add(1, Ordering::Relaxed);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "the console requires a valid API key"})),
-        )
-            .into_response();
+    if let Some(refusal) = console_refusal(&state, &headers).await {
+        return refusal;
     }
     let now = Utc::now();
     let global = state.budgets.spent(&Scope::Global, Period::Monthly, now);
@@ -295,7 +317,7 @@ async fn ready() -> impl IntoResponse {
 ///
 /// NOT the same series `serve` exposes, and a dashboard built here will not
 /// transfer. This counts by walking the in-memory usage log (only
-/// `unauthenticated` is an atomic), has no `estimated`
+/// `unauthenticated` is an atomic), has no `estimated` or `key_store_error`
 /// decision, accumulates cost only on `allowed`, and exports budget SPEND
 /// gauges. `serve` counts every decision including `estimated`, and exports no
 /// spend, because a scrape there deliberately touches neither Postgres nor

@@ -2746,6 +2746,7 @@ dependencies = [
  "hmac",
  "http",
  "humantime-serde",
+ "log",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

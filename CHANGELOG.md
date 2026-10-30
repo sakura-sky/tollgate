@@ -7,6 +7,67 @@ SPDX-FileCopyrightText: 2026 Andrew Stevens
 
 Notable changes per release.
 
+## Unreleased
+
+Authentication before anything else, and a key store that fails as a `503`
+rather than a wave of `401`s.
+
+Upgrading: `serve` now refuses `TOLLGATE_DATABASE__MAX_CONNECTIONS` below 4, an
+`ACQUIRE_TIMEOUT` outside 1 ms to 2147483647 ms, and a Postgres connection that
+drops startup options (see Changed).
+
+### Security
+
+- Every request to `/v1`, any path under `/v1/`, and any path under `/console/`
+  is authenticated before any route, extractor or handler runs. Without a valid
+  key the answer is `401` (or `503` if the key store cannot answer), shaped for
+  the path's family, and it no longer
+  reveals which providers are enabled (the streaming routes returned `503`
+  "upstream is not configured" first), the admission mode (`501` on a streaming
+  chat request under `exact`), the `anthropic-beta` allowlist, the route table
+  (`404` and `405` with `Allow`) or body-size limits (`413`).
+- Only the exact key shape Tollgate issues is looked up. Anything else is refused
+  without a database query.
+
+### Fixed
+
+- A key store that cannot answer (Postgres down, the lookup pool exhausted, a
+  lookup over its deadline) is a `503` with `x-tollgate-reason: backend_error`,
+  not a `401`. A lookup that hit a schema mismatch is the same `503` rather than
+  a panic.
+
+### Changed
+
+- `tollgate_requests_total` gains the `key_store_error` decision. It is not
+  exposed by `tollgate demo`.
+- `unauthenticated` now also counts unknown paths, wrong methods and
+  `/v1/messages/` sub-paths refused for their key, and no longer counts a store
+  failure.
+- API-key lookups run on their own pool, a quarter of
+  `TOLLGATE_DATABASE__MAX_CONNECTIONS` (at most 4). The total is unchanged, so
+  the shared pool is smaller: the default 10 becomes 8 shared and 2 for lookups.
+  `serve` refuses a value below 4 (admin commands do not).
+- `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT` is also the lookup connections'
+  server-side `statement_timeout`, and the gate answers `503` at most 250 ms
+  after it. `serve` refuses a value outside 1 ms to 2147483647 ms.
+- `serve` refuses to start if the lookup connections do not report that
+  `statement_timeout`, which happens when a connection pooler drops startup
+  options. Connect directly, or pass startup options through.
+- `/v1/messages/` sub-paths (`count_tokens`, `batches`) answered `404` to
+  anyone; they now need a key like every `/v1` path, and read `x-api-key` like
+  `/v1/messages`, so an Anthropic SDK with a valid key still gets the `404`.
+- Every `/console/*` refusal from `serve` carries `x-tollgate-reason` (the
+  `tollgate demo` console is unchanged): `unauthenticated` on
+  the `401`, `backend_error` on every `503` (including the request timeout's,
+  which now has a JSON body), `bad_request` on a `404` or `405`.
+- The console page reports "Gateway temporarily unavailable." on any refusal
+  other than `401`, rather than showing an empty dashboard.
+- Store failures are logged at most once a minute, with a count of the ones
+  skipped, instead of once per request.
+- `KeyStore::lookup` returns `Result<Option<KeyRecord>, KeyStoreError>` and
+  `GatewayCore::authenticate` returns `Result<String, AuthError>`. The crate is
+  not published, so this only matters to a fork.
+
 ## v0.3.0
 
 Streams charged what they measured, Vertex locations that resolve, and budgets
