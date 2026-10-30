@@ -94,6 +94,49 @@ pub struct ProvidersConfig {
     pub vertex: VertexConfig,
     pub anthropic: AnthropicConfig,
     pub openai: OpenAiConfig,
+    /// Where a request may point the provider at media it fetches itself.
+    #[serde(default)]
+    pub media: MediaConfig,
+    /// Per-model rules, matched by upstream and exact model id. Today they
+    /// carry only the Gemini thinking rule; operator rows override the built-in
+    /// rows for the same upstream and model. In TOML, `[[providers.models]]`
+    /// tables; as an environment variable, figment's inline form:
+    /// `TOLLGATE_PROVIDERS__MODELS='[{upstream="vertex",model="m",thinking="within_output_cap"}]'`.
+    #[serde(default)]
+    pub models: Vec<ModelRuleConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MediaConfig {
+    /// Cloud Storage buckets a native Vertex request may name in a
+    /// `fileData.fileUri` (`gs://bucket/...`). Vertex reads those objects on
+    /// the OPERATOR's behalf (Google requires them to be public or in the
+    /// requesting project; the exact principal is unverified), so any other
+    /// bucket is refused. Exact,
+    /// lowercase bucket names. Default empty: every `gs://` URI is refused.
+    /// As an environment variable: `TOLLGATE_PROVIDERS__MEDIA__GCS_BUCKETS='[a,b]'`
+    /// (quote a name that is all digits, or it parses as a number).
+    #[serde(default)]
+    pub gcs_buckets: Vec<String>,
+}
+
+/// One `[[providers.models]]` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRuleConfig {
+    /// `vertex` (native generateContent) or `vertex-openai` (the
+    /// OpenAI-compatible route with `providers.openai.upstream = "vertex"`).
+    pub upstream: String,
+    /// The exact model id as the route sees it: the path's model on `vertex`,
+    /// the body's `model` on `vertex-openai` (bare or `google/`-prefixed).
+    pub model: String,
+    /// `within_output_cap` (thinking tokens count against the output cap) or
+    /// `additive` (they come on top, up to `max_thinking_tokens`).
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// The operator's bound on thinking tokens for an `additive` model. 0 means
+    /// unset, which `additive` refuses at startup.
+    #[serde(default)]
+    pub max_thinking_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +154,13 @@ pub struct OpenAiConfig {
     pub base_url: String,
     /// Custom upstream bearer API key (used when `upstream = custom`).
     pub api_key: String,
+    /// Send `service_tier: "default"` on every outbound request. On OpenAI's
+    /// own API an omitted tier means `auto`, which can bill at a premium rate.
+    /// Unset means on when `upstream = custom` and the base URL's host is
+    /// `api.openai.com`, off otherwise, since other OpenAI-compatible servers
+    /// may reject the field. Never sent to Vertex, which drops the field.
+    #[serde(default)]
+    pub pin_service_tier: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +173,14 @@ pub struct VertexConfig {
     /// Optional static OAuth access token. If empty, the adapter fetches a token
     /// from the GCP metadata server (Workload Identity on Cloud Run/GCE).
     pub access_token: String,
+    /// Accept `labels` on native Vertex requests. Default false: labels land
+    /// in the operator's billing export, so a client could write arbitrary
+    /// keys and values into it. When true, each key and value is held to
+    /// Google's documented limit of 63 characters, and Tollgate caps the count
+    /// at 64 labels (its own limit, not a documented Google one).
+    /// Environment: `TOLLGATE_PROVIDERS__VERTEX__ALLOW_CLIENT_LABELS`.
+    #[serde(default)]
+    pub allow_client_labels: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +366,7 @@ impl Default for Config {
                     project: String::new(),
                     location: "us-central1".to_string(),
                     access_token: String::new(),
+                    allow_client_labels: false,
                 },
                 anthropic: AnthropicConfig {
                     enabled: false,
@@ -320,7 +379,10 @@ impl Default for Config {
                     upstream: "vertex".to_string(),
                     base_url: String::new(),
                     api_key: String::new(),
+                    pin_service_tier: None,
                 },
+                media: MediaConfig::default(),
+                models: Vec::new(),
             },
             reload: ReloadConfig {
                 interval: Duration::from_secs(15),

@@ -215,6 +215,162 @@ was at DEBUG in tower-http and filtered out by default. Unauthenticated
 requests and the public paths (`/healthz`, `/readyz`, `/metrics`, `/console`)
 open no span.
 
+## Request rules: media sources, Gemini thinking, service tier
+
+These settings change what a request may ask a provider to do. Each is
+checked at startup, before the database is touched, and a refusal of a request
+under these rules is fixed text that never repeats what the client sent. A body
+that is not valid JSON is the exception: its `400` carries the parser's message,
+which gives the line and column of the syntax error.
+
+```toml
+# tollgate.toml
+
+[providers.media]
+# Buckets a native Vertex request may name in fileData.fileUri (gs://bucket/...).
+# Empty (the default) refuses every gs:// URI.
+gcs_buckets = ["my-shared-media"]
+
+[providers.vertex]
+# Accept client `labels` on native Vertex requests. They land in your billing
+# export. Default false: refused.
+# allow_client_labels = true
+
+# One row per (upstream, model). upstream: "vertex" (native generateContent) or
+# "vertex-openai" (/v1/chat/completions with providers.openai.upstream = "vertex").
+# model: the id as that route forwards it, matched without case; on
+# vertex-openai a bare id means the google/ one.
+[[providers.models]]
+upstream = "vertex"
+model = "gemini-2.5-pro"
+thinking = "additive"
+max_thinking_tokens = 24576
+
+[[providers.models]]
+upstream = "vertex-openai"
+model = "google/gemini-2.5-pro"
+thinking = "additive"
+max_thinking_tokens = 24576
+
+[providers.openai]
+# Unset: on when upstream = "custom" and the base URL host is api.openai.com.
+# pin_service_tier = true
+```
+
+The same settings as environment variables, in figment's inline form:
+
+```sh
+TOLLGATE_PROVIDERS__MEDIA__GCS_BUCKETS='[my-shared-media]'
+TOLLGATE_PROVIDERS__MODELS='[{upstream="vertex",model="gemini-2.5-pro",thinking="additive",max_thinking_tokens=24576}]'
+TOLLGATE_PROVIDERS__OPENAI__PIN_SERVICE_TIER=true
+TOLLGATE_PROVIDERS__VERTEX__ALLOW_CLIENT_LABELS=true
+```
+
+A bucket name made only of digits must be quoted inside the list (`'["123"]'`),
+or it parses as a number and startup fails.
+
+**`gs://` allowlist.** Google's docs require a `gs://` object to be public or in
+the project sending the request, so Vertex reads it on the operator's behalf,
+not the caller's; which Google identity performs the read is unverified (see
+[`SECURITY.md`](../SECURITY.md)). List only buckets
+every key holder may read. A URI is accepted only when the text between `gs://`
+and the next `/` equals a listed name exactly; `%`, `..`, `\`, an uppercase or
+empty bucket, and any other scheme are refused. Entries
+must be plain lowercase bucket names (no `gs://`, no path), or startup fails. A
+refused request is a `403` with `x-tollgate-reason: forbidden_source`. So is an
+`https://` URI on any `googleapis.com` host or `storage.cloud.google.com`
+(compared without case or a trailing dot), which would reach Cloud Storage over
+https and so a bucket off the allowlist, and any URI carrying credentials
+(`user@` or `user:pass@`). Every other `https://` URI is a `400` until media
+support lands: remote media has no size bound, and what a URL serves can change
+between the pre-flight count and the generation. It is not
+written to the ledger, like any other request refused before it resolves to a
+priced model. The one exception is a refusal raised at the `exact` pre-flight
+count step (the count re-runs these checks), which is recorded as `error` at
+zero cost. Under `fast` admission any `fileData` is still refused with a
+`400`, because its size cannot be estimated from the body; use `exact`.
+
+**Gemini thinking rule.** Every Gemini model (`gemini-` ids, and
+`google/gemini-` on `vertex-openai`) on the Vertex routes needs a row stating
+`thinking`, or its requests are refused with a `400` that names this setting.
+Built in, as `within_output_cap`: `gemini-3.8-flash` on `vertex`, and
+`google/gemini-3.8-flash` on `vertex-openai`. Model ids are matched without
+ASCII case. On `vertex-openai` a row is matched against the id Tollgate
+forwards: a bare id gets the `google/` prefix first, so `gemini-x` and
+`google/gemini-x` are one model and one row covers both; two rows naming the
+same model that way refuse startup. A row for the same upstream and model
+replaces the built-in one.
+
+- `within_output_cap`: thinking tokens count against `maxOutputTokens` (or
+  `max_tokens`), so the reservation is the cap. Set it only after checking: send
+  the model a request with a small cap (say 64) and a high thinking setting; if
+  it stops with `MAX_TOKENS` and the reported thoughts plus candidates stay
+  within the cap, thinking is inside it.
+- `additive`: thinking comes on top of the cap. The output leg reserved is the
+  cap plus `max_thinking_tokens`, or plus the request's own explicit budget
+  (`thinkingConfig.thinkingBudget`, or `thinking_config.thinking_budget` under
+  `google` / `extra_body.google`) when that is larger. The outbound cap is not
+  changed. `max_thinking_tokens` is your assertion, not a bound Google enforces:
+  it calls a thinking budget a soft limit, so a request can exceed it and settle
+  above its reservation. Settlement always charges the real usage. `additive`
+  without `max_thinking_tokens` refuses startup, and so does
+  `max_thinking_tokens` on a `within_output_cap` row.
+
+  Set `max_thinking_tokens` to cover the highest thinking effort a client can
+  ask for without a number: `reasoning_effort: "high"` on
+  `/v1/chat/completions`, `thinkingLevel: "HIGH"` (or `thinking_level`), and the
+  dynamic budget `thinkingBudget: -1`. Each of those is reserved at exactly
+  `max_thinking_tokens`, so a bound below what the model spends at its highest
+  setting lets those requests settle above their reservation.
+
+Non-Gemini models on these routes, and every model on a custom OpenAI-compatible
+upstream, have no thinking rule.
+
+**Service tier.** On `/v1/chat/completions`, a `service_tier` that is present
+and not exactly the string `"default"` is refused, including `"auto"`, `null`,
+numbers and arrays. On OpenAI's own API an
+omitted tier means `auto`, so with `pin_service_tier` on, every outbound request
+carries `service_tier: "default"`. Leave it off for an OpenAI-compatible server
+that rejects the field. The Vertex upstream never gets it.
+
+**Native Vertex allowlist.** The README's Limitations list the fields a native
+`:generateContent` body may carry. Anything else is a `400`, so an SDK that adds
+a new field will see refusals until it is reviewed and added. Keys in Google's
+own objects must be strict lowerCamelCase or strict snake_case; other
+spellings, and two keys in one object that differ only in case or underscores
+(`fileDATA` beside `fileData`), are a `400`. `generationConfig.maxOutputTokens`
+must be a positive integer: `0` is a `400`, since Google may read it as unset.
+A `fileData` that is not an object is a `403`. `labels` are refused unless
+`providers.vertex.allow_client_labels` is true, since they land in your
+billing export; allowed, they are limited to 64 entries of at most 63
+characters.
+
+**Content parts on the Vertex OpenAI-compatible route.** A message `content`
+array may carry only `{"type": "text", "text": ...}` parts until media support
+lands; any other part type, or another key in a part, is a `400`.
+
+**Key spelling on the Vertex OpenAI-compatible route.** A top-level key with an
+uppercase ASCII letter is a `400`, and so is one inside `google`,
+`extra_body`, `extra_body.google` or `thinking_config`. Vertex may read
+camelCase aliases (`maxTokens`, `extraBody`, `candidateCount`,
+`serviceTier`) that would bypass the snake_case checks and the reservation, so
+clients must send the snake_case fields. In the same objects, a key that
+matches a field Tollgate checks once case and underscores are ignored, but is
+not spelled exactly as that field (`maxtokens`, `max__tokens`, `max_tokens_`,
+`service__tier`, `cachedcontent`), is a `400`, and so are two keys in one
+object that differ only in case or underscores. The checked fields are
+`model`, `messages`, `max_tokens`, `max_completion_tokens`, `n`, `stream`,
+`stream_options`, `service_tier`, `modalities`, `audio`, `prediction`,
+`web_search_options`, `tools`, `tool_choice`, `reasoning_effort`, `google`,
+`extra_body`, `thinking_config`, `thinking_budget`, `include_thoughts`,
+`thinking_level`, `cached_content` and `candidate_count`. This is the set
+protected against alias spellings, not a list of refused fields. Of these,
+`cached_content` and `candidate_count` are refused whenever present, at the top
+level and inside `google` or `extra_body.google`; `audio`, `prediction` and
+`web_search_options` unless null; `modalities` unless text only; `n` unless an integer of at most 1;
+`service_tier` other than `"default"`; and `tools` of any type but `function`.
+The rest are read, pinned or rewritten. A custom upstream is unaffected.
+
 ## Ledger retention
 
 `usage_events` is append-only: a trigger rejects `UPDATE` and `DELETE` for every
@@ -427,9 +583,18 @@ Alert too on `tollgate_unmatchable_budgets` being above zero. Each budget it
 counts fails to cover some or all of the requests it appears to. For a non-UUID
 key id or a model priced under a second name, those requests run under the other
 budgets that match them (or are denied if none does); for a disabled provider or an unpriced model they are refused
-anyway. A Vertex budget while `/v1/chat/completions` also reaches Vertex is
+anyway. With `upstream = vertex`, `/v1/chat/completions` prices, budgets and
+records a bare model id under the `google/` id it forwards, so an `openai` model
+budget with a bare id matches nothing and is counted. A Vertex budget while `/v1/chat/completions` also reaches Vertex is
 logged but not counted, because no budget can clear it. The warning "a configured budget cannot match some
 or all of its requests" names each budget and the reason, and is logged at
 startup and whenever the set changes on reload. A budget staged on purpose for a
 disabled provider or an unpriced model (`admin budget set --allow-unpriced`)
 keeps the gauge raised until it can match.
+
+For the same reason, an `openai` price row with a bare model id matches no
+request while `/v1/chat/completions` reaches Vertex. The warning "openai price
+rows with a bare model id match no request" names those models, at startup and
+whenever the set changes on reload. Re-price each as `google/<id>`
+(`admin price set --provider openai --model google/<id>`) and remove the bare
+row.

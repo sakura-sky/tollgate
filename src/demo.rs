@@ -214,7 +214,9 @@ async fn gateway(
             .into_response(),
         // The mock never refuses, but the arm is shared with `serve`: same
         // shape, and never the provider's body.
-        outcome @ Outcome::UpstreamRefused(_) => crate::gateway::outcome_response(outcome),
+        outcome @ (Outcome::UpstreamRefused(_) | Outcome::Forbidden(_)) => {
+            crate::gateway::outcome_response(outcome)
+        }
         Outcome::Upstream(m) => {
             tracing::warn!(detail = %m, "upstream provider error");
             (

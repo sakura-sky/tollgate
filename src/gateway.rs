@@ -154,6 +154,10 @@ pub enum Outcome {
     },
     Unauthenticated,
     BadRequest(String),
+    /// The request names a source the operator has not allowed the provider to
+    /// read (see [`ProviderError::Forbidden`]). 403, `forbidden_source`. The
+    /// text is the adapter's fixed message.
+    Forbidden(String),
     Unpriced {
         provider: String,
         model: String,
@@ -181,6 +185,10 @@ pub const UPSTREAM_RATE_LIMITED: &str = "the provider is rate limiting this gate
 /// The `x-tollgate-reason` for a provider 429. The plainer `rate_limited` is
 /// kept free for a gateway-side limit, which Tollgate does not have yet.
 pub const REASON_UPSTREAM_RATE_LIMITED: &str = "upstream_rate_limited";
+
+/// The `x-tollgate-reason` for a request naming a source the operator has not
+/// allowed, such as a `gs://` bucket off the allowlist.
+pub const REASON_FORBIDDEN_SOURCE: &str = "forbidden_source";
 
 /// The status a client gets for each provider refusal.
 #[must_use]
@@ -262,6 +270,12 @@ pub fn outcome_response(outcome: Outcome) -> Response {
             StatusCode::BAD_REQUEST,
             [("x-tollgate-reason", "bad_request")],
             Json(json!({"error": format!("invalid request body: {m}")})),
+        )
+            .into_response(),
+        Outcome::Forbidden(m) => (
+            StatusCode::FORBIDDEN,
+            [("x-tollgate-reason", REASON_FORBIDDEN_SOURCE)],
+            Json(json!({"error": m})),
         )
             .into_response(),
         // Unknown/unpriced provider or model: the caller targeted something we
@@ -516,6 +530,7 @@ impl GatewayCore {
                     provider_id,
                     rest_path,
                     body,
+                    None,
                 )
                 .await
             }
@@ -535,6 +550,11 @@ impl GatewayCore {
     ///
     /// `request_id` is the id the client was given in `x-tollgate-request-id`,
     /// put on the log line for a provider refusal so the two can be matched.
+    ///
+    /// `anthropic_beta` is the native Anthropic handler's validated, joined
+    /// `anthropic-beta` list, carried to the forward on the parsed request.
+    /// Every other route passes `None`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate_authenticated(
         &self,
         key_id: &str,
@@ -543,6 +563,7 @@ impl GatewayCore {
         provider_id: &str,
         rest_path: &str,
         body: &str,
+        anthropic_beta: Option<&str>,
     ) -> Outcome {
         // Measure the gateway's own overhead: total time in this method, plus
         // authentication, minus the time awaiting the provider (pre-flight
@@ -567,9 +588,12 @@ impl GatewayCore {
                 model: String::new(),
             };
         };
-        let parsed = match provider.parse_request(rest_path, body) {
+        let mut parsed = match provider.parse_request(rest_path, body) {
             Ok(p) => p,
             Err(ProviderError::BadRequest(m)) => return Outcome::BadRequest(m),
+            // Not recorded, like any other parse refusal: nothing was reserved
+            // or forwarded.
+            Err(ProviderError::Forbidden(m)) => return Outcome::Forbidden(m),
             // Nothing is reserved or forwarded yet, so neither of these can have
             // been billed. MeteringFailed from a parser would be an adapter bug;
             // it is handled rather than ignored so the match stays exhaustive if
@@ -581,10 +605,16 @@ impl GatewayCore {
             // names only the status.
             Err(e @ ProviderError::Refused { .. }) => return Outcome::Upstream(e.to_string()),
         };
+        parsed.anthropic_beta = anthropic_beta.map(str::to_owned);
         // In fast admission, refuse requests that reference external media: their
         // token cost is not bounded by body size, so the reservation would be far
         // too low. Such requests must use exact admission (which counts them).
-        if !self.admission_exact && crate::providers::references_external_media(body) {
+        // `parsed.external_media` is the adapter's reading of the body it
+        // forwards, which can differ from the client's bytes (native Vertex
+        // rewrites key spellings); either one is enough to refuse.
+        if !self.admission_exact
+            && (parsed.external_media || crate::providers::references_external_media(body))
+        {
             return Outcome::BadRequest(
                 "requests referencing external media (fileUri/file_id/url) require exact admission"
                     .to_owned(),
@@ -637,6 +667,22 @@ impl GatewayCore {
                     )
                     .await;
                     return Outcome::BadRequest(m);
+                }
+                // The count re-runs the checks `parse_request` ran, so this is
+                // not expected; a source refusal stays a 403 wherever it lands.
+                Err(ProviderError::Forbidden(m)) => {
+                    self.record(
+                        &key_id,
+                        provider_id,
+                        &parsed.model,
+                        Usage::default(),
+                        0,
+                        "error",
+                        started,
+                        provider_micros,
+                    )
+                    .await;
+                    return Outcome::Forbidden(m);
                 }
                 // The provider refused the count: classified by its status, with
                 // its details logged and none of its text given to the client.
@@ -788,7 +834,11 @@ impl GatewayCore {
             Ok(r) => r,
             // Never reached the provider: connect, DNS, TLS, or a failure
             // building the call. Nothing was billed, so release it all.
-            Err(e @ ProviderError::Upstream(_) | e @ ProviderError::BadRequest(_)) => {
+            Err(
+                e @ ProviderError::Upstream(_)
+                | e @ ProviderError::BadRequest(_)
+                | e @ ProviderError::Forbidden(_),
+            ) => {
                 let msg = e.to_string();
                 guard
                     .settle_with_overhead(
@@ -1927,6 +1977,7 @@ mod tests {
             Outcome::Allowed { .. } => "allowed",
             Outcome::Unauthenticated => "unauthenticated",
             Outcome::BadRequest(_) => "bad_request",
+            Outcome::Forbidden(_) => "forbidden_source",
             Outcome::Unpriced { .. } => "unpriced",
             Outcome::BudgetDenied(_) => "budget_denied",
             Outcome::BackendError(_) => "backend_error",

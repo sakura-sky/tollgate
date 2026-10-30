@@ -158,6 +158,12 @@ struct BudgetFinding {
 /// - a `vertex` provider or model budget when the OpenAI-compatible route also
 ///   reaches Vertex: those requests are scoped as `openai`. Logged, not counted.
 ///
+/// When the OpenAI-compatible route reaches Vertex, an `openai` model budget
+/// for a bare id (no `/`) cannot match anything: requests are scoped under the
+/// `google/`-prefixed id Vertex is sent. A `google/` budget is then not partial
+/// because of a bare-id price row, since that row matches nothing either (see
+/// [`unreachable_openai_prices`]).
+///
 /// It does not refuse to boot: a budget for a provider that is switched off for
 /// now is legitimate configuration. It makes the gap visible. Aliases that do not
 /// differ by a `/` prefix (dated model ids, say) are not detected.
@@ -223,6 +229,17 @@ fn unmatchable_budgets(
                 if p == PROVIDER_VERTEX && openai_reaches_vertex {
                     add(&at, vertex_route_note(), false);
                 }
+                if p == PROVIDER_OPENAI && openai_reaches_vertex {
+                    if !m.contains('/') {
+                        let reason = format!(
+                            "requests to /v1/chat/completions reach Vertex and are scoped as \
+                             {p}/{}, so a bare model id matches nothing",
+                            crate::providers::vertex_openai_model(m)
+                        );
+                        add(&at, reason, true);
+                    }
+                    continue;
+                }
                 let tail = |s: &str| s.rsplit_once('/').map(|(_, t)| t.to_owned());
                 // Covered only by a budget for the same period that is at least as
                 // hard: a soft cap on the alias does not stop its traffic.
@@ -254,6 +271,46 @@ fn unmatchable_budgets(
     }
     out.sort();
     out
+}
+
+/// The `openai` price rows that can match no request because the
+/// OpenAI-compatible route reaches Vertex: a bare model id (no `/`) is sent, and
+/// so priced, as its `google/`-prefixed id. Sorted; empty when the route does not
+/// reach Vertex.
+fn unreachable_openai_prices(prices: &PriceBook, openai_reaches_vertex: bool) -> Vec<String> {
+    if !openai_reaches_vertex {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = prices
+        .models_for(PROVIDER_OPENAI)
+        .filter(|m| !m.contains('/'))
+        .map(str::to_owned)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Log one WARN naming every unreachable `openai` price row (see
+/// [`unreachable_openai_prices`]) when the set differs from the last report, so
+/// a standing problem is reported at boot and on the reload that changes it,
+/// not every reload cycle. Returns whether anything was logged. The ids are the
+/// operator's own price rows.
+fn report_unreachable_prices(last: &mut Vec<String>, now: Vec<String>) -> bool {
+    if now == *last {
+        return false;
+    }
+    if !now.is_empty() {
+        tracing::warn!(
+            models = %now.join(", "),
+            "openai price rows with a bare model id match no request: \
+             /v1/chat/completions reaches Vertex, and requests are priced, budgeted and \
+             recorded under the google/-prefixed id. Re-price these models as google/<id>"
+        );
+    } else if !last.is_empty() {
+        tracing::info!("every openai price row can now match its requests");
+    }
+    *last = now;
+    true
 }
 
 /// Log the findings when they differ from the last report, and set the gauge to
@@ -478,6 +535,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
             ),
         }
     }
+    // Per-model rules and the gs:// allowlist: config errors, so they are
+    // refused here, before the database is touched.
+    let thinking_rules = crate::providers::ThinkingRules::from_config(&cfg.providers.models)
+        .map_err(|e| anyhow::anyhow!("invalid model rules: {e}"))?;
+    crate::providers::validate_gcs_buckets(&cfg.providers.media.gcs_buckets)
+        .map_err(|e| anyhow::anyhow!("invalid media config: {e}"))?;
     let admission_mode = cfg.providers.admission.to_ascii_lowercase();
     if admission_mode != "fast" && admission_mode != "exact" {
         anyhow::bail!(
@@ -604,12 +667,17 @@ pub async fn serve(cfg: Config) -> Result<()> {
     if cfg.providers.vertex.enabled {
         providers.insert(
             PROVIDER_VERTEX.to_owned(),
-            Arc::new(crate::providers::VertexProvider::new(
-                http.clone(),
-                cfg.providers.vertex.project.clone(),
-                cfg.providers.vertex.location.clone(),
-                cfg.providers.vertex.access_token.clone(),
-            )),
+            Arc::new(
+                crate::providers::VertexProvider::new(
+                    http.clone(),
+                    cfg.providers.vertex.project.clone(),
+                    cfg.providers.vertex.location.clone(),
+                    cfg.providers.vertex.access_token.clone(),
+                )
+                .with_gcs_buckets(cfg.providers.media.gcs_buckets.clone())
+                .with_client_labels(cfg.providers.vertex.allow_client_labels)
+                .with_thinking_rules(thinking_rules.clone()),
+            ),
         );
     }
     let mut openai_handle: Option<Arc<crate::providers::OpenAiProvider>> = None;
@@ -622,13 +690,15 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 &cfg.providers.vertex.project,
                 &cfg.providers.vertex.location,
                 cfg.providers.vertex.access_token.clone(),
-            ),
+            )
+            .with_thinking_rules(thinking_rules.clone()),
             "custom" => crate::providers::OpenAiProvider::custom(
                 http.clone(),
                 stream_http.clone(),
                 oc.base_url.clone(),
                 oc.api_key.clone(),
-            ),
+            )
+            .with_pin_service_tier(oc.pin_service_tier),
             // Validated before the database is touched; see the pre-flight checks.
             _ => unreachable!("openai upstream validated at boot"),
         };
@@ -666,6 +736,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
         openai_reaches_vertex,
     );
     report_unmatchable(&mut Vec::new(), unmatchable.clone(), &parts.metrics);
+    let unreachable_prices = unreachable_openai_prices(&prices, openai_reaches_vertex);
+    report_unreachable_prices(&mut Vec::new(), unreachable_prices.clone());
 
     let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
     let budgets_view = Arc::new(ArcSwap::from_pointee(budgets));
@@ -685,6 +757,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             cache_fallback,
             long_context,
             unmatchable,
+            unreachable_prices,
             openai_reaches_vertex,
         );
         tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
@@ -733,6 +806,8 @@ fn spawn_reload_task(
     long_context: crate::pricing::LongContextTier,
     // The set reported at boot, so the first reload does not repeat it.
     mut last_unmatchable: Vec<BudgetFinding>,
+    // Likewise for the unreachable `openai` price rows.
+    mut last_unreachable_prices: Vec<String>,
     openai_reaches_vertex: bool,
 ) {
     tokio::spawn(async move {
@@ -791,6 +866,10 @@ fn spawn_reload_task(
                 openai_reaches_vertex,
             );
             report_unmatchable(&mut last_unmatchable, unmatchable, &parts.metrics);
+            report_unreachable_prices(
+                &mut last_unreachable_prices,
+                unreachable_openai_prices(&prices, openai_reaches_vertex),
+            );
             core.store(Arc::new(parts.build(budgets.clone(), prices)));
             budgets_view.store(Arc::new(budgets));
             tracing::debug!(budgets = n_b, priced_models = n_p, "reloaded config");
@@ -944,6 +1023,7 @@ async fn gateway(
             &provider,
             &rest,
             &body,
+            None,
         )
         .await;
     outcome_response(outcome)
@@ -1000,17 +1080,25 @@ async fn anthropic_messages(
                 "malformed anthropic-beta header",
             );
         };
-        if let Some(unknown) = crate::providers::unknown_anthropic_beta(s) {
+        // Fixed text: the beta string is the client's.
+        if crate::providers::unknown_anthropic_beta(s).is_some() {
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                &format!(
-                    "anthropic-beta '{unknown}' is not supported: a beta can change the \
-                     per-token rate, which a single configured price cannot express"
-                ),
+                "an anthropic-beta value is not supported: a beta can change the per-token \
+                 rate, which a single configured price cannot express",
             );
         }
     }
+    // Every value passed the loop above, so all of them are allowlisted. They
+    // are forwarded on the Messages call; until they were, a client asking for
+    // an allowlisted beta silently did not get it.
+    let betas = crate::providers::joined_anthropic_betas(
+        headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
 
     // The service tier is pinned in the adapter's forward, not here, so the
     // legacy /v1/anthropic/messages route gets it too.
@@ -1018,7 +1106,7 @@ async fn anthropic_messages(
         .map(|v| stream_requested(&v))
         .unwrap_or(false);
     if wants_stream {
-        return anthropic_messages_stream(state, authed, body).await;
+        return anthropic_messages_stream(state, authed, body, betas).await;
     }
     let core = state.core.load_full();
     let outcome = core
@@ -1029,6 +1117,7 @@ async fn anthropic_messages(
             PROVIDER_ANTHROPIC,
             "messages",
             &body,
+            betas.as_deref(),
         )
         .await;
     anthropic_outcome_response(outcome)
@@ -1151,11 +1240,18 @@ pub(crate) fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Re
         Outcome::BadRequest(m) => {
             anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
         }
-        Outcome::Unpriced { provider, model } => anthropic_error_reason(
+        Outcome::Forbidden(m) => anthropic_error_reason(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            crate::gateway::REASON_FORBIDDEN_SOURCE,
+            &m,
+        ),
+        Outcome::Unpriced { .. } => anthropic_error_reason(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "unpriced",
-            &format!("no price configured for {provider}/{model}"),
+            // Fixed text: the model is the client's (it is logged with the refusal).
+            "no price configured for this provider and model; unpriced models are refused (fail closed)",
         ),
         Outcome::BudgetDenied(d) => anthropic_error(
             StatusCode::PAYMENT_REQUIRED,
@@ -1240,6 +1336,7 @@ async fn openai_chat(
             PROVIDER_OPENAI,
             "chat/completions",
             &body,
+            None,
         )
         .await;
     openai_outcome_response(outcome)
@@ -1258,7 +1355,12 @@ async fn openai_chat(
 /// `message_start` carries a small placeholder `output_tokens`, completion is
 /// signalled by `message_stop` rather than `[DONE]`, and an error event arrives
 /// on an otherwise-healthy 200 stream followed by a normal close.
-async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String) -> Response {
+async fn anthropic_messages_stream(
+    state: AppState,
+    authed: Authed,
+    body: String,
+    betas: Option<String>,
+) -> Response {
     // Authentication is part of the overhead, as it was when it ran here.
     let started = crate::gateway::backdate(authed.auth_elapsed);
     let key_id = authed.key_id;
@@ -1277,6 +1379,9 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
         Ok(p) => p,
         Err(ProviderError::BadRequest(m)) => {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m);
+        }
+        Err(ProviderError::Forbidden(m)) => {
+            return anthropic_outcome_response(crate::gateway::Outcome::Forbidden(m));
         }
         Err(
             ProviderError::Upstream(_)
@@ -1306,7 +1411,7 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "unpriced",
-            &format!("no price configured for anthropic/{}", parsed.model),
+            "no price configured for this provider and model; unpriced models are refused (fail closed)",
         );
     };
 
@@ -1349,6 +1454,9 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
                     // Tollgate's text about it, not the provider's.
                     ProviderError::BadRequest(m) => {
                         anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
+                    }
+                    ProviderError::Forbidden(m) => {
+                        anthropic_outcome_response(crate::gateway::Outcome::Forbidden(m))
                     }
                     // The provider refused the count: classified, its details
                     // logged with the request id, none of its text returned.
@@ -1459,7 +1567,7 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
         overhead_micros,
     );
 
-    let upstream = match provider.forward_stream(&body).await {
+    let upstream = match provider.forward_stream(&body, betas.as_deref()).await {
         Ok(r) => r,
         Err(ProviderError::MeteringFailed(m)) => {
             // Possibly billed; charge the reservation rather than releasing.
@@ -1586,6 +1694,9 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
                 &format!("invalid request: {m}"),
             );
         }
+        Err(ProviderError::Forbidden(m)) => {
+            return openai_outcome_response(crate::gateway::Outcome::Forbidden(m));
+        }
         // Pre-reservation, so nothing can have been billed on any of these.
         Err(
             ProviderError::Upstream(_)
@@ -1614,7 +1725,7 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
         return openai_error(
             StatusCode::BAD_REQUEST,
             "unpriced",
-            &format!("no price configured for openai/{}", parsed.model),
+            "no price configured for this provider and model; unpriced models are refused (fail closed)",
         );
     };
 
@@ -2762,10 +2873,16 @@ pub(crate) fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Respo
             "bad_request",
             &format!("invalid request: {m}"),
         ),
-        Outcome::Unpriced { provider, model } => openai_error(
+        Outcome::Forbidden(m) => openai_error(
+            StatusCode::FORBIDDEN,
+            crate::gateway::REASON_FORBIDDEN_SOURCE,
+            &m,
+        ),
+        Outcome::Unpriced { .. } => openai_error(
             StatusCode::BAD_REQUEST,
             "unpriced",
-            &format!("no price configured for {provider}/{model}"),
+            // Fixed text: the model is the client's (it is logged with the refusal).
+            "no price configured for this provider and model; unpriced models are refused (fail closed)",
         ),
         Outcome::BudgetDenied(d) => openai_error(
             StatusCode::PAYMENT_REQUIRED,
@@ -3173,7 +3290,38 @@ mod tests {
         assert!(msg.contains("connecting to Postgres"), "control: {msg}");
 
         type Case = (&'static str, &'static str, fn(&mut Config));
-        let cases: [Case; 18] = [
+        let cases: [Case; 21] = [
+            (
+                "additive thinking without a bound",
+                "thinking = \"additive\" needs max_thinking_tokens",
+                |c| {
+                    c.providers.models = vec![crate::config::ModelRuleConfig {
+                        upstream: "vertex".to_owned(),
+                        model: "gemini-2.5-pro".to_owned(),
+                        thinking: Some("additive".to_owned()),
+                        max_thinking_tokens: 0,
+                    }];
+                },
+            ),
+            (
+                "unknown model-rule upstream",
+                "upstream must be 'vertex' or 'vertex-openai'",
+                |c| {
+                    c.providers.models = vec![crate::config::ModelRuleConfig {
+                        upstream: "vertex_openai".to_owned(),
+                        model: "gemini-2.5-pro".to_owned(),
+                        thinking: Some("within_output_cap".to_owned()),
+                        max_thinking_tokens: 0,
+                    }];
+                },
+            ),
+            (
+                "gs:// in the bucket allowlist",
+                "is not a bucket name",
+                |c| {
+                    c.providers.media.gcs_buckets = vec!["gs://my-bucket".to_owned()];
+                },
+            ),
             ("short pepper", "at least 16 bytes", |c| {
                 c.security.api_key_pepper = "short".to_owned();
             }),
@@ -3367,6 +3515,9 @@ mod tests {
             ("bad request", "bad_request", || {
                 crate::gateway::Outcome::BadRequest("nope".to_owned())
             }),
+            ("forbidden source", "forbidden_source", || {
+                crate::gateway::Outcome::Forbidden(crate::providers::FORBIDDEN_SOURCE.to_owned())
+            }),
             ("unpriced", "unpriced", unpriced),
             ("budget", "budget_exceeded", denied),
             ("backend", "backend_error", || {
@@ -3402,6 +3553,16 @@ mod tests {
             ] {
                 assert_eq!(got, want, "{label} refusal on {route}");
             }
+        }
+
+        // A forbidden source is a 403 on every route.
+        for status in [
+            anthropic_outcome_response(crate::gateway::Outcome::Forbidden(String::new())).status(),
+            openai_outcome_response(crate::gateway::Outcome::Forbidden(String::new())).status(),
+            crate::gateway::outcome_response(crate::gateway::Outcome::Forbidden(String::new()))
+                .status(),
+        ] {
+            assert_eq!(status, StatusCode::FORBIDDEN);
         }
 
         // The BODY must not follow the header. An SDK resolves its exception
@@ -4191,6 +4352,29 @@ mod tests {
         assert!(notes.iter().all(|f| !f.counted), "{notes:?}");
         assert!(unmatchable_budgets(&vertex, &prices, enabled, false).is_empty());
 
+        // When the OpenAI-compatible route reaches Vertex, requests are scoped
+        // under the google/ id: a bare-id budget matches nothing, and the
+        // google/ one is not partial because of the bare price row.
+        let shim = unmatchable_budgets(
+            &[
+                budget(Scope::Model("openai:gemini-x".to_owned())),
+                budget(Scope::Model("openai:google/gemini-x".to_owned())),
+            ],
+            &prices,
+            enabled,
+            true,
+        );
+        assert_eq!(shim.len(), 1, "{shim:?}");
+        assert!(
+            shim[0].budget.starts_with("model:openai:gemini-x "),
+            "{shim:?}"
+        );
+        assert!(
+            shim[0].reason.contains("openai/google/gemini-x"),
+            "{shim:?}"
+        );
+        assert!(shim[0].counted, "{shim:?}");
+
         // A valid configuration reports nothing.
         let ok = unmatchable_budgets(
             &[
@@ -4363,6 +4547,14 @@ mod gate_tests {
         /// Point the Anthropic and OpenAI providers here instead of a closed
         /// port (a stub upstream).
         upstream: Option<String>,
+        /// Register a native Vertex provider pointed here, with the bucket
+        /// `tollgate-media` allowlisted.
+        vertex_upstream: Option<String>,
+        /// Build the OpenAI provider as the Vertex OpenAI-compatible route
+        /// (pointed at `upstream`) instead of a custom upstream.
+        openai_on_vertex: bool,
+        /// Replace the default price book (when the deployment is priced).
+        prices: Option<Vec<ModelPrice>>,
     }
 
     impl Default for Options {
@@ -4381,6 +4573,9 @@ mod gate_tests {
                 pg_keys: None,
                 db_acquire_timeout: Duration::from_millis(300),
                 upstream: None,
+                vertex_upstream: None,
+                openai_on_vertex: false,
+                prices: None,
             }
         }
     }
@@ -4418,14 +4613,16 @@ mod gate_tests {
             .build()
             .expect("client builds");
         let openai = d.openai.then(|| {
-            Arc::new(OpenAiProvider::custom(
-                http.clone(),
-                http.clone(),
-                opts.upstream
-                    .clone()
-                    .unwrap_or_else(|| CLOSED_HTTP.to_owned()),
-                "test-key".to_owned(),
-            ))
+            let base = opts
+                .upstream
+                .clone()
+                .unwrap_or_else(|| CLOSED_HTTP.to_owned());
+            Arc::new(if opts.openai_on_vertex {
+                OpenAiProvider::vertex(http.clone(), http.clone(), "p", "global", "t".to_owned())
+                    .with_base_url(base)
+            } else {
+                OpenAiProvider::custom(http.clone(), http.clone(), base, "test-key".to_owned())
+            })
         });
         let anthropic = d.anthropic.then(|| {
             Arc::new(crate::providers::AnthropicProvider::new(
@@ -4449,11 +4646,29 @@ mod gate_tests {
                 p.clone() as Arc<dyn Provider>,
             );
         }
-        let prices = if d.priced {
+        if let Some(base) = &opts.vertex_upstream {
+            providers.insert(
+                PROVIDER_VERTEX.to_owned(),
+                Arc::new(
+                    crate::providers::VertexProvider::new(
+                        http.clone(),
+                        "p".to_owned(),
+                        "global".to_owned(),
+                        "test-token".to_owned(),
+                    )
+                    .with_base(base.clone())
+                    .with_gcs_buckets(vec!["tollgate-media".to_owned()]),
+                ),
+            );
+        }
+        let prices = if let (true, Some(rows)) = (d.priced, opts.prices) {
+            PriceBook::from_prices(rows)
+        } else if d.priced {
             PriceBook::from_prices(vec![
                 ModelPrice::new(PROVIDER_MOCK, "demo", 3_000_000, 15_000_000),
                 ModelPrice::new(PROVIDER_ANTHROPIC, "m", 3_000_000, 15_000_000),
                 ModelPrice::new(PROVIDER_OPENAI, "m", 3_000_000, 15_000_000),
+                ModelPrice::new(PROVIDER_VERTEX, "gemini-3.8-flash", 3_000_000, 15_000_000),
             ])
         } else {
             PriceBook::from_prices(Vec::new())
@@ -5331,6 +5546,114 @@ mod gate_tests {
         }
     }
 
+    /// On the Vertex OpenAI-compatible route a bare id is the `google/` model:
+    /// it is charged at, budgeted under and recorded as the `google/` row, and a
+    /// bare-id price row alone leaves it unpriced.
+    #[tokio::test]
+    async fn a_bare_vertex_openai_id_is_charged_at_the_google_price() {
+        const ANSWER: &str = r#"{"id":"c1","object":"chat.completion","model":"google/gemini-3.8-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}"#;
+        async fn send(h: &Harness, model: &str) -> Response {
+            let body = json!({
+                "model": model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+            .to_string();
+            h.send(with(
+                request(&Method::POST, "/v1/chat/completions", Body::from(body)),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await
+        }
+        let (upstream, seen) = recording_upstream(ANSWER).await;
+        let h = harness(Options {
+            upstream: Some(upstream.clone()),
+            openai_on_vertex: true,
+            prices: Some(vec![
+                ModelPrice::new(
+                    PROVIDER_OPENAI,
+                    "google/gemini-3.8-flash",
+                    3_000_000,
+                    15_000_000,
+                ),
+                ModelPrice::new(PROVIDER_OPENAI, "gemini-3.8-flash", 1_000_000, 1_000_000),
+            ]),
+            ..Options::default()
+        });
+        for model in ["gemini-3.8-flash", "google/gemini-3.8-flash"] {
+            assert_eq!(send(&h, model).await.status(), StatusCode::OK, "{model}");
+        }
+        let events = h.usage.snapshot();
+        assert_eq!(events.len(), 2, "{events:?}");
+        for e in &events {
+            assert_eq!(e.model, "google/gemini-3.8-flash", "{e:?}");
+            // 1000 x 3 + 100 x 15, at the google/ row; the bare row would be 1100.
+            assert_eq!(e.cost_micros, 4_500, "{e:?}");
+        }
+        for (_, _, body) in seen.lock().unwrap().iter() {
+            let sent: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(sent["model"], "google/gemini-3.8-flash");
+        }
+
+        // Only a bare-id row: the bare id is unpriced, and nothing is sent.
+        let (upstream, seen) = recording_upstream(ANSWER).await;
+        let h = harness(Options {
+            upstream: Some(upstream),
+            openai_on_vertex: true,
+            prices: Some(vec![ModelPrice::new(
+                PROVIDER_OPENAI,
+                "gemini-3.8-flash",
+                1_000_000,
+                1_000_000,
+            )]),
+            ..Options::default()
+        });
+        let resp = send(&h, "gemini-3.8-flash").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_refusal_headers(&resp, "unpriced", "bare id, bare row only");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// A bare-id `openai` price row is reported once when the route reaches
+    /// Vertex, not again while it stands, and never for a custom upstream.
+    #[test]
+    fn a_bare_openai_price_row_is_reported_when_the_route_reaches_vertex() {
+        const MESSAGE: &str = "openai price rows with a bare model id match no request: \
+             /v1/chat/completions reaches Vertex, and requests are priced, budgeted and \
+             recorded under the google/-prefixed id. Re-price these models as google/<id>";
+        let prices = PriceBook::from_prices([
+            ModelPrice::new(PROVIDER_OPENAI, "gemini-x", 1, 1),
+            ModelPrice::new(PROVIDER_OPENAI, "google/gemini-y", 1, 1),
+            ModelPrice::new(PROVIDER_ANTHROPIC, "claude-z", 1, 1),
+        ]);
+        let log = Captured::default();
+        let _guard = log.install(tracing::Level::WARN);
+        let warned = |log: &Captured| {
+            log.lines()
+                .into_iter()
+                .filter(|l| l["fields"]["message"] == MESSAGE)
+                .collect::<Vec<_>>()
+        };
+
+        // A custom upstream: every row can match.
+        let mut last = Vec::new();
+        let custom = unreachable_openai_prices(&prices, false);
+        assert!(custom.is_empty());
+        assert!(!report_unreachable_prices(&mut last, custom));
+        assert!(warned(&log).is_empty());
+
+        // Vertex: the bare row is named, at WARN, once.
+        let vertex = unreachable_openai_prices(&prices, true);
+        assert_eq!(vertex, ["gemini-x"]);
+        assert!(report_unreachable_prices(&mut last, vertex.clone()));
+        assert!(!report_unreachable_prices(&mut last, vertex));
+        let lines = warned(&log);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["fields"]["models"], "gemini-x");
+    }
+
     /// One provider answer, as the client should see it on every route.
     struct Refusal {
         status: u16,
@@ -5848,5 +6171,259 @@ mod gate_tests {
                 assert!(!body_text(resp).await.contains(SENTINEL), "{path} {body}");
             }
         }
+    }
+
+    /// Requests a recording stub received: path, headers, body.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, HeaderMap, String)>>>;
+
+    /// A local upstream that records every request and answers each with one
+    /// canned JSON body.
+    async fn recording_upstream(body: &'static str) -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let s = seen.clone();
+        let app = Router::new().fallback(
+            move |uri: axum::http::Uri, headers: HeaderMap, req_body: String| {
+                let s = s.clone();
+                async move {
+                    s.lock()
+                        .unwrap()
+                        .push((uri.path().to_owned(), headers, req_body));
+                    ([(header::CONTENT_TYPE, "application/json")], body)
+                }
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The native Vertex route the harness can reach.
+    const VERTEX_PATH: &str =
+        "/v1/vertex/publishers/google/models/gemini-3.8-flash:generateContent";
+
+    fn vertex_file_body(uri: &str) -> String {
+        json!({
+            "contents": [{"role": "user", "parts": [
+                {"text": "summarise"},
+                {"fileData": {"mimeType": "application/pdf", "fileUri": uri}}
+            ]}],
+            "generationConfig": {"maxOutputTokens": 16}
+        })
+        .to_string()
+    }
+
+    /// The live hole this closes: under `exact` admission a `gs://` URI used to
+    /// be forwarded as sent, and Vertex read it on the operator's behalf (the
+    /// exact Google principal is unverified).
+    /// Now a bucket off the allowlist is a 403 before anything reaches Google,
+    /// the pre-flight count included (`countTokens` would read the object too).
+    #[tokio::test]
+    async fn a_gs_uri_off_the_allowlist_is_refused_before_any_provider_call() {
+        let (upstream, seen) = recording_upstream(
+            r#"{"totalTokens":5,"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1,"totalTokenCount":6}}"#,
+        )
+        .await;
+        let base = Options::default().deployment;
+        for exact in [true, false] {
+            let h = harness(Options {
+                vertex_upstream: Some(upstream.clone()),
+                deployment: Deployment { exact, ..base },
+                ..Options::default()
+            });
+            for uri in [
+                "gs://operator-private-bucket/secret.pdf",
+                "gs://tollgate-media/../operator-private-bucket/secret.pdf",
+                "ftp://example.com/a.pdf",
+                "https://storage.googleapis.com/operator-private-bucket/secret.pdf",
+                "https://operator-private-bucket.storage.googleapis.com/secret.pdf",
+                "https://storage.cloud.google.com/operator-private-bucket/secret.pdf",
+            ] {
+                let resp = h
+                    .send(with(
+                        request(
+                            &Method::POST,
+                            VERTEX_PATH,
+                            Body::from(vertex_file_body(uri)),
+                        ),
+                        "x-tollgate-key",
+                        &h.key,
+                    ))
+                    .await;
+                let ctx = format!("exact={exact} {uri}");
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{ctx}");
+                assert_eq!(
+                    resp.headers()["x-tollgate-reason"],
+                    "forbidden_source",
+                    "{ctx}"
+                );
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], crate::providers::FORBIDDEN_SOURCE, "{ctx}");
+                assert!(!v.to_string().contains("operator-private-bucket"), "{ctx}");
+            }
+            // Remote https media is a 400 until it can be bounded.
+            let resp = h
+                .send(with(
+                    request(
+                        &Method::POST,
+                        VERTEX_PATH,
+                        Body::from(vertex_file_body("https://example.com/a.pdf")),
+                    ),
+                    "x-tollgate-key",
+                    &h.key,
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "exact={exact}");
+            let v = body_json(resp).await;
+            assert!(!v.to_string().contains("example.com"), "exact={exact}");
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "exact={exact}: nothing reached Google"
+            );
+        }
+
+        // The allowlisted bucket passes, and under `exact` it is counted first.
+        let h = harness(Options {
+            vertex_upstream: Some(upstream.clone()),
+            deployment: Deployment {
+                exact: true,
+                ..base
+            },
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(
+                    &Method::POST,
+                    VERTEX_PATH,
+                    Body::from(vertex_file_body("gs://tollgate-media/report.pdf")),
+                ),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].ends_with(":countTokens"), "{paths:?}");
+        assert!(paths[1].ends_with(":generateContent"), "{paths:?}");
+
+        // Fast admission still refuses external media it cannot size.
+        let h = harness(Options {
+            vertex_upstream: Some(upstream),
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(
+                    &Method::POST,
+                    VERTEX_PATH,
+                    Body::from(vertex_file_body("gs://tollgate-media/report.pdf")),
+                ),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers()["x-tollgate-reason"], "bad_request");
+        // Under every spelling the adapter forwards as `fileData`, and under
+        // the loose spellings it refuses: none reaches Google in fast mode.
+        let before = seen.lock().unwrap().len();
+        for (data, uri) in [
+            ("file_data", "file_uri"),
+            ("fileData", "file_uri"),
+            ("file__data", "file__uri"),
+            ("File__Data", "fileUri"),
+            ("file_data_", "fileUri"),
+        ] {
+            let body = format!(
+                r#"{{"contents":[{{"role":"user","parts":[{{"{data}":{{"mimeType":"application/pdf","{uri}":"gs://tollgate-media/report.pdf"}}}}]}}],"generationConfig":{{"maxOutputTokens":16}}}}"#
+            );
+            let resp = h
+                .send(with(
+                    request(&Method::POST, VERTEX_PATH, Body::from(body)),
+                    "x-tollgate-key",
+                    &h.key,
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{data}/{uri}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), before, "nothing reached Google");
+    }
+
+    /// Allowlisted betas reach the provider on the Messages call, buffered and
+    /// streamed, from every header instance, deduplicated. The count under
+    /// `exact` admission does not carry them.
+    #[tokio::test]
+    async fn validated_betas_are_forwarded_on_messages_only() {
+        let (upstream, seen) = recording_upstream(
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"input_tokens":3,"usage":{"input_tokens":3,"output_tokens":1}}"#,
+        )
+        .await;
+        let base = Options::default().deployment;
+        let h = harness(Options {
+            upstream: Some(upstream),
+            deployment: Deployment {
+                exact: true,
+                ..base
+            },
+            ..Options::default()
+        });
+        for body in [ROUTES[0].1, ROUTES[1].1] {
+            let req = with(
+                with(
+                    request(&Method::POST, "/v1/messages", Body::from(body)),
+                    "anthropic-beta",
+                    "prompt-caching-2024-07-31, pdfs-2024-09-25",
+                ),
+                "anthropic-beta",
+                "pdfs-2024-09-25",
+            );
+            let _ = h.send(with(req, "x-tollgate-key", &h.key)).await;
+        }
+        let seen = seen.lock().unwrap();
+        let betas = |i: usize| -> Vec<String> {
+            seen[i]
+                .1
+                .get_all("anthropic-beta")
+                .iter()
+                .map(|v| v.to_str().unwrap().to_owned())
+                .collect()
+        };
+        // count, messages (buffered), count, messages (stream).
+        assert_eq!(seen.len(), 4);
+        for i in [0, 2] {
+            assert_eq!(seen[i].0, "/v1/messages/count_tokens");
+            assert!(betas(i).is_empty(), "the count carries no beta");
+        }
+        for i in [1, 3] {
+            assert_eq!(seen[i].0, "/v1/messages");
+            assert_eq!(betas(i), vec!["prompt-caching-2024-07-31,pdfs-2024-09-25"]);
+        }
+    }
+
+    /// The refusal of an unknown beta is fixed text: the client's string is not
+    /// repeated back.
+    #[tokio::test]
+    async fn an_unknown_beta_is_refused_without_echoing_it() {
+        let h = harness(Options::default());
+        let resp = h
+            .send(with(
+                with(
+                    request(&Method::POST, "/v1/messages", Body::from(ROUTES[0].1)),
+                    "anthropic-beta",
+                    "pdfs-2024-09-25,context-1m-<script>",
+                ),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers()["x-tollgate-reason"], "bad_request");
+        let text = body_text(resp).await;
+        assert!(!text.contains("context-1m"), "{text}");
+        assert!(!text.contains("<script>"), "{text}");
     }
 }

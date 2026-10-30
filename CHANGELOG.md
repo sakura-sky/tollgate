@@ -15,7 +15,15 @@ verbatim.
 
 Upgrading: `serve` now refuses `TOLLGATE_DATABASE__MAX_CONNECTIONS` below 4, an
 `ACQUIRE_TIMEOUT` outside 1 ms to 2147483647 ms, and a Postgres connection that
-drops startup options (see Changed).
+drops startup options (see Changed). Gemini models other than
+`gemini-3.8-flash` need a `[[providers.models]]` thinking row, an explicit
+`service_tier` other than the string `"default"` is refused on
+`/v1/chat/completions`, native Vertex requests are checked against an
+allowlist, `https://` media and client `labels` on native Vertex are refused
+by default, Gemini model ids are matched without case (see Changed), camelCase
+keys are refused on `/v1/chat/completions` with `upstream = vertex`, a bare
+model id there is priced and budgeted as `google/<id>` (see Changed), and native
+Vertex `maxOutputTokens: 0` is refused (see Security).
 
 ### Security
 
@@ -50,6 +58,65 @@ drops startup options (see Changed).
   a `502` `upstream_error` before the stream starts, charged its reservation.
   A buffered `200` whose body is an error (not a JSON object, a non-null
   top-level `error`, or Anthropic's `"type": "error"`) is a `502` too.
+- Native Vertex `fileData` URIs are checked in both admission modes. This
+  closes a code-level hole: under `exact` admission the gateway forwarded any
+  `fileUri` as sent, so a key holder could have Vertex read, on the operator's
+  behalf, any object the operator's project can see. There is no evidence it
+  was exploited. Which Google identity performs the read is unverified (probe
+  P5). A `gs://` URI is now accepted only in a bucket
+  listed in `providers.media.gcs_buckets` (empty by default); a URI on a
+  `googleapis.com` host or `storage.cloud.google.com` (Cloud Storage over
+  https, which would reach a bucket off the allowlist), a URI carrying
+  credentials, and any other scheme are refused with a `403` and the new reason
+  `forbidden_source`, before the pre-flight count and with fixed text that does
+  not repeat the URI.
+- Breaking: other `https://` `fileData` URIs on native Vertex are refused with
+  a `400` until media support lands. Remote media is unbounded and what a URL
+  serves can change between the pre-flight count and the generation, so no
+  reservation can bound it.
+- Breaking: `labels` on native Vertex are refused unless the operator sets
+  `providers.vertex.allow_client_labels = true` (default false;
+  `TOLLGATE_PROVIDERS__VERTEX__ALLOW_CLIENT_LABELS`), because they land in the
+  operator's billing export. When allowed, the 64-entry and 63-character limits
+  apply.
+- Native Vertex keys in Google-defined objects must be strict lowerCamelCase or
+  strict snake_case. Looser spellings Google also reads (`file__data`,
+  `File_Data`, `file_data_`) were rewritten to `fileData` on the forwarded body
+  while `fast` admission read the client's bytes and saw no media; they are now
+  refused with a `400`, and `fast` admission decides on the body that is
+  forwarded. The media check also ignores case and underscores in keys.
+- On `/v1/chat/completions` with `upstream = vertex`, a message `content`
+  array may carry only `{"type": "text", "text": ...}` parts; any other part
+  type (`file`, `input_file`, `file_url`, `imageUrl`, ...) or an extra key in a
+  part is a `400`. String content is unchanged.
+- Refusals for a bad upstream path or a native Vertex path without a model no
+  longer repeat the client's path.
+- The refusal of an unknown `anthropic-beta` value no longer repeats the
+  client's string.
+- Breaking: on `/v1/chat/completions` with `upstream = vertex`, a top-level
+  key containing an uppercase ASCII letter is a `400`, as is one inside
+  `google`, `extra_body`, `extra_body.google` or `thinking_config`. Vertex may
+  read camelCase aliases (`maxTokens`, `extraBody`, `candidateCount`,
+  `serviceTier`) that bypassed the snake_case checks and the reservation. In
+  the same objects, a key that matches a checked field once case and
+  underscores are ignored but is not spelled exactly as it (`maxtokens`,
+  `max__tokens`, `max_tokens_`, `service__tier`), or two keys that differ only
+  in case or underscores, is also a `400`. A custom upstream is unchanged.
+- Breaking: native Vertex `generationConfig.maxOutputTokens: 0` is a `400`.
+  Google may read 0 as unset, leaving generation uncapped behind its
+  reservation. (`max_tokens` / `max_completion_tokens` of 0 on
+  `/v1/chat/completions` already reserve and forward the 4096 default.)
+- Native Vertex: two keys in one Google-defined object that differ only in
+  case or underscores (`fileDATA` beside `fileData`, `pARTS` beside `parts`)
+  are a `400`; Google's choice between them is not documented, so the media
+  check could have read a different one. `videoMetadata`, `executableCode`,
+  `codeExecutionResult`, a part's `mediaResolution` and the `parts` of a
+  `functionResponse` are now canonicalised and checked like the other
+  Google-defined objects. A `fileData` that is not an object is a `403`.
+- On `/v1/messages` and `/v1/chat/completions`, the refusals of a
+  `cache_control` TTL and of an unpriced model no longer repeat the client's
+  TTL or model id. The legacy `/v1/{provider}` route's unpriced refusal still
+  returns the client's own `model` field in its body, unchanged from before.
 
 ### Added
 
@@ -64,6 +131,11 @@ drops startup options (see Changed).
   with the request id, the provider's error type and code, and the provider's
   own request id. The provider's body is opt-in at TRACE under
   `tollgate::upstream_body` and never exported over OTLP.
+- `x-tollgate-reason: forbidden_source` on a `403`, on every route.
+- Config: `providers.media.gcs_buckets`, the `[[providers.models]]` table
+  (`upstream`, `model`, `thinking`, `max_thinking_tokens`),
+  `providers.openai.pin_service_tier` and
+  `providers.vertex.allow_client_labels`. See `docs/OPERATIONS.md`.
 
 ### Fixed
 
@@ -71,8 +143,78 @@ drops startup options (see Changed).
   lookup over its deadline) is a `503` with `x-tollgate-reason: backend_error`,
   not a `401`. A lookup that hit a schema mismatch is the same `503` rather than
   a panic.
+- `generationConfig.candidateCount` above 1 on native Vertex was reserved as
+  one candidate and could settle at several times its reservation. It is now
+  refused, like `n > 1` on `/v1/chat/completions`.
+- Allowlisted `anthropic-beta` values were accepted on `/v1/messages` and then
+  dropped, so a request depending on one silently did not get it. They are now
+  forwarded on the Messages call, buffered and streaming (every header
+  instance, comma-split, deduplicated), and not on the `exact` pre-flight
+  count.
 
 ### Changed
+
+- Breaking: on `/v1/chat/completions` with `upstream = vertex`, a bare model id
+  is priced, budgeted, recorded in the ledger and logged under the
+  `google/`-prefixed id it is forwarded as, so `gemini-x` and `google/gemini-x`
+  are one model with one price. Each spelling used to take its own price row and
+  `model:` budget, so a client could pick the cheaper row or step around a
+  model-scoped budget by changing spelling. Re-price bare ids as `google/<id>`
+  under provider `openai`, and move `model:openai:<id>` budgets to
+  `model:openai:google/<id>`: a bare-id price row or budget now matches nothing,
+  and the gateway logs a warning naming each such price row at startup and on
+  the reload that changes the set, and counts each such budget in
+  `tollgate_unmatchable_budgets`. Ledger rows written before the change keep the
+  spelling they were recorded under. A custom upstream is unchanged.
+- Breaking: a Gemini model on either Vertex route (native, or
+  `/v1/chat/completions` with `upstream = vertex`) is refused with a `400`
+  unless a thinking rule covers it. Only `gemini-3.8-flash` (and
+  `google/gemini-3.8-flash`) is built in, as `within_output_cap`, because only
+  it was proven live to count thinking against the output cap. Add a
+  `[[providers.models]]` row for any other: `within_output_cap`, or `additive`
+  with `max_thinking_tokens`, which reserves that many more output tokens (or
+  the request's larger explicit thinking budget). `additive` without
+  `max_thinking_tokens` refuses startup.
+- Gemini model ids are matched without ASCII case, for the Gemini check and the
+  thinking-rule lookup, on both Vertex routes. On `vertex-openai` a rule is
+  looked up by the id that is forwarded, so a bare `gemini-x` and
+  `google/gemini-x` share one rule (an operator row for either covers both),
+  and two rows that name the same forwarded model in any case or spelling
+  refuse startup.
+- A request body carrying an integer outside the 64-bit signed and unsigned
+  ranges is refused with a `400` on native Vertex (checked as a parsed value),
+  `/v1/chat/completions` and `/v1/messages` (re-serialised before they are
+  forwarded), rather than checked or forwarded as the nearest float.
+- Breaking: on `/v1/chat/completions` a `service_tier` that is present and not
+  exactly the string `"default"` is refused, including `"auto"`, `null`,
+  numbers, arrays and other casings. A custom upstream at
+  `api.openai.com` now gets `service_tier: "default"` on every request
+  (`providers.openai.pin_service_tier`, default on for that host only). Vertex
+  never gets the field.
+- Breaking: native Vertex requests are checked against an allowlist. Top-level
+  `cachedContent`, `routingConfig`, `modelConfig`, `modelArmorConfig`, `model`
+  and unknown fields are refused; `tools` may carry only
+  `functionDeclarations`, `toolConfig` only `functionCallingConfig`;
+  `generationConfig` accepts the text-generation fields listed in the README
+  (`responseModalities` only `["TEXT"]`, `thinkingBudget` -1 or more), and
+  `labels` only when the operator allows them (see Security). Duplicate JSON keys and
+  two spellings of one field are refused, and keys in Google's own objects must
+  be strict lowerCamelCase or snake_case. The checks run on the parsed body with
+  those objects read as camelCase; the client's bytes are then forwarded
+  unchanged (key order in schemas included), which is the same request
+  because every ambiguous body was refused and Google's parser accepts both
+  spellings (a live check showed a snake_case `max_output_tokens` honoured).
+- On `/v1/chat/completions` with `upstream = vertex`, Google settings in a
+  top-level `google` object or a literal `extra_body.google` object are limited
+  to `thinking_config`; both at once, `cached_content`, and any other
+  `extra_body` member are refused. A top-level `cached_content` or
+  `candidate_count` is refused too (`400`, fixed text), since whether Vertex
+  reads either there is unverified. A custom upstream is unaffected.
+- `GatewayCore::evaluate_authenticated` takes the validated `anthropic-beta`
+  list, `AnthropicProvider::forward_stream` takes it too, `ParsedRequest` gains
+  `anthropic_beta` and `external_media`, and `ProviderError` and `Outcome`
+  gain `Forbidden`. The
+  crate is not published, so this only matters to a fork.
 
 - Streams: the client receives only `data:` and `event:` lines from the
   provider, re-terminated with LF; provider comments, `id:` and `retry:` lines
