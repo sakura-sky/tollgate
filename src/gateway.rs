@@ -412,6 +412,19 @@ impl Metrics {
     }
 }
 
+/// Whether a 2xx body is an error rather than a result: not a JSON object, a
+/// top-level `error` that is not `null`, or (Anthropic) `"type": "error"`. No
+/// provider's success body has any of these.
+#[must_use]
+pub fn body_is_an_error(provider_id: &str, body: &Value) -> bool {
+    let Some(object) = body.as_object() else {
+        return true;
+    };
+    object.get("error").is_some_and(|e| !e.is_null())
+        || (provider_id == crate::budget::PROVIDER_ANTHROPIC
+            && object.get("type").and_then(Value::as_str) == Some("error"))
+}
+
 /// `now - elapsed`, or `now` if that would precede the clock's origin.
 #[must_use]
 pub fn backdate(elapsed: std::time::Duration) -> std::time::Instant {
@@ -945,6 +958,21 @@ impl GatewayCore {
         // provider's and goes to the log only.
         if !is_success {
             let fault = classify_upstream_status(resp.status, resp.meta.retry_after_secs);
+            log_upstream_refusal(
+                request_id,
+                provider_id,
+                &parsed.model,
+                resp.status,
+                fault,
+                &RefusalDetail::from_value(&resp.meta, &resp.body),
+            );
+            return Outcome::UpstreamRefused(fault);
+        }
+        // A 2xx that is really an error (a proxy, or an upstream answering 200
+        // with an error body) is not passed on either: its text is the
+        // provider's. Settled as above, like any 2xx.
+        if body_is_an_error(provider_id, &resp.body) {
+            let fault = UpstreamFault::Provider;
             log_upstream_refusal(
                 request_id,
                 provider_id,
@@ -1668,6 +1696,40 @@ mod tests {
             assert_eq!(events[0].decision, "error", "{status}");
             assert_eq!(events[0].cost_micros, 0, "{status}");
         }
+    }
+
+    /// What counts as an error body on a 2xx.
+    #[test]
+    fn an_error_shaped_2xx_body_is_recognised() {
+        use serde_json::json;
+        let anthropic = crate::budget::PROVIDER_ANTHROPIC;
+        assert!(body_is_an_error(
+            "openai",
+            &json!({"error": {"message": "x"}})
+        ));
+        assert!(body_is_an_error("openai", &json!({"error": "x"})));
+        assert!(body_is_an_error("openai", &json!([{"error": {}}])));
+        assert!(body_is_an_error("openai", &json!("text")));
+        assert!(body_is_an_error(
+            anthropic,
+            &json!({"type": "error", "error": {}})
+        ));
+        assert!(body_is_an_error(anthropic, &json!({"type": "error"})));
+        // Successes.
+        assert!(!body_is_an_error(
+            "openai",
+            &json!({"choices": [], "error": null})
+        ));
+        assert!(!body_is_an_error(
+            anthropic,
+            &json!({"type": "message", "content": []})
+        ));
+        assert!(!body_is_an_error("vertex", &json!({"candidates": []})));
+        // `type: error` is Anthropic's convention only.
+        assert!(!body_is_an_error(
+            "openai",
+            &json!({"type": "error", "choices": []})
+        ));
     }
 
     /// A non-2xx can never leave through a success arm, in release builds too.

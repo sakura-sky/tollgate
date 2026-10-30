@@ -182,6 +182,28 @@ limit, and a `429` with no Retry-After and the error code
 current documentation). Read the WARN lines'
 `provider_error_type` and `provider_error_code` before blaming clients.
 
+Inside a stream that began with `200`, an error event (or anything the relay
+cannot classify as safe) ends the client's stream with one fixed error event,
+and one WARN line is logged per stream, `upstream stream error; ending the
+client's stream and metering on`, with `request_id`, `provider`, `model`,
+`reason` (`error_event`, `unclassifiable`, `unknown_event_name` or
+`over_limit`), `event_name`, and the provider's cleaned error type and code.
+The event's joined data so far (up to 2 KiB; for `over_limit`, without the
+over-long line) is at TRACE under `tollgate::upstream_body`. The
+`stream settled` line for that stream carries the same reason as
+`client_ended`. On `/v1/messages`, `unknown_event_name` means Anthropic sent an
+event name outside the eight it documents, usually a new event type; streams
+using it end early until Tollgate is updated, which is the fail-closed choice.
+On `/v1/chat/completions` any event name gives that reason, as neither OpenAI
+nor Vertex names its events.
+
+A `200` on a stream route that is not an event stream (or is compressed) is
+logged at WARN, `upstream answered a stream request without a plain event
+stream; charging the reservation`, with the reason and the cleaned media type.
+
+The relay drops a provider's SSE comments (keepalives) and sends its own fixed
+`:` comment instead, at most every 15 seconds.
+
 A provider `401`, `403`, `404`, or any other non-2xx outside `400`, `413`, `422`
 and `429`, reaches the client as `502`, so each one
 also produces tower-http's ERROR `response failed` line, as Tollgate's own

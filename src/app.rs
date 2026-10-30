@@ -1214,7 +1214,8 @@ pub(crate) fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Re
 /// verbatim so OpenAI clients, LiteLLM, and ADK agents work unchanged.
 ///
 /// Streaming (`stream: true`) is dispatched to [`openai_chat_stream`], which
-/// relays the upstream SSE and meters usage as [`OpenAiStreamMeter`] describes.
+/// meters the upstream SSE as [`OpenAiStreamMeter`] describes and relays the
+/// events [`crate::sse_redact`] classifies as safe.
 /// Buffered requests run the shared [`GatewayCore::evaluate`] flow unchanged.
 async fn openai_chat(
     State(state): State<AppState>,
@@ -1484,6 +1485,23 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
         let fault = stream_refusal(upstream, &request_id, PROVIDER_ANTHROPIC, &parsed.model);
         return anthropic_outcome_response(crate::gateway::Outcome::UpstreamRefused(fault));
     }
+    // A 2xx that is not a plain event stream cannot be checked event by event,
+    // so it is never relayed. It may have been billed: charge the reservation.
+    if let Some(reason) = not_an_event_stream(upstream.headers()) {
+        guard
+            .settle(reserve_micros, Usage::default(), "estimated")
+            .await;
+        non_stream_body(
+            upstream,
+            &request_id,
+            PROVIDER_ANTHROPIC,
+            &parsed.model,
+            reason,
+        );
+        return anthropic_outcome_response(crate::gateway::Outcome::UpstreamRefused(
+            UpstreamFault::Provider,
+        ));
+    }
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(
@@ -1495,11 +1513,12 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
             reserve_micros,
             prompt_floor_micros,
             StreamMeter::Anthropic {
-                line_buf: Vec::new(),
+                lines: LineSplitter::default(),
                 meter: crate::providers::AnthropicStreamMeter::new(),
             },
             PROVIDER_ANTHROPIC,
             parsed.model,
+            request_id,
         )
         // The relay outlives the handler; keep it in the request's span so
         // `stream settled` and its warnings carry the request id.
@@ -1697,6 +1716,23 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
         let fault = stream_refusal(upstream, &request_id, PROVIDER_OPENAI, &parsed.model);
         return openai_outcome_response(crate::gateway::Outcome::UpstreamRefused(fault));
     }
+    // A 2xx that is not a plain event stream cannot be checked event by event,
+    // so it is never relayed. It may have been billed: charge the reservation.
+    if let Some(reason) = not_an_event_stream(upstream.headers()) {
+        guard
+            .settle(reserve_micros, Usage::default(), "estimated")
+            .await;
+        non_stream_body(
+            upstream,
+            &request_id,
+            PROVIDER_OPENAI,
+            &parsed.model,
+            reason,
+        );
+        return openai_outcome_response(crate::gateway::Outcome::UpstreamRefused(
+            UpstreamFault::Provider,
+        ));
+    }
 
     // Relay: bounded channel gives natural backpressure (a slow client throttles
     // upstream reads). The spawned task owns the guard and settles at its single
@@ -1721,6 +1757,7 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
             meter,
             PROVIDER_OPENAI,
             parsed.model,
+            request_id,
         )
         // The relay outlives the handler; keep it in the request's span so
         // `stream settled` and its warnings carry the request id.
@@ -1795,11 +1832,12 @@ impl StreamEnd {
     }
 }
 
-/// Relay upstream SSE chunks to the client while metering usage, then settle the
+/// Meter the upstream SSE stream and relay the events the
+/// [`crate::sse_redact::SseRedactor`] passes to the client, then settle the
 /// [`Settlement`] guard exactly once: the measured cost when the meter says the
 /// provider reported its final usage and finished, otherwise the FULL
 /// reservation (never under-charge). Enforces an idle timeout, a max total
-/// duration, and a bounded line-reassembly buffer so a hostile or hung upstream
+/// duration, and bounded line and event buffers so a hostile or hung upstream
 /// cannot grief the gateway.
 #[allow(clippy::too_many_arguments)]
 async fn relay_stream(
@@ -1815,15 +1853,65 @@ async fn relay_stream(
     mut meter: StreamMeter,
     provider: &'static str,
     model: String,
+    request_id: String,
 ) {
-    let (end, drained) = relay_body(upstream.bytes_stream(), &tx, &mut meter, RELAY_LIMITS).await;
+    let surface = match meter {
+        StreamMeter::OpenAi(_) => crate::sse_redact::StreamSurface::OpenAi,
+        StreamMeter::Anthropic { .. } => crate::sse_redact::StreamSurface::Anthropic,
+    };
+    let mut redactor = crate::sse_redact::SseRedactor::new(surface, request_id, provider, &*model);
+    let (end, drained) = relay_body(
+        upstream.bytes_stream(),
+        &tx,
+        &mut meter,
+        &mut redactor,
+        RELAY_LIMITS,
+    )
+    .await;
     if meter.is_clean() && !meter.usage_seen() {
         tracing::warn!("stream ended cleanly without any usage; charging reservation");
     }
     let (actual, usage, decision) =
         choose_settlement(&meter, &price, reserve_micros, prompt_floor_micros);
-    log_stream_settlement(provider, &model, end, drained, &meter, decision);
+    log_stream_settlement(
+        provider,
+        &model,
+        end,
+        drained,
+        &meter,
+        decision,
+        redactor.ended(),
+    );
     guard.settle(actual, usage, decision).await;
+}
+
+/// The least time between two keepalives the relay sends in place of the
+/// upstream's dropped comments.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Send a fixed SSE comment in place of an upstream keepalive the redactor
+/// dropped, so proxies between Tollgate and the client still see traffic. Never
+/// waits: a full channel skips it, and a closed one is the client gone.
+fn keepalive(
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    redactor: &mut crate::sse_redact::SseRedactor,
+    last: &mut Option<tokio::time::Instant>,
+) -> Option<StreamEnd> {
+    if !redactor.take_keepalive() || redactor.silent() {
+        return None;
+    }
+    let now = tokio::time::Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < KEEPALIVE_INTERVAL) {
+        return None;
+    }
+    match tx.try_send(Ok(Bytes::from_static(b":\n\n"))) {
+        Ok(()) => {
+            *last = Some(now);
+            None
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => None,
+        Err(mpsc::error::TrySendError::Closed(_)) => Some(StreamEnd::ClientGone),
+    }
 }
 
 /// The relay loop, separated from settlement so tests can drive it with a
@@ -1839,12 +1927,15 @@ async fn relay_stream(
 /// into a reservation charge. So after the finish, a failed or timed-out send
 /// stops forwarding but keeps reading the upstream, for at most
 /// [`RelayLimits::drain`], until the end marker. Before the finish it stops at
-/// once, as it always has: draining mid-generation would make the provider bill
+/// once, as it always has (unless the client's stream was already ended by the
+/// redactor, after which the client leaving changes nothing): draining
+/// mid-generation would make the provider bill
 /// an answer nobody reads.
 async fn relay_body<S, E>(
     mut stream: S,
     tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     meter: &mut StreamMeter,
+    redactor: &mut crate::sse_redact::SseRedactor,
     limits: RelayLimits,
 ) -> (StreamEnd, bool)
 where
@@ -1853,6 +1944,7 @@ where
 {
     let deadline = tokio::time::Instant::now() + limits.max;
     let mut drain_until: Option<tokio::time::Instant> = None;
+    let mut last_keepalive: Option<tokio::time::Instant> = None;
     loop {
         let mut wait_until = (tokio::time::Instant::now() + limits.idle).min(deadline);
         if let Some(d) = drain_until {
@@ -1874,6 +1966,11 @@ where
             }
             Ok(None) => {
                 meter.finish_input();
+                // A held event that was complete apart from its blank line.
+                let tail = redactor.end();
+                if !draining && !tail.is_empty() {
+                    let _ = tokio::time::timeout_at(wait_until, tx.send(Ok(tail))).await;
+                }
                 return (StreamEnd::Eof, draining);
             }
             Ok(Some(Err(e))) => {
@@ -1896,20 +1993,50 @@ where
                     }
                     continue;
                 }
-                // Relay downstream, bounded by the SAME idle/duration deadline as
-                // the upstream read: a client that stops reading fills the bounded
-                // channel and would otherwise park this task (and hold the
-                // reservation and upstream connection) indefinitely.
-                let cut = match tokio::time::timeout_at(wait_until, tx.send(Ok(chunk))).await {
-                    Ok(Ok(())) => None,
-                    Ok(Err(_)) => {
-                        tracing::debug!("stream client disconnected");
-                        Some(StreamEnd::ClientGone)
+                // Only what the redactor passes reaches the client: complete,
+                // safe events, or the one fixed error event that ends the
+                // client's stream (see `crate::sse_redact`). The meter above
+                // has already seen the provider's original bytes.
+                let mut out = redactor.push(&chunk);
+                if finished {
+                    // The end marker was metered; dispatch it even if its blank
+                    // line is still in flight.
+                    let tail = redactor.end();
+                    if !tail.is_empty() {
+                        out = [out, tail].concat().into();
                     }
-                    Err(_) => {
-                        tracing::warn!("stream client too slow to drain (idle/max duration)");
-                        Some(StreamEnd::SlowClient)
-                    }
+                }
+                let cut = if !out.is_empty() {
+                    // Relay downstream, bounded by the SAME idle/duration
+                    // deadline as the upstream read: a client that stops
+                    // reading fills the bounded channel and would otherwise
+                    // park this task (and hold the reservation and upstream
+                    // connection) indefinitely.
+                    let sent = match tokio::time::timeout_at(wait_until, tx.send(Ok(out))).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(_)) => {
+                            tracing::debug!("stream client disconnected");
+                            Some(StreamEnd::ClientGone)
+                        }
+                        Err(_) => {
+                            tracing::warn!("stream client too slow to drain (idle/max duration)");
+                            Some(StreamEnd::SlowClient)
+                        }
+                    };
+                    // Once the client's stream has been ended (its last event
+                    // just went), the client leaving changes nothing: metering
+                    // reads on to the provider's end, so what is charged does
+                    // not depend on the redaction.
+                    sent.filter(|_| redactor.ended().is_none())
+                } else if redactor.ended().is_some() {
+                    None
+                } else if tx.is_closed() {
+                    // Nothing to send this time, but a client that has gone
+                    // must still be noticed now, not at the next event.
+                    tracing::debug!("stream client disconnected");
+                    Some(StreamEnd::ClientGone)
+                } else {
+                    keepalive(tx, redactor, &mut last_keepalive)
                 };
                 // Nothing billable follows the end marker, so exit there rather
                 // than hold the upstream connection and the reservation open
@@ -1946,7 +2073,10 @@ fn log_stream_settlement(
     drained: bool,
     meter: &StreamMeter,
     decision: &str,
+    client_ended: Option<crate::sse_redact::Ended>,
 ) {
+    // Why the client's stream was ended early by the redactor, if it was.
+    let client_ended = client_ended.map_or("", crate::sse_redact::Ended::as_str);
     let finish_seen = meter.finish_seen();
     let usage_seen = meter.usage_seen();
     let done_seen = meter.is_clean();
@@ -1960,6 +2090,7 @@ fn log_stream_settlement(
             usage_seen,
             done_seen,
             decision,
+            client_ended,
             "stream settled"
         );
     } else {
@@ -1972,6 +2103,7 @@ fn log_stream_settlement(
             usage_seen,
             done_seen,
             decision,
+            client_ended,
             "stream settled"
         );
     }
@@ -1987,27 +2119,79 @@ fn log_stream_settlement(
 pub enum StreamMeter {
     OpenAi(OpenAiStreamMeter),
     Anthropic {
-        line_buf: Vec<u8>,
+        lines: LineSplitter,
         meter: crate::providers::AnthropicStreamMeter,
     },
+}
+
+/// Splits a meter's input into `\n`-terminated lines, holding a partial line
+/// across chunks.
+///
+/// Linear in the input however it is chunked: it remembers how far the held
+/// partial line has already been searched, so a provider sending one byte per
+/// frame does not make every chunk rescan the line from its start. A partial
+/// line longer than [`MAX_SSE_LINE_BUFFER`] is dropped, and the rest of it up to
+/// its newline is discarded rather than parsed as a line of its own.
+#[derive(Default)]
+pub struct LineSplitter {
+    buf: Vec<u8>,
+    /// Bytes at the start of `buf` already known to hold no newline.
+    scanned: usize,
+    discarding: bool,
+}
+
+impl LineSplitter {
+    /// Feed bytes. `on_line` gets each complete line, newline included, and
+    /// returns `true` to stop: the rest of the input is then dropped.
+    fn feed(&mut self, chunk: &[u8], mut on_line: impl FnMut(&[u8]) -> bool) {
+        self.buf.extend_from_slice(chunk);
+        let mut start = 0;
+        let mut from = self.scanned;
+        while let Some(rel) = self.buf[from..].iter().position(|&b| b == b'\n') {
+            let end = from + rel;
+            let skip = std::mem::take(&mut self.discarding);
+            let stop = !skip && on_line(&self.buf[start..=end]);
+            start = end + 1;
+            from = start;
+            if stop {
+                self.buf.clear();
+                self.scanned = 0;
+                return;
+            }
+        }
+        self.buf.drain(..start);
+        // What is left is one partial line, all of it searched.
+        self.scanned = self.buf.len();
+        if self.buf.len() > MAX_SSE_LINE_BUFFER {
+            self.buf.clear();
+            self.scanned = 0;
+            self.discarding = true;
+        }
+    }
+
+    /// The held partial line, at the end of the input, unless it was being
+    /// discarded.
+    fn take_rest(&mut self) -> Option<Vec<u8>> {
+        let rest = std::mem::take(&mut self.buf);
+        self.scanned = 0;
+        if std::mem::take(&mut self.discarding) || rest.is_empty() {
+            None
+        } else {
+            Some(rest)
+        }
+    }
 }
 
 impl StreamMeter {
     fn observe(&mut self, chunk: &[u8]) {
         match self {
             Self::OpenAi(m) => m.observe(chunk),
-            Self::Anthropic { line_buf, meter } => {
-                line_buf.extend_from_slice(chunk);
-                while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = line_buf.drain(..=pos).collect();
-                    if let Ok(s) = std::str::from_utf8(&line) {
-                        meter.observe_line(s.trim_end());
-                    }
+            Self::Anthropic { lines, meter } => lines.feed(chunk, |line| {
+                if let Ok(s) = std::str::from_utf8(line) {
+                    meter.observe_line(s.trim_end());
                 }
-                if line_buf.len() > MAX_SSE_LINE_BUFFER {
-                    line_buf.clear();
-                }
-            }
+                false
+            }),
         }
     }
 
@@ -2097,10 +2281,7 @@ impl StreamMeter {
 /// in the output between readings is itself a contradiction and charges the
 /// reservation, as does any untrustworthy reading.
 pub struct OpenAiStreamMeter {
-    line_buf: Vec<u8>,
-    /// Set after a line overflowed the buffer, so the rest of that line is
-    /// discarded up to its newline instead of being parsed as a line of its own.
-    discarding: bool,
+    lines: LineSplitter,
     /// The SAME semantics the buffered path uses for this upstream. If these
     /// ever diverge, a caller picks the cheaper metering by setting stream:true.
     semantics: CacheSemantics,
@@ -2120,8 +2301,7 @@ impl OpenAiStreamMeter {
     #[must_use]
     pub fn new(semantics: CacheSemantics, price: ModelPrice) -> Self {
         Self {
-            line_buf: Vec::new(),
-            discarding: false,
+            lines: LineSplitter::default(),
             semantics,
             price,
             finish_seen: false,
@@ -2138,29 +2318,23 @@ impl OpenAiStreamMeter {
             // Nothing after the end marker counts.
             return;
         }
-        self.line_buf.extend_from_slice(chunk);
-        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
-            if std::mem::take(&mut self.discarding) {
-                continue;
-            }
-            self.observe_line_bytes(&line);
-            if self.done_seen {
-                self.line_buf.clear();
-                return;
-            }
-        }
-        if self.line_buf.len() > MAX_SSE_LINE_BUFFER {
-            self.line_buf.clear();
-            self.discarding = true;
-        }
+        // Taken out for the call, so the closure can borrow the meter.
+        let mut lines = std::mem::take(&mut self.lines);
+        lines.feed(chunk, |line| {
+            self.observe_line_bytes(line);
+            // Nothing after the end marker counts.
+            self.done_seen
+        });
+        self.lines = lines;
     }
 
     /// Parse a final line the upstream closed without terminating.
     fn flush(&mut self) {
-        let rest = std::mem::take(&mut self.line_buf);
-        if !self.done_seen && !std::mem::take(&mut self.discarding) && !rest.is_empty() {
-            self.observe_line_bytes(&rest);
+        let rest = self.lines.take_rest();
+        if !self.done_seen {
+            if let Some(rest) = rest {
+                self.observe_line_bytes(&rest);
+            }
         }
     }
 
@@ -2338,9 +2512,8 @@ fn choose_settlement(
             // - Nothing started.
             // - The provider EXPLICITLY errored. Without this, any 200 that is
             //   not an SSE stream at all (an upstream ignoring `stream`, a proxy
-            //   rewriting the response) is relayed to the client in full and
-            //   then discounted, because it contains neither message_start nor
-            //   message_stop.
+            //   rewriting the response) would be discounted, because it
+            //   contains neither message_start nor message_stop.
             if !clean && !m.started() && m.errored() {
                 tracing::warn!(
                     "anthropic stream reported an error before generating anything; \
@@ -2433,6 +2606,86 @@ fn stream_refusal(
         .instrument(tracing::Span::current()),
     );
     fault
+}
+
+/// Why a 2xx answer to a stream request cannot be relayed, if it cannot: its
+/// media type is not `text/event-stream`, or it is compressed (this build does
+/// not decompress, so its events could not be read).
+fn not_an_event_stream(headers: &reqwest::header::HeaderMap) -> Option<&'static str> {
+    let media = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .unwrap_or("")
+        .trim();
+    if !media.eq_ignore_ascii_case("text/event-stream") {
+        return Some("not_an_event_stream");
+    }
+    let compressed = headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .any(|e| {
+            !e.to_str()
+                .is_ok_and(|e| e.trim().eq_ignore_ascii_case("identity"))
+        });
+    if compressed {
+        return Some("compressed");
+    }
+    None
+}
+
+/// Log a 2xx answer to a stream request that was not a plain event stream:
+/// the reason and media type at WARN, the body (bounded) at TRACE from a
+/// spawned task, so a slow body delays nothing.
+fn non_stream_body(
+    upstream: reqwest::Response,
+    request_id: &str,
+    provider: &'static str,
+    model: &str,
+    reason: &'static str,
+) {
+    let content_type: String = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "/.+-".contains(*c))
+        .take(64)
+        .collect();
+    tracing::warn!(
+        request_id,
+        provider,
+        model,
+        reason,
+        content_type = %content_type,
+        "upstream answered a stream request without a plain event stream; \
+         charging the reservation"
+    );
+    if reason == "compressed" {
+        // Compressed bytes are unreadable as text; not logged.
+        return;
+    }
+    let request_id = request_id.to_owned();
+    tokio::spawn(
+        async move {
+            let (body, _) = read_bounded(
+                upstream,
+                crate::provider::LOGGED_BODY_BYTES,
+                STREAM_REFUSAL_READ_TIMEOUT,
+            )
+            .await;
+            tracing::trace!(
+                target: "tollgate::upstream_body",
+                request_id = %request_id,
+                body = %String::from_utf8_lossy(&body),
+                "upstream non-stream body"
+            );
+        }
+        .instrument(tracing::Span::current()),
+    );
 }
 
 /// Read at most `limit` bytes of a response body within `timeout`. Returns the
@@ -3206,7 +3459,7 @@ mod tests {
             m.observe_line(l);
         }
         StreamMeter::Anthropic {
-            line_buf: Vec::new(),
+            lines: LineSplitter::default(),
             meter: m,
         }
     }
@@ -3535,7 +3788,8 @@ mod tests {
                 if *l == "ERR" {
                     Err(std::io::Error::other("upstream reset"))
                 } else {
-                    Ok(Bytes::from(format!("{l}\n")))
+                    // Each scripted line is one complete SSE event.
+                    Ok(Bytes::from(format!("{l}\n\n")))
                 }
             })
             .collect();
@@ -3572,8 +3826,20 @@ mod tests {
             }
             Client::Reads | Client::Stalls => Some(rx),
         };
-        let (end, drained) =
-            relay_body(upstream(lines, hold_open), &tx, &mut meter, TEST_LIMITS).await;
+        let mut redactor = crate::sse_redact::SseRedactor::new(
+            crate::sse_redact::StreamSurface::OpenAi,
+            "rid",
+            PROVIDER_OPENAI,
+            "m",
+        );
+        let (end, drained) = relay_body(
+            upstream(lines, hold_open),
+            &tx,
+            &mut meter,
+            &mut redactor,
+            TEST_LIMITS,
+        )
+        .await;
         let price = ModelPrice::new("openai", "m", 1_000_000, 1_000_000);
         (
             end,
@@ -3625,7 +3891,7 @@ mod tests {
         // The finish and [DONE] arrive in one upstream chunk and the client is
         // gone: the meter has already seen [DONE] when the send fails.
         let fin = finish_with_usage(9, 509, 518);
-        let both = format!("{fin}\n{DONE}");
+        let both = format!("{fin}\n\n{DONE}");
         let (end, drained, (actual, _, decision)) = relay(&[&both], false, Client::Gone).await;
         assert_eq!((end, drained), (StreamEnd::Done, false));
         assert_eq!((actual, decision), (518, "allowed"));
@@ -3685,6 +3951,159 @@ mod tests {
         let (end, _, (actual, _, decision)) = relay(&[early, early], false, Client::Reads).await;
         assert_eq!(end, StreamEnd::Eof);
         assert_eq!((actual, decision), (RESERVE, "estimated"));
+    }
+
+    /// An Anthropic error event inside a 200 stream reaches the client only as
+    /// the fixed replacement, and the settlement is what the meter decides
+    /// from the original bytes, as before: an error before generation charges
+    /// the prompt leg.
+    #[tokio::test]
+    async fn an_anthropic_stream_error_reaches_the_client_only_as_the_fixed_event() {
+        let secret = "projects/relay-sentinel/locations/x";
+        let lines = [format!(
+            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"{secret}\"}}}}"
+        )];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut meter = anthropic_meter(&[]);
+        let mut redactor = crate::sse_redact::SseRedactor::new(
+            crate::sse_redact::StreamSurface::Anthropic,
+            "rid",
+            PROVIDER_ANTHROPIC,
+            "m",
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let (end, _) = relay_body(
+            upstream(&lines, false),
+            &tx,
+            &mut meter,
+            &mut redactor,
+            TEST_LIMITS,
+        )
+        .await;
+        drop(tx);
+        let mut sent = Vec::new();
+        while let Some(Ok(b)) = rx.recv().await {
+            sent.extend_from_slice(&b);
+        }
+        let sent = String::from_utf8(sent).unwrap();
+        assert_eq!(end, StreamEnd::Eof);
+        assert!(!sent.contains(secret), "{sent}");
+        assert!(sent.starts_with("event: error\ndata: "), "{sent}");
+        assert!(sent.contains("overloaded_error"), "{sent}");
+        assert_eq!(redactor.ended(), Some(crate::sse_redact::Ended::ErrorEvent));
+        // Metered from the original bytes: the provider generated nothing.
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
+        assert_eq!(choose_settlement(&meter, &price, 999, 100).0, 100);
+    }
+
+    /// After the client's stream has been ended, the client leaving does not
+    /// stop metering: the relay reads on to the provider's end marker and the
+    /// stream is charged what it measured.
+    #[tokio::test]
+    async fn metering_continues_after_the_clients_stream_is_ended() {
+        let fin = finish_with_usage(9, 509, 518);
+        let error = r#"data: {"error":{"message":"projects/relay-sentinel/locations/x"}}"#;
+        let (end, drained, (actual, _, decision)) =
+            relay(&[error, CONTENT, &fin, DONE], false, Client::Gone).await;
+        assert_eq!((end, drained), (StreamEnd::Done, false));
+        assert_eq!((actual, decision), (518, "allowed"));
+    }
+
+    /// A client that leaves while the redactor is holding an incomplete event
+    /// is noticed at once, not at the next complete event.
+    #[tokio::test]
+    async fn a_client_gone_while_bytes_are_held_is_noticed() {
+        let partial: futures_util::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(b"data: {\"choices\":"))])
+                .chain(futures_util::stream::pending())
+                .boxed();
+        let mut meter = StreamMeter::OpenAi(openai_meter());
+        let mut redactor = crate::sse_redact::SseRedactor::new(
+            crate::sse_redact::StreamSurface::OpenAi,
+            "rid",
+            PROVIDER_OPENAI,
+            "m",
+        );
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (end, drained) = relay_body(partial, &tx, &mut meter, &mut redactor, TEST_LIMITS).await;
+        assert_eq!((end, drained), (StreamEnd::ClientGone, false));
+    }
+
+    /// The meters read the same lines however the input is chunked.
+    #[test]
+    fn meters_read_the_same_whole_or_one_byte_at_a_time() {
+        let fin = finish_with_usage(9, 509, 518);
+        let openai_stream = format!("{CONTENT}\n\n{fin}\n\n{DONE}\n\n");
+        let mut whole = openai_meter();
+        whole.observe(openai_stream.as_bytes());
+        let mut bytewise = openai_meter();
+        for b in openai_stream.as_bytes() {
+            bytewise.observe(std::slice::from_ref(b));
+        }
+        let price_reserve = 999;
+        assert_eq!(
+            whole.settlement(price_reserve),
+            bytewise.settlement(price_reserve)
+        );
+        assert!(bytewise.done_seen && bytewise.finish_seen);
+
+        let anthropic_stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let price = ModelPrice::new("anthropic", "m", 1_000_000, 1_000_000);
+        let mut whole = anthropic_meter(&[]);
+        whole.observe(anthropic_stream.as_bytes());
+        let mut bytewise = anthropic_meter(&[]);
+        for b in anthropic_stream.as_bytes() {
+            bytewise.observe(std::slice::from_ref(b));
+        }
+        assert_eq!(
+            choose_settlement(&whole, &price, 999, 100),
+            choose_settlement(&bytewise, &price, 999, 100)
+        );
+        assert!(bytewise.is_clean());
+    }
+
+    /// An over-long line fed in small pieces is dropped up to its newline on
+    /// both meters, and the next line is still read.
+    #[test]
+    fn an_over_long_line_in_small_chunks_is_discarded_on_both_meters() {
+        let long = vec![b'x'; MAX_SSE_LINE_BUFFER + 10];
+        let mut m = openai_meter();
+        for piece in long.chunks(4096) {
+            m.observe(piece);
+        }
+        m.observe(b"\n");
+        m.observe(format!("{DONE}\n").as_bytes());
+        assert!(m.done_seen, "the line after the over-long one is read");
+
+        let mut a = anthropic_meter(&[]);
+        for piece in long.chunks(4096) {
+            a.observe(piece);
+        }
+        a.observe(b"\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n");
+        assert!(a.is_clean(), "the line after the over-long one is read");
+    }
+
+    /// One byte at a time for a megabyte: linear, not quadratic.
+    #[test]
+    fn a_meter_fed_one_byte_at_a_time_is_linear() {
+        let mut m = openai_meter();
+        let started = Instant::now();
+        for _ in 0..MAX_SSE_LINE_BUFFER {
+            m.observe(b"x");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     // ---- Budgets that can never match ------------------------------------
@@ -5282,5 +5701,152 @@ mod gate_tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, "error");
         assert_eq!(events[0].cost_micros, 0);
+    }
+
+    /// A local upstream answering every request with one canned response of
+    /// the given content type.
+    async fn stub_typed(status: u16, content_type: &'static str, body: &'static str) -> String {
+        let app = Router::new().fallback(move || async move {
+            (
+                StatusCode::from_u16(status).unwrap(),
+                [(header::CONTENT_TYPE, content_type)],
+                body,
+            )
+                .into_response()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    const STREAM_BODY: &str = r#"{"model":"m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    const BUFFERED_BODY: &str =
+        r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    async fn body_text(resp: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// An error event inside a 200 stream reaches the client only as the fixed
+    /// replacement, on both stream routes.
+    #[tokio::test]
+    async fn an_error_event_inside_a_stream_never_reaches_the_client() {
+        for (path, sse) in [
+            (
+                "/v1/messages",
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"projects/sentinel-project-123/locations/us-central1\"}}\n\n",
+            ),
+            (
+                "/v1/chat/completions",
+                "data: {\"error\":{\"message\":\"projects/sentinel-project-123/locations/us-central1\",\"type\":\"server_error\"}}\n\n",
+            ),
+        ] {
+            let upstream = stub_typed(200, "text/event-stream", sse).await;
+            let h = harness(Options {
+                upstream: Some(upstream),
+                ..Options::default()
+            });
+            let resp = h
+                .send(with(
+                    request(&Method::POST, path, Body::from(STREAM_BODY)),
+                    "x-tollgate-key",
+                    &h.key,
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let id = resp.headers()[crate::auth_gate::REQUEST_ID_HEADER]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let text = body_text(resp).await;
+            assert!(!text.contains(SENTINEL), "{path}: {text}");
+            assert!(
+                text.contains(&id),
+                "{path}: replacement carries the id: {text}"
+            );
+            let events = h.usage.snapshot();
+            assert_eq!(events.len(), 1, "{path}");
+            assert_eq!(events[0].decision, "estimated", "{path}");
+        }
+    }
+
+    /// A 200 that is not an event stream is never relayed on a stream route:
+    /// 502, with the reservation charged as estimated.
+    #[tokio::test]
+    async fn a_non_event_stream_200_on_a_stream_route_is_a_502() {
+        let upstream = stub_typed(
+            200,
+            "application/json",
+            r#"{"error":{"message":"projects/sentinel-project-123/locations/us-central1"}}"#,
+        )
+        .await;
+        for path in ["/v1/messages", "/v1/chat/completions"] {
+            let h = harness(Options {
+                upstream: Some(upstream.clone()),
+                ..Options::default()
+            });
+            let resp = h
+                .send(with(
+                    request(&Method::POST, path, Body::from(STREAM_BODY)),
+                    "x-tollgate-key",
+                    &h.key,
+                ))
+                .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{path}");
+            assert_eq!(
+                resp.headers()["x-tollgate-reason"],
+                "upstream_error",
+                "{path}"
+            );
+            assert!(!body_text(resp).await.contains(SENTINEL), "{path}");
+            let events = h.usage.snapshot();
+            assert_eq!(events.len(), 1, "{path}");
+            assert_eq!(events[0].decision, "estimated", "{path}");
+            assert!(
+                events[0].cost_micros > 0,
+                "{path}: the reservation is charged"
+            );
+        }
+    }
+
+    /// A buffered 200 whose body is really an error is answered as a 502,
+    /// without the provider's text.
+    #[tokio::test]
+    async fn a_buffered_200_error_body_is_a_502() {
+        for body in [
+            r#"{"error":{"message":"projects/sentinel-project-123/locations/us-central1"}}"#,
+            r#"{"type":"error","error":{"type":"api_error","message":"projects/sentinel-project-123/locations/us-central1"}}"#,
+            r#"["projects/sentinel-project-123/locations/us-central1"]"#,
+        ] {
+            let upstream = stub_typed(200, "application/json", body).await;
+            for path in [
+                "/v1/messages",
+                "/v1/chat/completions",
+                "/v1/openai/chat/completions",
+            ] {
+                let h = harness(Options {
+                    upstream: Some(upstream.clone()),
+                    ..Options::default()
+                });
+                let resp = h
+                    .send(with(
+                        request(&Method::POST, path, Body::from(BUFFERED_BODY)),
+                        "x-tollgate-key",
+                        &h.key,
+                    ))
+                    .await;
+                assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{path} {body}");
+                assert!(!body_text(resp).await.contains(SENTINEL), "{path} {body}");
+            }
+        }
     }
 }

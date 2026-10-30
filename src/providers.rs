@@ -647,10 +647,9 @@ impl AnthropicStreamMeter {
     /// The prompt-leg discount requires this, not merely the absence of
     /// `message_start`. Without it, any 200 that is not an SSE stream at all
     /// (an upstream that ignores `stream` and returns a buffered body, a proxy
-    /// that rewrites it) is relayed to the client in full and then charged the
-    /// prompt leg alone, because it contains neither `message_start` nor
-    /// `message_stop`. The provider has to tell us it failed before we discount
-    /// the request.
+    /// that rewrites it) would be charged the prompt leg alone, because it
+    /// contains neither `message_start` nor `message_stop`. The provider has to
+    /// tell us it failed before we discount the request.
     #[must_use]
     pub fn errored(&self) -> bool {
         self.errored

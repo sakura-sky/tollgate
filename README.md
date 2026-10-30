@@ -343,6 +343,7 @@ never the provider's response:
 | `400`, `413`, `422` (the request body is at fault) | the same status | `bad_request` |
 | `429` | `429`, with `Retry-After` when the provider sent a whole number of seconds, clamped to 1 to 60 | `upstream_rate_limited` |
 | `401`, `403`, `404` and every other non-2xx | `502` | `upstream_error` |
+| a `200` that is not an event stream on a stream route, or a buffered `200` whose body is an error | `502` | `upstream_error` |
 
 A `401`, `403` or `404` from the provider describes Tollgate's own credential or
 configuration, not the caller's, so it is never passed on as such. The
@@ -353,8 +354,23 @@ resource path. The gateway's log line for the response's
 request id; the first 2 KiB of the provider's body is logged only while the
 operator has switched it on (see [`docs/OPERATIONS.md`](./docs/OPERATIONS.md)).
 This covers every response the provider sends with a non-2xx status, buffered
-or streaming. An error event the provider sends inside a stream that started
-with `200` is still relayed as sent; it is not yet rewritten.
+or streaming, and a `200` whose body is really an error. Inside a stream that
+started with `200`, Tollgate forwards only events it can classify as safe: no
+data, `[DONE]` (on `/v1/chat/completions`), or one strictly parsed JSON object
+with no top-level `error` other than `null` (and, on `/v1/messages`, no
+`"type": "error"`). An error event, or anything it
+cannot classify, ends the client's stream with one fixed error event in the
+route's format (on `/v1/messages`,
+Anthropic's `overloaded_error`, `rate_limit_error` and `timeout_error` keep
+their type; anything else is `api_error`), and the client gets nothing more.
+Tollgate still reads and meters the provider's stream to its end (within the
+idle and maximum-duration limits), even if the client then disconnects, so what
+is charged does not change. The `stream settled` log line's `client_ended`
+field says why, when the client's stream was ended this way. A `200` that is not an event stream at all is a `502`
+before the stream starts, charged its reservation, because the provider may
+have billed it. Only protocol-level error events are recognised: text in any
+other field of a safe event (the generated output, or an error a provider
+nests inside a choice) is relayed as the provider sent it.
 
 Every response on `/v1` and `/console/*` carries `x-tollgate-request-id`, a
 random id Tollgate generates for that request (a client-supplied value is never
@@ -524,8 +540,6 @@ is the property the design actually guarantees.
 Known limitations in this release, stated up front:
 
 - **A client never sees the provider's own error message.** A refused request gets a classified status, a reason and a fixed message, so a developer whose request a provider rejects is told it was rejected and given a request id, not why. The gateway's log has the provider's error type and code under that id, and the first 2 KiB of the provider's body only while the operator has switched it on. This is deliberate: provider messages can name the deployment's cloud project, region and resource paths.
-- **An error event inside a successful stream is relayed as the provider sent it.** Anthropic, for example, can send an `error` event on a stream that began with `200`. Every non-2xx response is classified; these mid-stream events are not yet rewritten.
-
 - **Streaming under `exact` admission is refused on the OpenAI path.** A streaming request to `/v1/chat/completions` with `TOLLGATE_PROVIDERS__ADMISSION=exact` returns `501` to an authenticated caller. The native Anthropic path at `/v1/messages` does support the combination, because `count_tokens` gives it a real pre-flight count for the prompt.
 - **Streaming is supported on `/v1/chat/completions` and `/v1/messages` only.** The native Vertex adapter still allows only `:generateContent`, because usage cannot be metered from a partial `streamGenerateContent` response.
 - **A stream that does not end cleanly is charged its full reservation**, which over-charges. "Cleanly" means the provider said it finished, not merely that the connection closed, because a proxy can close a connection cleanly mid-generation. On `/v1/messages` that is Anthropic's `message_stop`: Anthropic reports a small placeholder `output_tokens` in `message_start` and can deliver an error event on an otherwise-healthy 200 stream, so trusting the connection would under-charge a failed stream by its entire output leg. On `/v1/chat/completions` a stream is charged its measured usage when the upstream sent a non-empty `finish_reason` with no output after it, a usage report in or after that chunk, and `data: [DONE]`. A client that stops reading at the end of an answer, before `[DONE]`, is still measured: once the finish has arrived, Tollgate keeps reading the upstream for up to 10 seconds after it notices the client has stopped, without forwarding anything, to receive the usage and `[DONE]`. On Cloud Run with CPU allocated only during requests (`cpu_idle = true` in the shipped Terraform), that work may run with throttled CPU once the client has gone, so a drain can expire and charge the reservation. Two consequences for a custom OpenAI-compatible upstream: one that never sends a `finish_reason` or `[DONE]` is charged its reservation on every stream, and usage is assumed to be cumulative, so one that reports per-chunk deltas would be under-counted, or charged its reservation where a delta is smaller than the one before. Each stream the relay settles logs a `stream settled` line giving how it ended and what was seen, at `debug` when it was measured, ended at the provider's end marker and was not drained, and at `info` otherwise. Streams are cut after 60 seconds with no bytes, or 15 minutes in total, and charged their reservation. `/console/usage` splits `measured_cost` from `estimated_cost` over the rows it returns, so this is visible rather than silent. One exception: on `/v1/messages`, when Anthropic reports an error before generating anything (`overloaded_error` is the common one), only the reserved prompt leg is charged, because nothing was generated and SDK retries would otherwise multiply a full worst-case reservation through an overload window.
