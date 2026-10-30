@@ -9,8 +9,9 @@ Notable changes per release.
 
 ## Unreleased
 
-Authentication before anything else, and a key store that fails as a `503`
-rather than a wave of `401`s.
+Authentication before anything else, a key store that fails as a `503`
+rather than a wave of `401`s, and provider errors that no longer reach clients
+verbatim.
 
 Upgrading: `serve` now refuses `TOLLGATE_DATABASE__MAX_CONNECTIONS` below 4, an
 `ACQUIRE_TIMEOUT` outside 1 ms to 2147483647 ms, and a Postgres connection that
@@ -28,6 +29,31 @@ drops startup options (see Changed).
   (`404` and `405` with `Allow`) or body-size limits (`413`).
 - Only the exact key shape Tollgate issues is looked up. Anything else is refused
   without a database query.
+- A provider's non-2xx response no longer reaches the client. The buffered
+  routes returned the provider's status and body verbatim (on the
+  `/v1/{provider}/{path}` route inside its `{"response": ..}` envelope), which
+  could name the cloud project, region and resource path, and the provider's
+  account state. Every route, buffered or streaming, now answers with a status
+  classified by fault, a reason header and a fixed message (see Changed). The
+  provider's error type and code are logged, and the first 2 KiB of its body
+  only at TRACE on request. The same applies to a pre-flight count refusal,
+  whose message `exact` admission used to pass back inside a `400`. An error
+  event inside a stream that began with `200` is still relayed; it is not yet
+  rewritten.
+
+### Added
+
+- `x-tollgate-request-id` on every response on `/v1` and `/console/*`: a random
+  id generated per request, never taken from the client, and on every log line
+  for an authenticated request (not on `tollgate demo`, which has no gate, nor
+  on the `500` for a panic in the gate itself).
+- `x-tollgate-reason: upstream_rate_limited` on a `429` when the provider is
+  rate limiting the deployment, with `Retry-After` when the provider sent a whole
+  number of seconds (clamped to 1 to 60, re-written rather than copied).
+- A WARN log line, `upstream refused the request`, for every provider refusal,
+  with the request id, the provider's error type and code, and the provider's
+  own request id. The provider's body is opt-in at TRACE under
+  `tollgate::upstream_body` and never exported over OTLP.
 
 ### Fixed
 
@@ -38,6 +64,21 @@ drops startup options (see Changed).
 
 ### Changed
 
+- Provider refusals are classified by fault on every route:
+  - `400`, `413` and `422` keep their status, with `bad_request`;
+  - `429` stays `429`, with `upstream_rate_limited`;
+  - `401`, `403`, `404` and every other non-2xx become `502` with
+    `upstream_error`. The streaming routes used to pass the provider's status
+    through, so a rotated provider key showed clients a `401` that looked like
+    their own key had failed.
+  - On `/v1/{provider}/{path}`, a provider error that used to come back as
+    `{"response": {"error": ..}, "tollgate": {..}}` with the provider's status is
+    now, for example, a `400` with `{"error": "the provider rejected this
+    request; ...", "status": 400}` and `x-tollgate-reason: bad_request`.
+  - These responses carry no `x-tollgate-cost` or `x-tollgate-overhead-us`; the
+    settlement and ledger row are unchanged.
+- With OTLP set, one span is exported per authenticated request on `/v1` and
+  `/console/*` (the per-request span was previously at DEBUG and filtered out).
 - `tollgate_requests_total` gains the `key_store_error` decision. It is not
   exposed by `tollgate demo`.
 - `unauthenticated` now also counts unknown paths, wrong methods and

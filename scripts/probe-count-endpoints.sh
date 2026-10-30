@@ -166,7 +166,8 @@ What must hold, or the code is wrong:
   Counts must move   A carried field whose presence does not change the count is
                      not being counted, and reserving without it under-reserves.
   Refusal statuses   `count_refusal` treats 400, 413 and 422 as the caller's
-                     body and everything else as the provider. A credential
+                     body, 429 as the provider rate limiting, and everything
+                     else as the provider. A credential
                      failure must appear here as 401 or 403, never as 400: if a
                      provider ever returns 400 for a bad key, that allowlist
                      would blame every caller for our own misconfiguration.

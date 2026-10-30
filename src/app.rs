@@ -31,6 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Instrument as _;
 
 use crate::apikey::KeyHasher;
 use crate::auth_gate::Authed;
@@ -46,7 +47,10 @@ use crate::gateway::{
     GatewayCore, KeyStore, Metrics, ReserveError, Settlement, UsageSink, outcome_response,
 };
 use crate::pricing::{ModelPrice, PriceBook, Usage, format_micros};
-use crate::provider::{MockProvider, Provider, ProviderError};
+use crate::provider::{
+    MockProvider, Provider, ProviderError, RefusalDetail, ResponseMeta, UpstreamFault,
+    classify_upstream_status, log_upstream_refusal,
+};
 use crate::providers::{CacheSemantics, OpenAiProvider, stream_requested};
 use crate::routes::health;
 
@@ -820,9 +824,11 @@ fn spawn_maintenance_task(db: PgPool, window: Duration) {
 ///    answers unknown paths and wrong methods under `/v1` and `/console/`
 ///    before the router can (a `Router::layer` gate would leak `Allow` on a
 ///    405);
-/// 4. tracing, inside the gate, so unauthenticated probes are counted on
-///    `/metrics` rather than traced one by one;
-/// 5. a panic guard around the routes, inside the trace span;
+/// 4. request logging (tower-http's events only, no span of its own), inside
+///    the gate, which opens the `request` span around everything inside it
+///    once the caller is authenticated, so unauthenticated probes are counted
+///    on `/metrics` rather than traced one by one;
+/// 5. a panic guard around the routes, inside that span;
 /// 6. the routes.
 ///
 /// `key_lookup_timeout` is `database.acquire_timeout`: the gate's deadline for
@@ -891,7 +897,13 @@ pub fn router(
         // failure it has. The binary is built to unwind rather than abort for
         // exactly this reason.
         .layer(CatchPanicLayer::custom(panic_response))
-        .layer(TraceLayer::new_for_http());
+        // No span of its own: the gate opens the request's span (with the
+        // request id) around this, and the JSON log format shows only the
+        // current span, so an inner span here would hide the id.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|_: &axum::extract::Request| tracing::Span::none()),
+        );
 
     tower::ServiceBuilder::new()
         .map_response(IntoResponse::into_response)
@@ -925,7 +937,14 @@ async fn gateway(
 ) -> Response {
     let core = state.core.load_full();
     let outcome = core
-        .evaluate_authenticated(&authed.key_id, authed.auth_elapsed, &provider, &rest, &body)
+        .evaluate_authenticated(
+            &authed.key_id,
+            Some(&authed.request_id),
+            authed.auth_elapsed,
+            &provider,
+            &rest,
+            &body,
+        )
         .await;
     outcome_response(outcome)
 }
@@ -1005,6 +1024,7 @@ async fn anthropic_messages(
     let outcome = core
         .evaluate_authenticated(
             &authed.key_id,
+            Some(&authed.request_id),
             authed.auth_elapsed,
             PROVIDER_ANTHROPIC,
             "messages",
@@ -1104,6 +1124,10 @@ fn anthropic_error_reason(
 pub(crate) fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Response {
     use crate::gateway::Outcome;
     match outcome {
+        Outcome::Allowed { status, .. } if !(200..300).contains(&status) => {
+            crate::gateway::non_success_reached_success_arm(status);
+            anthropic_outcome_response(Outcome::UpstreamRefused(UpstreamFault::Provider))
+        }
         Outcome::Allowed {
             status,
             body,
@@ -1148,8 +1172,38 @@ pub(crate) fn anthropic_outcome_response(outcome: crate::gateway::Outcome) -> Re
             "backend_error",
             "gateway backend unavailable",
         ),
-        Outcome::Upstream(_) => {
+        Outcome::Upstream(m) => {
+            // Logged like the other surfaces' Upstream arms, so the request id
+            // finds the transport detail.
+            tracing::warn!(detail = %m, "anthropic upstream error");
             anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error")
+        }
+        Outcome::UpstreamRefused(fault) => {
+            let status = crate::gateway::upstream_fault_status(fault);
+            let response = match fault {
+                UpstreamFault::Request(413) => anthropic_error_reason(
+                    status,
+                    "request_too_large",
+                    "bad_request",
+                    crate::gateway::UPSTREAM_REQUEST_REFUSED,
+                ),
+                UpstreamFault::Request(_) => anthropic_error_reason(
+                    status,
+                    "invalid_request_error",
+                    "bad_request",
+                    crate::gateway::UPSTREAM_REQUEST_REFUSED,
+                ),
+                UpstreamFault::RateLimited { .. } => anthropic_error_reason(
+                    status,
+                    "rate_limit_error",
+                    crate::gateway::REASON_UPSTREAM_RATE_LIMITED,
+                    crate::gateway::UPSTREAM_RATE_LIMITED,
+                ),
+                UpstreamFault::Provider => {
+                    anthropic_error_reason(status, "api_error", "upstream_error", "upstream error")
+                }
+            };
+            crate::gateway::with_retry_after(response, fault)
         }
     }
 }
@@ -1180,6 +1234,7 @@ async fn openai_chat(
     let outcome = core
         .evaluate_authenticated(
             &authed.key_id,
+            Some(&authed.request_id),
             authed.auth_elapsed,
             PROVIDER_OPENAI,
             "chat/completions",
@@ -1206,6 +1261,7 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
     // Authentication is part of the overhead, as it was when it ran here.
     let started = crate::gateway::backdate(authed.auth_elapsed);
     let key_id = authed.key_id;
+    let request_id = authed.request_id;
     let core = state.core.load_full();
     let Some(provider) = state.anthropic.clone() else {
         return anthropic_error_reason(
@@ -1221,7 +1277,11 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
         Err(ProviderError::BadRequest(m)) => {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m);
         }
-        Err(ProviderError::Upstream(_) | ProviderError::MeteringFailed(_)) => {
+        Err(
+            ProviderError::Upstream(_)
+            | ProviderError::MeteringFailed(_)
+            | ProviderError::Refused { .. },
+        ) => {
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", "upstream error");
         }
     };
@@ -1267,15 +1327,12 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
             Ok(n) => n,
             Err(e) => {
                 // Upstream, not backend: the count is a round trip to the
-                // provider. Matches the buffered path in `GatewayCore::evaluate`,
-                // including the split between a provider that REFUSED the count
-                // (the caller's body is wrong, 400) and one that could not answer
-                // (502).
-                // warn, not error: a `BadRequest` here is the caller's malformed
-                // body, and a client looping on its own bug must not fill the
-                // operator's error budget. The genuinely alarming cases, a
-                // rejected credential, are logged at ERROR by `count_refusal`.
-                tracing::warn!(error = %e.to_string(), "pre-flight token count failed");
+                // provider. Matches the buffered path in `GatewayCore::evaluate`:
+                // the caller's own unbuildable body is a 400 with Tollgate's text,
+                // a provider refusal is classified by its status (the caller's
+                // body, a rate limit, or the provider), and a provider that could
+                // not answer is a 502. A rejected credential is also logged at
+                // ERROR by `count_refusal`.
                 record_stream_refusal(
                     &core,
                     &key_id,
@@ -1287,14 +1344,37 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
                 )
                 .await;
                 return match e {
+                    // The caller's own body, from building the count payload:
+                    // Tollgate's text about it, not the provider's.
                     ProviderError::BadRequest(m) => {
                         anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
                     }
-                    _ => anthropic_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        "pre-flight token count failed upstream",
-                    ),
+                    // The provider refused the count: classified, its details
+                    // logged with the request id, none of its text returned.
+                    ProviderError::Refused {
+                        status,
+                        fault,
+                        detail,
+                    } => {
+                        log_upstream_refusal(
+                            Some(&request_id),
+                            PROVIDER_ANTHROPIC,
+                            &parsed.model,
+                            status,
+                            fault,
+                            &detail,
+                        );
+                        anthropic_outcome_response(crate::gateway::Outcome::UpstreamRefused(fault))
+                    }
+                    // Logged here only for the variants no other line describes.
+                    ProviderError::Upstream(_) | ProviderError::MeteringFailed(_) => {
+                        tracing::warn!(error = %e, "pre-flight token count failed");
+                        anthropic_error(
+                            StatusCode::BAD_GATEWAY,
+                            "api_error",
+                            "pre-flight token count failed upstream",
+                        )
+                    }
                 };
             }
         }
@@ -1395,27 +1475,36 @@ async fn anthropic_messages_stream(state: AppState, authed: Authed, body: String
         }
     };
 
-    let up_status = upstream.status();
-    if !up_status.is_success() {
+    // A non-2xx is an error page, not a stream: never relayed, and never its
+    // status either (a provider 401 would tell the client its own key failed).
+    // Settled first, as before; the classified refusal is answered at once and
+    // the provider's body is read and logged off the response path.
+    if !upstream.status().is_success() {
         guard.settle(0, Usage::default(), "error").await;
-        return anthropic_error(up_status, "api_error", "upstream provider error");
+        let fault = stream_refusal(upstream, &request_id, PROVIDER_ANTHROPIC, &parsed.model);
+        return anthropic_outcome_response(crate::gateway::Outcome::UpstreamRefused(fault));
     }
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    tokio::spawn(relay_stream(
-        upstream,
-        tx,
-        guard,
-        price,
-        reserve_micros,
-        prompt_floor_micros,
-        StreamMeter::Anthropic {
-            line_buf: Vec::new(),
-            meter: crate::providers::AnthropicStreamMeter::new(),
-        },
-        PROVIDER_ANTHROPIC,
-        parsed.model,
-    ));
+    tokio::spawn(
+        relay_stream(
+            upstream,
+            tx,
+            guard,
+            price,
+            reserve_micros,
+            prompt_floor_micros,
+            StreamMeter::Anthropic {
+                line_buf: Vec::new(),
+                meter: crate::providers::AnthropicStreamMeter::new(),
+            },
+            PROVIDER_ANTHROPIC,
+            parsed.model,
+        )
+        // The relay outlives the handler; keep it in the request's span so
+        // `stream settled` and its warnings carry the request id.
+        .instrument(tracing::Span::current()),
+    );
 
     (
         StatusCode::OK,
@@ -1443,6 +1532,7 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
     // Authentication is part of the overhead, as it was when it ran here.
     let started = crate::gateway::backdate(authed.auth_elapsed);
     let key_id = authed.key_id;
+    let request_id = authed.request_id;
     let core = state.core.load_full();
     let Some(provider) = state.openai.clone() else {
         // The endpoint is registered even when the openai upstream is disabled;
@@ -1477,8 +1567,12 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
                 &format!("invalid request: {m}"),
             );
         }
-        // Pre-reservation, so nothing can have been billed on either variant.
-        Err(ProviderError::Upstream(_) | ProviderError::MeteringFailed(_)) => {
+        // Pre-reservation, so nothing can have been billed on any of these.
+        Err(
+            ProviderError::Upstream(_)
+            | ProviderError::MeteringFailed(_)
+            | ProviderError::Refused { .. },
+        ) => {
             return openai_error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
@@ -1594,14 +1688,14 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
     };
 
     // A non-2xx upstream is an error page, not an SSE stream: do not relay it.
-    // Charge zero (not billed) and pass the status through with a generic body so
-    // no upstream detail (GCP project/region/host) leaks to the client.
-    // reqwest and axum both re-export `http::StatusCode`, so the upstream status
-    // passes straight through (generic body only: no upstream detail leaks).
-    let up_status = upstream.status();
-    if !up_status.is_success() {
+    // Charge zero (not billed). The client gets the classified refusal, never
+    // the provider's body (GCP project, region, host) nor its status (a provider
+    // 401 would tell the client its own key failed). The body is read and logged
+    // off the response path.
+    if !upstream.status().is_success() {
         guard.settle(0, Usage::default(), "error").await;
-        return openai_error(up_status, "upstream_error", "upstream provider error");
+        let fault = stream_refusal(upstream, &request_id, PROVIDER_OPENAI, &parsed.model);
+        return openai_outcome_response(crate::gateway::Outcome::UpstreamRefused(fault));
     }
 
     // Relay: bounded channel gives natural backpressure (a slow client throttles
@@ -1614,19 +1708,24 @@ async fn openai_chat_stream(state: AppState, authed: Authed, body: String) -> Re
         provider.cache_semantics(),
         price.clone(),
     ));
-    tokio::spawn(relay_stream(
-        upstream,
-        tx,
-        guard,
-        price,
-        reserve_micros,
-        // Unused on this path: the OpenAI meter has no pre-generation signal, so
-        // there is no prompt-leg discount.
-        reserve_micros,
-        meter,
-        PROVIDER_OPENAI,
-        parsed.model,
-    ));
+    tokio::spawn(
+        relay_stream(
+            upstream,
+            tx,
+            guard,
+            price,
+            reserve_micros,
+            // Unused on this path: the OpenAI meter has no pre-generation signal, so
+            // there is no prompt-leg discount.
+            reserve_micros,
+            meter,
+            PROVIDER_OPENAI,
+            parsed.model,
+        )
+        // The relay outlives the handler; keep it in the request's span so
+        // `stream settled` and its warnings carry the request id.
+        .instrument(tracing::Span::current()),
+    );
 
     (
         StatusCode::OK,
@@ -2302,6 +2401,70 @@ fn stream_settlement(
     }
 }
 
+/// How long a streaming upstream's error body may take to read for the log.
+const STREAM_REFUSAL_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Classify a streaming upstream's non-2xx, and log its body from a spawned
+/// task in the request's span. The caller has already settled and answers at
+/// once, so a slow or endless error body delays no response and a client that
+/// disconnects cannot change what was charged.
+fn stream_refusal(
+    upstream: reqwest::Response,
+    request_id: &str,
+    provider: &'static str,
+    model: &str,
+) -> UpstreamFault {
+    let status = upstream.status().as_u16();
+    let meta = ResponseMeta::from_headers(upstream.headers());
+    let fault = classify_upstream_status(status, meta.retry_after_secs);
+    let request_id = request_id.to_owned();
+    let model = model.to_owned();
+    tokio::spawn(
+        async move {
+            let (body, complete) = read_bounded(
+                upstream,
+                crate::provider::LOGGED_BODY_BYTES + 3,
+                STREAM_REFUSAL_READ_TIMEOUT,
+            )
+            .await;
+            let detail = RefusalDetail::new(&meta, &body, complete);
+            log_upstream_refusal(Some(&request_id), provider, &model, status, fault, &detail);
+        }
+        .instrument(tracing::Span::current()),
+    );
+    fault
+}
+
+/// Read at most `limit` bytes of a response body within `timeout`. Returns the
+/// bytes and whether they are the whole body.
+async fn read_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+    timeout: Duration,
+) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let read = async {
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    // Never more than one byte past the limit, which marks the
+                    // body as incomplete.
+                    let room = limit + 1 - buf.len();
+                    buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    if buf.len() > limit {
+                        return false;
+                    }
+                }
+                Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    };
+    let complete = tokio::time::timeout(timeout, read).await.unwrap_or(false);
+    buf.truncate(limit);
+    (buf, complete)
+}
+
 fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Response {
     (
         status,
@@ -2317,6 +2480,10 @@ fn openai_error(status: StatusCode, reason: &'static str, message: &str) -> Resp
 pub(crate) fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Response {
     use crate::gateway::Outcome;
     match outcome {
+        Outcome::Allowed { status, .. } if !(200..300).contains(&status) => {
+            crate::gateway::non_success_reached_success_arm(status);
+            openai_outcome_response(Outcome::UpstreamRefused(UpstreamFault::Provider))
+        }
         Outcome::Allowed {
             status,
             body,
@@ -2364,6 +2531,25 @@ pub(crate) fn openai_outcome_response(outcome: crate::gateway::Outcome) -> Respo
                 "upstream_error",
                 "upstream provider error",
             )
+        }
+        Outcome::UpstreamRefused(fault) => {
+            let status = crate::gateway::upstream_fault_status(fault);
+            let response = match fault {
+                UpstreamFault::Request(_) => openai_error(
+                    status,
+                    "bad_request",
+                    crate::gateway::UPSTREAM_REQUEST_REFUSED,
+                ),
+                UpstreamFault::RateLimited { .. } => openai_error(
+                    status,
+                    crate::gateway::REASON_UPSTREAM_RATE_LIMITED,
+                    crate::gateway::UPSTREAM_RATE_LIMITED,
+                ),
+                UpstreamFault::Provider => {
+                    openai_error(status, "upstream_error", "upstream provider error")
+                }
+            };
+            crate::gateway::with_retry_after(response, fault)
         }
     }
 }
@@ -2935,6 +3121,17 @@ mod tests {
             }),
             ("upstream", "upstream_error", || {
                 crate::gateway::Outcome::Upstream("502 from provider".to_owned())
+            }),
+            ("provider refused the body", "bad_request", || {
+                crate::gateway::Outcome::UpstreamRefused(UpstreamFault::Request(400))
+            }),
+            ("provider rate limit", "upstream_rate_limited", || {
+                crate::gateway::Outcome::UpstreamRefused(UpstreamFault::RateLimited {
+                    retry_after_secs: Some(3),
+                })
+            }),
+            ("provider fault", "upstream_error", || {
+                crate::gateway::Outcome::UpstreamRefused(UpstreamFault::Provider)
             }),
         ];
 
@@ -3744,6 +3941,9 @@ mod gate_tests {
         /// `TestKeys`.
         pg_keys: Option<Duration>,
         db_acquire_timeout: Duration,
+        /// Point the Anthropic and OpenAI providers here instead of a closed
+        /// port (a stub upstream).
+        upstream: Option<String>,
     }
 
     impl Default for Options {
@@ -3761,6 +3961,7 @@ mod gate_tests {
                 key_lookup_timeout: Duration::from_secs(5),
                 pg_keys: None,
                 db_acquire_timeout: Duration::from_millis(300),
+                upstream: None,
             }
         }
     }
@@ -3792,12 +3993,18 @@ mod gate_tests {
             None => keys.clone(),
         };
 
-        let http = reqwest::Client::new();
+        // No system proxy: the stub upstream is on loopback.
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client builds");
         let openai = d.openai.then(|| {
             Arc::new(OpenAiProvider::custom(
                 http.clone(),
                 http.clone(),
-                CLOSED_HTTP.to_owned(),
+                opts.upstream
+                    .clone()
+                    .unwrap_or_else(|| CLOSED_HTTP.to_owned()),
                 "test-key".to_owned(),
             ))
         });
@@ -3806,7 +4013,9 @@ mod gate_tests {
                 http.clone(),
                 http.clone(),
                 "test-key".to_owned(),
-                CLOSED_HTTP.to_owned(),
+                opts.upstream
+                    .clone()
+                    .unwrap_or_else(|| CLOSED_HTTP.to_owned()),
                 "2023-06-01".to_owned(),
             ))
         });
@@ -3962,10 +4171,12 @@ mod gate_tests {
         for name in resp.headers().keys() {
             assert!(
                 [header::CONTENT_TYPE, header::CONTENT_LENGTH].contains(name)
-                    || name == "x-tollgate-reason",
+                    || name == "x-tollgate-reason"
+                    || name == crate::auth_gate::REQUEST_ID_HEADER,
                 "{ctx}: unexpected header {name}"
             );
         }
+        assert_request_id(resp, ctx);
         assert_eq!(resp.headers()["x-tollgate-reason"], reason, "{ctx}");
         assert!(
             resp.headers()[header::CONTENT_TYPE]
@@ -3974,6 +4185,18 @@ mod gate_tests {
                 .starts_with("application/json"),
             "{ctx}"
         );
+    }
+
+    /// Exactly one `x-tollgate-request-id`, a v4 UUID.
+    fn assert_request_id(resp: &Response, ctx: &str) {
+        let values: Vec<_> = resp
+            .headers()
+            .get_all(crate::auth_gate::REQUEST_ID_HEADER)
+            .iter()
+            .collect();
+        assert_eq!(values.len(), 1, "{ctx}: request id header count");
+        let id = uuid::Uuid::parse_str(values[0].to_str().unwrap()).expect("a UUID");
+        assert_eq!(id.get_version_num(), 4, "{ctx}");
     }
 
     /// Every gated path, method, credential and body, in every deployment,
@@ -4094,9 +4317,12 @@ mod gate_tests {
                 assert_eq!(h.lookups() - l0, want_lookups, "{ctx}: lookups");
                 assert_eq!(h.unauthenticated() - u0, 1, "{ctx}: unauthenticated count");
                 let status = resp.status();
+                // The request id differs per request by design; everything else
+                // must be byte-identical.
                 let headers: Vec<(String, String)> = resp
                     .headers()
                     .iter()
+                    .filter(|(k, _)| k.as_str() != crate::auth_gate::REQUEST_ID_HEADER)
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
                     .collect();
                 let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -4583,5 +4809,478 @@ mod gate_tests {
                 "{surface:?}"
             );
         }
+    }
+
+    /// Provider text that must never reach a client.
+    const SENTINEL: &str = "projects/sentinel-project-123/locations/us-central1";
+
+    /// Headers an upstream sends that must never be copied to a client.
+    const LEAKY_HEADERS: [(&str, &str); 5] = [
+        ("request-id", "req_provider_1"),
+        ("set-cookie", "upstream=1"),
+        ("server", "upstream-server"),
+        ("x-goog-trace", "abc"),
+        ("anthropic-ratelimit-requests-remaining", "3"),
+    ];
+
+    /// A local upstream answering every request with one canned response.
+    async fn stub_upstream(
+        status: u16,
+        retry_after: Option<&'static str>,
+        body: &'static str,
+    ) -> String {
+        let app = Router::new().fallback(move || async move {
+            let mut response = (StatusCode::from_u16(status).unwrap(), body).into_response();
+            for (name, value) in LEAKY_HEADERS {
+                response
+                    .headers_mut()
+                    .append(name, HeaderValue::from_static(value));
+            }
+            if let Some(v) = retry_after {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static(v));
+            }
+            response
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Log lines written while the guard is held, as JSON objects.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+            // tracing caches each callsite's interest globally. While only one
+            // dispatcher exists, that interest comes from whichever thread
+            // reaches the callsite first (tracing-core 0.1.36 `callsite.rs`,
+            // `Rebuilder::JustOne`), so a parallel test with no subscriber can
+            // cache "never" for this test's log lines. A second, inert
+            // dispatcher kept alive for the whole run makes tracing combine
+            // every live dispatcher instead, this test's included.
+            static INERT: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            INERT.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_max_level(level)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+        fn lines(&self) -> Vec<Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        }
+        /// The first line whose message is `message`, waiting briefly for a
+        /// spawned task to write it.
+        async fn wait_for(&self, message: &str) -> Option<Value> {
+            for _ in 0..200 {
+                if let Some(line) = self
+                    .lines()
+                    .into_iter()
+                    .find(|l| l["fields"]["message"] == message)
+                {
+                    return Some(line);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            None
+        }
+    }
+
+    /// One provider answer, as the client should see it on every route.
+    struct Refusal {
+        status: u16,
+        retry_after: Option<&'static str>,
+        body: &'static str,
+        want: StatusCode,
+        reason: &'static str,
+        want_retry_after: Option<&'static str>,
+    }
+
+    fn refusals() -> Vec<Refusal> {
+        const JSON: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"projects/sentinel-project-123/locations/us-central1 is not allowed"}}"#;
+        let r = |status, retry_after, body, want, reason, want_retry_after| Refusal {
+            status,
+            retry_after,
+            body,
+            want,
+            reason,
+            want_retry_after,
+        };
+        vec![
+            r(
+                400,
+                None,
+                JSON,
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                None,
+            ),
+            r(
+                413,
+                None,
+                "request too large: projects/sentinel-project-123/locations/us-central1",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "bad_request",
+                None,
+            ),
+            r(
+                422,
+                None,
+                JSON,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bad_request",
+                None,
+            ),
+            r(
+                429,
+                Some("30"),
+                JSON,
+                StatusCode::TOO_MANY_REQUESTS,
+                "upstream_rate_limited",
+                Some("30"),
+            ),
+            // A CDN's HTML 429 keeps its class, and an hour becomes 60 s.
+            r(
+                429,
+                Some("3600"),
+                "<html>projects/sentinel-project-123/locations/us-central1</html>",
+                StatusCode::TOO_MANY_REQUESTS,
+                "upstream_rate_limited",
+                Some("60"),
+            ),
+            // An HTTP-date is not passed on.
+            r(
+                429,
+                Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+                JSON,
+                StatusCode::TOO_MANY_REQUESTS,
+                "upstream_rate_limited",
+                None,
+            ),
+            r(
+                401,
+                None,
+                JSON,
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                None,
+            ),
+            r(
+                403,
+                None,
+                JSON,
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                None,
+            ),
+            r(
+                404,
+                None,
+                JSON,
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                None,
+            ),
+            r(
+                503,
+                Some("5"),
+                JSON,
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                None,
+            ),
+        ]
+    }
+
+    /// A route and a body that reaches the provider on it.
+    const ROUTES: [(&str, &str); 6] = [
+        (
+            "/v1/messages",
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/messages",
+            r#"{"model":"m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        // The enveloped legacy routes, which used to return the provider's
+        // status and body inside `{"response": ..}`.
+        (
+            "/v1/anthropic/messages",
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        (
+            "/v1/openai/chat/completions",
+            r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+    ];
+
+    /// H1 through the real stack: a provider refusal on every route, buffered
+    /// and streaming, reaches the client classified, without the provider's
+    /// text or headers, with a request id, and settled at zero as `error`.
+    #[tokio::test]
+    async fn provider_refusals_reach_the_client_classified_and_without_provider_text() {
+        for case in refusals() {
+            let upstream = stub_upstream(case.status, case.retry_after, case.body).await;
+            for (path, body) in ROUTES {
+                let h = harness(Options {
+                    upstream: Some(upstream.clone()),
+                    ..Options::default()
+                });
+                let resp = h
+                    .send(with(
+                        request(&Method::POST, path, Body::from(body)),
+                        "x-tollgate-key",
+                        &h.key,
+                    ))
+                    .await;
+                let ctx = format!("{} {path} {body}", case.status);
+                assert_eq!(resp.status(), case.want, "{ctx}");
+                assert_eq!(resp.headers()["x-tollgate-reason"], case.reason, "{ctx}");
+                assert_eq!(
+                    resp.headers()
+                        .get(header::RETRY_AFTER)
+                        .map(|v| v.to_str().unwrap()),
+                    case.want_retry_after,
+                    "{ctx}"
+                );
+                for (name, _) in LEAKY_HEADERS {
+                    assert!(resp.headers().get(name).is_none(), "{ctx}: {name} copied");
+                }
+                assert_request_id(&resp, &ctx);
+                let text = String::from_utf8(
+                    axum::body::to_bytes(resp.into_body(), 1 << 20)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(!text.contains(SENTINEL), "{ctx}: {text}");
+                let events = h.usage.snapshot();
+                assert_eq!(events.len(), 1, "{ctx}");
+                assert_eq!(events[0].decision, "error", "{ctx}");
+                assert_eq!(events[0].cost_micros, 0, "{ctx}");
+            }
+        }
+    }
+
+    /// A provider's 2xx passes through, but none of its headers do.
+    #[tokio::test]
+    async fn a_provider_success_carries_no_provider_headers() {
+        let upstream = stub_upstream(
+            200,
+            Some("30"),
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .await;
+        let h = harness(Options {
+            upstream: Some(upstream),
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(&Method::POST, "/v1/messages", Body::from(ROUTES[0].1)),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        for (name, _) in LEAKY_HEADERS {
+            assert!(resp.headers().get(name).is_none(), "{name} copied");
+        }
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+        assert_request_id(&resp, "success");
+    }
+
+    /// The operator can find the provider's reason by the client's request id;
+    /// the provider's text is in the opt-in TRACE line only.
+    #[tokio::test]
+    async fn a_provider_refusal_is_logged_with_the_clients_request_id() {
+        let upstream = stub_upstream(
+            400,
+            None,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"projects/sentinel-project-123/locations/us-central1"}}"#,
+        )
+        .await;
+        for (path, body) in ROUTES {
+            for level in [tracing::Level::TRACE, tracing::Level::WARN] {
+                let captured = Captured::default();
+                let _guard = captured.install(level);
+                let h = harness(Options {
+                    upstream: Some(upstream.clone()),
+                    ..Options::default()
+                });
+                let resp = h
+                    .send(with(
+                        request(&Method::POST, path, Body::from(body)),
+                        "x-tollgate-key",
+                        &h.key,
+                    ))
+                    .await;
+                let id = resp.headers()[crate::auth_gate::REQUEST_ID_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let ctx = format!("{level} {path} {body}");
+                let warn = captured
+                    .wait_for("upstream refused the request")
+                    .await
+                    .unwrap_or_else(|| panic!("{ctx}: no refusal line"));
+                // The id is on the line itself, so a `warn` filter (which
+                // drops the INFO span) still finds it.
+                assert_eq!(warn["fields"]["request_id"], id.as_str(), "{ctx}");
+                assert_eq!(warn["fields"]["status"], 400, "{ctx}");
+                assert_eq!(
+                    warn["fields"]["provider_error_type"], "invalid_request_error",
+                    "{ctx}"
+                );
+                assert_eq!(
+                    warn["fields"]["provider_request_id"], "req_provider_1",
+                    "{ctx}"
+                );
+                assert!(!warn.to_string().contains(SENTINEL), "{ctx}");
+                // Written straight after the WARN line, by the same call.
+                let body_line = captured
+                    .lines()
+                    .into_iter()
+                    .find(|l| l["fields"]["message"] == "upstream refusal body");
+                if level == tracing::Level::TRACE {
+                    let line = body_line.unwrap_or_else(|| panic!("{ctx}: no body line"));
+                    assert!(line.to_string().contains(SENTINEL), "{ctx}");
+                    assert_eq!(line["target"], crate::provider::UPSTREAM_BODY_TARGET);
+                } else {
+                    assert!(body_line.is_none(), "{ctx}: body logged without opting in");
+                }
+            }
+        }
+    }
+
+    /// Requests get distinct ids, and a client's own value is never used.
+    #[tokio::test]
+    async fn the_request_id_is_generated_never_taken_from_the_client() {
+        let h = harness(Options::default());
+        let mut seen = std::collections::HashSet::new();
+        for path in ["/v1/models", "/console/nosuch", "/v1/messages/count_tokens"] {
+            for keyed in [false, true] {
+                let mut req = request(&Method::GET, path, Body::empty());
+                req = with(req, crate::auth_gate::REQUEST_ID_HEADER, "client-chosen-id");
+                if keyed {
+                    req = with(req, "x-tollgate-key", &h.key);
+                }
+                let resp = h.send(req).await;
+                let ctx = format!("{path} keyed={keyed}");
+                assert_request_id(&resp, &ctx);
+                let id = resp.headers()[crate::auth_gate::REQUEST_ID_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                assert_ne!(id, "client-chosen-id", "{ctx}");
+                assert!(seen.insert(id), "{ctx}: repeated id");
+            }
+        }
+        // Public paths are not gated and carry none.
+        let resp = h
+            .send(request(&Method::GET, "/healthz", Body::empty()))
+            .await;
+        assert!(
+            resp.headers()
+                .get(crate::auth_gate::REQUEST_ID_HEADER)
+                .is_none()
+        );
+    }
+
+    /// A refused stream is settled at 0 `error` before its response exists, so
+    /// a client that drops the response unread changes nothing. (A disconnect
+    /// part-way through the handler is the `Settlement` guard's job, covered by
+    /// the gateway's cancellation tests.)
+    #[tokio::test]
+    async fn a_refused_stream_is_settled_before_the_response_is_returned() {
+        let upstream = stub_upstream(429, Some("30"), "{}").await;
+        for path in ["/v1/messages", "/v1/chat/completions"] {
+            let h = harness(Options {
+                upstream: Some(upstream.clone()),
+                ..Options::default()
+            });
+            let body = r#"{"model":"m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+            let req = with(
+                request(&Method::POST, path, Body::from(body)),
+                "x-tollgate-key",
+                &h.key,
+            );
+            // Drop the response as soon as it exists.
+            drop(h.send(req).await);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            let events = h.usage.snapshot();
+            assert_eq!(events.len(), 1, "{path}");
+            assert_eq!(events[0].decision, "error", "{path}");
+            assert_eq!(events[0].cost_micros, 0, "{path}");
+        }
+    }
+
+    /// The Anthropic stream's pre-flight count under `exact` admission: a
+    /// provider 429 there is a 429 with its Retry-After, not a 502.
+    #[tokio::test]
+    async fn a_rate_limited_count_on_an_exact_stream_is_a_429() {
+        let upstream = stub_upstream(429, Some("30"), r#"{"type":"error"}"#).await;
+        let base = Options::default().deployment;
+        let h = harness(Options {
+            upstream: Some(upstream),
+            deployment: Deployment {
+                exact: true,
+                ..base
+            },
+            ..Options::default()
+        });
+        let body = r#"{"model":"m","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = h
+            .send(with(
+                request(&Method::POST, "/v1/messages", Body::from(body)),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()["x-tollgate-reason"], "upstream_rate_limited");
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "30");
+        assert_request_id(&resp, "exact stream count 429");
+        let events = h.usage.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, "error");
+        assert_eq!(events[0].cost_micros, 0);
     }
 }

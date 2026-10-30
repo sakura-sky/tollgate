@@ -34,7 +34,11 @@ use crate::pricing::format_micros;
 use crate::apikey::{self, KeyHasher};
 use crate::budget::{BudgetDenied, Budgets, Period, RequestCtx, Reservation, Scope};
 use crate::pricing::{PriceBook, Usage};
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{
+    Provider, ProviderError, RefusalDetail, UpstreamFault, classify_upstream_status,
+    log_upstream_refusal,
+};
+use tracing::Instrument as _;
 
 /// The header carrying the API key.
 pub const KEY_HEADER: &str = "x-tollgate-key";
@@ -159,6 +163,62 @@ pub enum Outcome {
     /// is logged, never returned to the client.
     BackendError(String),
     Upstream(String),
+    /// The provider answered with a non-2xx. The client gets the classified
+    /// refusal only (see [`UpstreamFault`]), never the provider's body; the
+    /// provider's details were logged with the request id.
+    UpstreamRefused(UpstreamFault),
+}
+
+/// The message for a provider refusal of the caller's request. Fixed text: the
+/// provider's own message can name the project, region and resource path. The
+/// log line for the request id carries the provider's error type and code.
+pub const UPSTREAM_REQUEST_REFUSED: &str = "the provider rejected this request; the operator can \
+     find the provider's error type and code by this response's x-tollgate-request-id";
+
+/// The message for a provider 429.
+pub const UPSTREAM_RATE_LIMITED: &str = "the provider is rate limiting this gateway; retry later";
+
+/// The `x-tollgate-reason` for a provider 429. The plainer `rate_limited` is
+/// kept free for a gateway-side limit, which Tollgate does not have yet.
+pub const REASON_UPSTREAM_RATE_LIMITED: &str = "upstream_rate_limited";
+
+/// The status a client gets for each provider refusal.
+#[must_use]
+pub fn upstream_fault_status(fault: UpstreamFault) -> StatusCode {
+    match fault {
+        UpstreamFault::Request(code) => {
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST)
+        }
+        UpstreamFault::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+        UpstreamFault::Provider => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// Add `Retry-After` to a response for a provider 429 that sent a valid one.
+/// The value is re-serialised from the parsed integer, never copied.
+#[must_use]
+pub fn with_retry_after(mut response: Response, fault: UpstreamFault) -> Response {
+    if let UpstreamFault::RateLimited {
+        retry_after_secs: Some(secs),
+    } = fault
+    {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(secs),
+        );
+    }
+    response
+}
+
+/// Log, at ERROR, a non-2xx that reached a success arm, which no path should
+/// produce, and say what the client gets instead. Kept in release builds: the
+/// alternative is returning the provider's body, which is the leak this guards.
+pub fn non_success_reached_success_arm(status: u16) {
+    tracing::error!(
+        status,
+        "a provider non-2xx reached a success response; answering 502 rather than \
+         returning the provider's body"
+    );
 }
 
 /// Map an [`Outcome`] to a standard HTTP response. Both the demo and production
@@ -166,6 +226,10 @@ pub enum Outcome {
 #[must_use]
 pub fn outcome_response(outcome: Outcome) -> Response {
     match outcome {
+        Outcome::Allowed { status, .. } if !(200..300).contains(&status) => {
+            non_success_reached_success_arm(status);
+            outcome_response(Outcome::UpstreamRefused(UpstreamFault::Provider))
+        }
         Outcome::Allowed {
             status,
             body,
@@ -244,6 +308,29 @@ pub fn outcome_response(outcome: Outcome) -> Response {
                 Json(json!({"error": "upstream provider error"})),
             )
                 .into_response()
+        }
+        Outcome::UpstreamRefused(fault) => {
+            let response = match fault {
+                UpstreamFault::Request(code) => (
+                    upstream_fault_status(fault),
+                    [("x-tollgate-reason", "bad_request")],
+                    Json(json!({"error": UPSTREAM_REQUEST_REFUSED, "status": code})),
+                )
+                    .into_response(),
+                UpstreamFault::RateLimited { .. } => (
+                    upstream_fault_status(fault),
+                    [("x-tollgate-reason", REASON_UPSTREAM_RATE_LIMITED)],
+                    Json(json!({"error": UPSTREAM_RATE_LIMITED})),
+                )
+                    .into_response(),
+                UpstreamFault::Provider => (
+                    upstream_fault_status(fault),
+                    [("x-tollgate-reason", "upstream_error")],
+                    Json(json!({"error": "upstream provider error"})),
+                )
+                    .into_response(),
+            };
+            with_retry_after(response, fault)
         }
     }
 }
@@ -411,6 +498,7 @@ impl GatewayCore {
             Ok(key_id) => {
                 self.evaluate_authenticated(
                     &key_id,
+                    None,
                     started.elapsed(),
                     provider_id,
                     rest_path,
@@ -431,9 +519,13 @@ impl GatewayCore {
     /// `auth_elapsed` is the time authentication took, so the overhead figures
     /// include it as they did when authentication ran here, without also
     /// counting the client's upload of the body in between.
+    ///
+    /// `request_id` is the id the client was given in `x-tollgate-request-id`,
+    /// put on the log line for a provider refusal so the two can be matched.
     pub async fn evaluate_authenticated(
         &self,
         key_id: &str,
+        request_id: Option<&str>,
         auth_elapsed: std::time::Duration,
         provider_id: &str,
         rest_path: &str,
@@ -472,6 +564,9 @@ impl GatewayCore {
             Err(ProviderError::Upstream(m) | ProviderError::MeteringFailed(m)) => {
                 return Outcome::Upstream(m);
             }
+            // A parser never asks the provider, so this is unreachable; its text
+            // names only the status.
+            Err(e @ ProviderError::Refused { .. }) => return Outcome::Upstream(e.to_string()),
         };
         // In fast admission, refuse requests that reference external media: their
         // token cost is not bounded by body size, so the reservation would be far
@@ -529,6 +624,36 @@ impl GatewayCore {
                     )
                     .await;
                     return Outcome::BadRequest(m);
+                }
+                // The provider refused the count: classified by its status, with
+                // its details logged and none of its text given to the client.
+                // Recorded as `error` at zero cost: nothing was reserved or
+                // forwarded.
+                Err(ProviderError::Refused {
+                    status,
+                    fault,
+                    detail,
+                }) => {
+                    log_upstream_refusal(
+                        request_id,
+                        provider_id,
+                        &parsed.model,
+                        status,
+                        fault,
+                        &detail,
+                    );
+                    self.record(
+                        &key_id,
+                        provider_id,
+                        &parsed.model,
+                        Usage::default(),
+                        0,
+                        "error",
+                        started,
+                        provider_micros,
+                    )
+                    .await;
+                    return Outcome::UpstreamRefused(fault);
                 }
                 Err(e) => {
                     // The only place this is logged. `count_refusal` logs 401
@@ -662,6 +787,32 @@ impl GatewayCore {
                     .await;
                 return Outcome::Upstream(msg);
             }
+            // A non-2xx whose body did not parse (an HTML 429 from a CDN):
+            // nothing was billed that anyone reported, so release it all, as
+            // the 502 this used to be did.
+            Err(ProviderError::Refused {
+                status,
+                fault,
+                detail,
+            }) => {
+                log_upstream_refusal(
+                    request_id,
+                    provider_id,
+                    &parsed.model,
+                    status,
+                    fault,
+                    &detail,
+                );
+                guard
+                    .settle_with_overhead(
+                        0,
+                        Usage::default(),
+                        "error",
+                        overhead_now(provider_micros),
+                    )
+                    .await;
+                return Outcome::UpstreamRefused(fault);
+            }
             // May well have been served and billed, but cannot be metered: a
             // timeout after the request was sent, or a 2xx that will not parse.
             // Releasing here would under-charge a request the provider is
@@ -790,6 +941,20 @@ impl GatewayCore {
                 overhead_now(provider_micros),
             )
             .await;
+        // Settled as above whatever the status. A non-2xx's body is the
+        // provider's and goes to the log only.
+        if !is_success {
+            let fault = classify_upstream_status(resp.status, resp.meta.retry_after_secs);
+            log_upstream_refusal(
+                request_id,
+                provider_id,
+                &parsed.model,
+                resp.status,
+                fault,
+                &RefusalDetail::from_value(&resp.meta, &resp.body),
+            );
+            return Outcome::UpstreamRefused(fault);
+        }
         Outcome::Allowed {
             status: resp.status,
             body: resp.body,
@@ -972,20 +1137,25 @@ impl Drop for Settlement {
             let key_id = self.key_id.clone();
             let provider = self.provider.clone();
             let model = self.model.clone();
-            handle.spawn(async move {
-                budgets.commit(&r, reserved).await;
-                usage
-                    .record(UsageEvent {
-                        key_id: &key_id,
-                        provider: &provider,
-                        model: &model,
-                        usage: Usage::default(),
-                        cost_micros: reserved,
-                        decision: "estimated",
-                        overhead_micros: overhead,
-                    })
-                    .await;
-            });
+            // In the request's span, so a failure logged by the ledger write
+            // carries the request id.
+            handle.spawn(
+                async move {
+                    budgets.commit(&r, reserved).await;
+                    usage
+                        .record(UsageEvent {
+                            key_id: &key_id,
+                            provider: &provider,
+                            model: &model,
+                            usage: Usage::default(),
+                            cost_micros: reserved,
+                            decision: "estimated",
+                            overhead_micros: overhead,
+                        })
+                        .await;
+                }
+                .instrument(tracing::Span::current()),
+            );
         }
     }
 }
@@ -1192,6 +1362,11 @@ mod tests {
         (core, generated.plaintext)
     }
 
+    /// Provider text that must never reach a client: a resource path naming the
+    /// deployment's project and region.
+    const SENTINEL: &str =
+        "projects/sentinel-project-123/locations/us-central1/publishers/google/models/x";
+
     /// A provider whose `forward` never returns, standing in for a slow LLM
     /// response, and one that fails in each of the two ways that matter.
     struct StubProvider(StubBehaviour);
@@ -1205,6 +1380,10 @@ mod tests {
         CountUnavailable,
         /// The provider refused the count: the caller's body is wrong.
         CountRefused,
+        /// The provider rate limited the count, with a Retry-After.
+        CountRateLimited,
+        /// `forward` returns a parsed non-2xx carrying provider text.
+        ForwardStatus(u16),
     }
 
     #[async_trait]
@@ -1233,11 +1412,25 @@ mod tests {
                 StubBehaviour::MaybeBilled => Err(ProviderError::MeteringFailed(
                     "timed out waiting for response".to_owned(),
                 )),
+                StubBehaviour::ForwardStatus(status) => Ok(crate::provider::ProviderResponse {
+                    status,
+                    body: serde_json::json!({"error": {
+                        "type": "invalid_request_error",
+                        "message": SENTINEL,
+                    }}),
+                    usage: Usage::default(),
+                    meta: crate::provider::ResponseMeta {
+                        retry_after_secs: Some(7),
+                        provider_request_id: Some("req_test".to_owned()),
+                    },
+                }),
                 // These fail at the count, so forward is never reached. Panic
                 // rather than return: reaching here would mean admission
                 // continued past a failed count, which is the hole `exact`
                 // exists to close.
-                StubBehaviour::CountUnavailable | StubBehaviour::CountRefused => {
+                StubBehaviour::CountUnavailable
+                | StubBehaviour::CountRefused
+                | StubBehaviour::CountRateLimited => {
                     panic!(
                         "forward reached on a count-failing stub. Either admission continued \
                          past a failed count, which is the hole `exact` exists to close, or \
@@ -1257,9 +1450,21 @@ mod tests {
                 StubBehaviour::CountUnavailable => {
                     Err(ProviderError::Upstream("count endpoint 503".to_owned()))
                 }
-                StubBehaviour::CountRefused => Err(ProviderError::BadRequest(
-                    "messages: at least one message is required".to_owned(),
-                )),
+                StubBehaviour::CountRefused => Err(ProviderError::Refused {
+                    status: 400,
+                    fault: UpstreamFault::Request(400),
+                    detail: Box::new(RefusalDetail {
+                        body: SENTINEL.to_owned(),
+                        ..RefusalDetail::default()
+                    }),
+                }),
+                StubBehaviour::CountRateLimited => Err(ProviderError::Refused {
+                    status: 429,
+                    fault: UpstreamFault::RateLimited {
+                        retry_after_secs: Some(5),
+                    },
+                    detail: Box::default(),
+                }),
                 _ => Ok(10),
             }
         }
@@ -1367,21 +1572,116 @@ mod tests {
         let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
 
         let out = core.evaluate("mock", "generate", &header(&key), body).await;
-        match out {
-            Outcome::BadRequest(m) => assert!(
-                m.contains("at least one message"),
-                "the provider's own reason must reach the caller, got {m}"
-            ),
-            Outcome::Upstream(m) => {
-                panic!("a refusal must not read as an outage: {m}")
-            }
-            _ => panic!("expected BadRequest"),
-        }
+        // The caller's fault, so its status (not a 502 an SDK would retry),
+        // and none of the provider's text.
+        assert!(
+            matches!(out, Outcome::UpstreamRefused(UpstreamFault::Request(400))),
+            "{}",
+            label(&out)
+        );
+        let response = outcome_response(out);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-tollgate-reason"], "bad_request");
+        let text = body_text(response).await;
+        assert!(!text.contains(SENTINEL), "{text}");
 
         let events = sink.snapshot();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, "error");
         assert_eq!(events[0].cost_micros, 0);
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_pre_flight_count_is_a_429_with_its_retry_after() {
+        let (mut core, key, sink) = core_with_stub(StubBehaviour::CountRateLimited);
+        core.admission_exact = true;
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":1000}"#;
+        let response =
+            outcome_response(core.evaluate("mock", "generate", &header(&key), body).await);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers()["x-tollgate-reason"],
+            REASON_UPSTREAM_RATE_LIMITED
+        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "5");
+        let events = sink.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, "error");
+        assert_eq!(events[0].cost_micros, 0);
+    }
+
+    /// The H1 leak: a provider non-2xx used to come back to the client
+    /// verbatim. Now every status is classified, settled as before, and the
+    /// provider's text stays out of the response.
+    #[tokio::test]
+    async fn a_provider_non_2xx_never_returns_the_providers_body() {
+        let body = r#"{"model":"demo","prompt":"hi","max_output_tokens":10}"#;
+        for (status, want, reason, retry_after) in [
+            (400, StatusCode::BAD_REQUEST, "bad_request", None),
+            (413, StatusCode::PAYLOAD_TOO_LARGE, "bad_request", None),
+            (422, StatusCode::UNPROCESSABLE_ENTITY, "bad_request", None),
+            (
+                429,
+                StatusCode::TOO_MANY_REQUESTS,
+                REASON_UPSTREAM_RATE_LIMITED,
+                Some("7"),
+            ),
+            (401, StatusCode::BAD_GATEWAY, "upstream_error", None),
+            (403, StatusCode::BAD_GATEWAY, "upstream_error", None),
+            (404, StatusCode::BAD_GATEWAY, "upstream_error", None),
+            (500, StatusCode::BAD_GATEWAY, "upstream_error", None),
+            (503, StatusCode::BAD_GATEWAY, "upstream_error", None),
+            (529, StatusCode::BAD_GATEWAY, "upstream_error", None),
+        ] {
+            let (core, key, sink) = core_with_stub(StubBehaviour::ForwardStatus(status));
+            let out = core.evaluate("mock", "generate", &header(&key), body).await;
+            assert!(
+                matches!(out, Outcome::UpstreamRefused(_)),
+                "{status}: {}",
+                label(&out)
+            );
+            let response = outcome_response(out);
+            assert_eq!(response.status(), want, "{status}");
+            assert_eq!(response.headers()["x-tollgate-reason"], reason, "{status}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap()),
+                retry_after,
+                "{status}"
+            );
+            let text = body_text(response).await;
+            assert!(!text.contains(SENTINEL), "{status}: {text}");
+            assert!(!text.contains("invalid_request_error"), "{status}: {text}");
+            // Settled exactly as before: what the provider reported (zero
+            // here), recorded as an error.
+            let events = sink.snapshot();
+            assert_eq!(events.len(), 1, "{status}");
+            assert_eq!(events[0].decision, "error", "{status}");
+            assert_eq!(events[0].cost_micros, 0, "{status}");
+        }
+    }
+
+    /// A non-2xx can never leave through a success arm, in release builds too.
+    #[tokio::test]
+    async fn a_non_2xx_allowed_outcome_is_answered_with_a_502() {
+        let response = outcome_response(Outcome::Allowed {
+            status: 403,
+            body: serde_json::json!({"error": SENTINEL}),
+            cost_micros: 0,
+            overhead_micros: 0,
+            key_id: "k".to_owned(),
+        });
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!body_text(response).await.contains(SENTINEL));
     }
 
     /// The test that should have existed first.
@@ -1569,6 +1869,7 @@ mod tests {
             Outcome::BudgetDenied(_) => "budget_denied",
             Outcome::BackendError(_) => "backend_error",
             Outcome::Upstream(_) => "upstream",
+            Outcome::UpstreamRefused(_) => "upstream_refused",
         }
     }
 }
