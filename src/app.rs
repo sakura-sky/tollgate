@@ -486,7 +486,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // `config_errors_are_reported_before_postgres_is_touched` pins the order.
     let db = crate::db::build_pool(&cfg.database).await?;
     // DEV ONLY (the compose stack): apply migrations at boot. It runs after the
-    // config checks above, so a misconfigured process never touches the schema.
+    // config checks above, so a mistake in any of those never touches the schema.
     // Production keeps migrations an explicit `admin migrate` step, and the
     // schema check below still guards it.
     if cfg.database.auto_migrate {

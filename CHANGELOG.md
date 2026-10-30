@@ -7,7 +7,10 @@ SPDX-FileCopyrightText: 2026 Andrew Stevens
 
 Notable changes per release.
 
-## Unreleased
+## v0.3.0
+
+Streams charged what they measured, Vertex locations that resolve, and budgets
+that are enforced as set or reported when they cannot be.
 
 Upgrading requires migration 0011, which can refuse to run and starts enforcing
 per-key budgets that were previously ignored. Read the upgrade note under Fixed
@@ -27,12 +30,15 @@ first.
 - `TOLLGATE_DATABASE__AUTO_MIGRATE` (default off, dev only): `serve` applies
   pending migrations at boot, after all config checks (billing, pepper, the
   OpenAI-compatible upstream, the Vertex project and location, admission mode,
-  Redis URL), so a misconfigured
-  process never touches the schema. The compose `app` profile sets it.
+  Redis URL), so a mistake in any of those stops the process before it touches
+  the schema. Migrations do run before the Redis connection, the schema and
+  budget checks and binding the port, and against whatever database URL is
+  configured. The compose `app` profile sets it.
   Production should keep running `admin migrate` explicitly.
 - `TOLLGATE_DEMO_BIND_ALL`: `tollgate demo` honours the IP in
   `TOLLGATE_HTTP__BIND` instead of forcing loopback, which a container needs. It
-  prints a warning banner whenever the demo is not on loopback.
+  prints a warning banner whenever the demo is not on loopback. The bind address
+  defaults to `0.0.0.0:8080`, so the flag on its own listens on every interface.
 - `scripts/demo.sh` runs the demo in Docker when cargo is missing or
   `USE_DOCKER=1`, publishing on `127.0.0.1` only.
 
@@ -58,7 +64,9 @@ first.
   `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` without a scheme, such as `collector:4317`,
   is rewritten to `https://` by the new exporter, and this build has no TLS, so
   Tollgate now refuses any endpoint that is not `http://host:port` or
-  `unix:///path`, with a message saying what to set. An empty value now disables
+  `unix:///path`, with a message saying what to set. The message names only the
+  scheme of the refused value, never the value itself, since an endpoint can
+  carry credentials or a token. An empty value now disables
   export; before, it fell back to the `OTEL_EXPORTER_OTLP_*` variables and then
   `http://localhost:4317`. Transient export failures are now retried (up to
   three times, with backoff).

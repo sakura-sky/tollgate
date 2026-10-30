@@ -104,7 +104,9 @@ Inspect spend with the console endpoints (which require the key):
 hands out the demo key. Inside a container loopback is unreachable from the
 host, so `TOLLGATE_DEMO_BIND_ALL=1` makes it honour the IP in
 `TOLLGATE_HTTP__BIND` instead and prints a warning banner; publish that
-container's port on `127.0.0.1` only. Or run the whole narrated sequence at once:
+container's port on `127.0.0.1` only. `TOLLGATE_HTTP__BIND` defaults to
+`0.0.0.0:8080`, so outside a container leave the flag unset: on its own it
+listens on every interface. Or run the whole narrated sequence at once:
 
 ```bash
 ./scripts/demo.sh

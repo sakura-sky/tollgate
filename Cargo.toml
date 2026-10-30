@@ -1,6 +1,6 @@
 [package]
 name = "tollgate"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 # 1.88, not 1.85. The older MSRV was pinning `redis` five minor versions back:
 # 1.2.3 onward require 1.88, so dependabot kept proposing updates CI had to
