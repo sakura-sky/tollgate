@@ -87,6 +87,11 @@ pub enum BudgetCommand {
         /// Spend ceiling in the deployment's currency (e.g. dollars).
         #[arg(long)]
         limit: f64,
+        /// Allow a `model:` scope for a model that has no current price yet, so
+        /// its cap applies once it is priced and the gateway has reloaded. Without it, an unpriced
+        /// model is refused, because a typo there would never match anything.
+        #[arg(long)]
+        allow_unpriced: bool,
         /// `--hard-stop false` makes this a soft cap: spend is still counted
         /// against it and a breach is logged at WARN, but no request is
         /// refused. Defaults to true.
@@ -300,8 +305,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             scope,
             period,
             limit,
+            allow_unpriced,
             hard_stop,
-        })) => admin_budget_set(&cfg, &scope, &period, limit, hard_stop).await,
+        })) => admin_budget_set(&cfg, &scope, &period, limit, hard_stop, allow_unpriced).await,
         Command::Admin(AdminCommand::Price(PriceCommand::Set {
             provider,
             model,
@@ -499,6 +505,16 @@ async fn admin_key_issue(cfg: &Config, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse and normalise a `--scope` value, refusing anything that could never
+/// match a request. Pure, so it is testable without a database; the checks that
+/// need one (the key exists, the model is priced) follow in `admin_budget_set`.
+///
+/// - `api_key:<id>` is stored in canonical form. Any other form used to be
+///   stored verbatim and never matched its key.
+/// - `provider:<id>` must be a provider this build can register. Scopes follow
+///   the ROUTE a request arrives on: the OpenAI-compatible route is `openai`
+///   whatever its upstream, so `provider:vertex` does not cover it.
+/// - `model:<provider>:<model>` must name such a provider and a non-empty model.
 fn parse_scope(scope: &str) -> Result<(&'static str, Option<String>)> {
     if scope == "global" {
         return Ok(("global", None));
@@ -506,10 +522,40 @@ fn parse_scope(scope: &str) -> Result<(&'static str, Option<String>)> {
     let (kind, id) = scope
         .split_once(':')
         .context("scope must be `global` or `<kind>:<id>`")?;
+    let known = || crate::budget::PROVIDER_IDS.join(", ");
     match kind {
-        "api_key" => Ok(("api_key", Some(id.to_owned()))),
-        "provider" => Ok(("provider", Some(id.to_owned()))),
-        "model" => Ok(("model", Some(id.to_owned()))),
+        "api_key" => {
+            // The rejected text is not echoed: an operator who pastes a secret
+            // here by mistake must not find it in a terminal or CI log.
+            let canonical = crate::budget::canonical_key_id(id)
+                .context("api_key scope id must be a UUID (the key's id, not the key)")?;
+            Ok(("api_key", Some(canonical)))
+        }
+        "provider" => {
+            if !crate::budget::PROVIDER_IDS.contains(&id) {
+                bail!(
+                    "unknown provider {id:?}; expected one of: {}. Scopes follow the route a \
+                     request uses, so /v1/chat/completions is `openai` whatever its upstream",
+                    known()
+                );
+            }
+            Ok(("provider", Some(id.to_owned())))
+        }
+        "model" => {
+            let (provider, model) = id
+                .split_once(':')
+                .context("model scope must be `model:<provider>:<model>`")?;
+            if !crate::budget::PROVIDER_IDS.contains(&provider) {
+                bail!(
+                    "unknown provider {provider:?} in model scope; expected one of: {}",
+                    known()
+                );
+            }
+            if model.is_empty() {
+                bail!("model scope must name a model: `model:<provider>:<model>`");
+            }
+            Ok(("model", Some(id.to_owned())))
+        }
         other => bail!("unknown scope kind: {other}"),
     }
 }
@@ -520,8 +566,17 @@ async fn admin_budget_set(
     period: &str,
     limit: f64,
     hard_stop: bool,
+    allow_unpriced: bool,
 ) -> Result<()> {
     let (scope_type, scope_id) = parse_scope(scope)?;
+    if allow_unpriced && scope_type != "model" {
+        bail!("--allow-unpriced applies only to model: scopes");
+    }
+    // The scope as stored, which is what the audit trail and the output show.
+    let canonical_scope = match &scope_id {
+        Some(id) => format!("{scope_type}:{id}"),
+        None => scope_type.to_owned(),
+    };
     let limit_micros = to_micros(limit)?;
     if !matches!(period, "daily" | "weekly" | "monthly") {
         bail!("period must be daily, weekly, or monthly (got {period})");
@@ -541,6 +596,42 @@ async fn admin_budget_set(
                 .context("checking api key exists")?;
         if exists.is_none() {
             bail!("no api key with id {id}");
+        }
+    }
+
+    // A model budget for a model with no current price can never match: an
+    // unpriced model is refused before budgets are looked at. Refused by default,
+    // because the likeliest cause is a typo. `--allow-unpriced` stages the cap
+    // ahead of the price, which is the safer order when it is deliberate.
+    // Recorded in the audit row: null for scopes that are not models.
+    let mut priced: Option<bool> = None;
+    if scope_type == "model" {
+        let id = scope_id.as_deref().unwrap_or_default();
+        let (provider, model) = id.split_once(':').unwrap_or((id, ""));
+        let found = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM model_prices WHERE provider = $1 AND model = $2 \
+             AND effective_to IS NULL",
+        )
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(&pool)
+        .await
+        .context("checking the model is priced")?
+        .is_some();
+        priced = Some(found);
+        if !found {
+            if allow_unpriced {
+                eprintln!(
+                    "warning: {provider}/{model} has no current price, so this budget will not \
+                     apply until it is priced (`admin price set`)"
+                );
+            } else {
+                bail!(
+                    "{provider}/{model} has no current price, so this budget could never apply. \
+                     Check the name, set the price first with `admin price set`, or pass \
+                     --allow-unpriced to stage the budget before the price"
+                );
+            }
         }
     }
 
@@ -576,18 +667,21 @@ async fn admin_budget_set(
     record_audit(
         &mut tx,
         "budget.set",
-        scope,
+        &canonical_scope,
         json!({
             "period": period,
             "limit_micros": limit_micros,
             "hard_stop": hard_stop,
+            "input_scope": scope,
+            "allow_unpriced": allow_unpriced,
+            "model_priced": priced,
         }),
     )
     .await?;
     tx.commit().await.context("commit transaction")?;
 
     println!(
-        "budget set: scope={scope} period={period} limit={} hard_stop={hard_stop}",
+        "budget set: scope={canonical_scope} period={period} limit={} hard_stop={hard_stop}",
         crate::pricing::format_micros(limit_micros)
     );
     Ok(())
@@ -929,5 +1023,40 @@ mod tests {
             carry_long_context(flags(None, None, None, true), carried),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn budget_scopes_that_could_never_match_are_refused() {
+        // api_key ids are stored canonically, whatever form was typed.
+        assert_eq!(
+            parse_scope("api_key:A1A2A3A4B1B2C1C2D1D2D3D4D5D6D7D8").unwrap(),
+            (
+                "api_key",
+                Some("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8".to_owned())
+            )
+        );
+        let err = parse_scope("api_key:not-a-uuid-SECRETISH").unwrap_err();
+        assert!(
+            !format!("{err:#}").contains("SECRETISH"),
+            "a rejected id must not be echoed: {err:#}"
+        );
+        // Providers must be ones this build registers.
+        assert_eq!(
+            parse_scope("provider:vertex").unwrap(),
+            ("provider", Some("vertex".to_owned()))
+        );
+        assert!(parse_scope("provider:vertx").is_err());
+        assert!(parse_scope("provider:").is_err());
+        // Model scopes need a known provider and a model name.
+        assert_eq!(
+            parse_scope("model:openai:gemini-x").unwrap(),
+            ("model", Some("openai:gemini-x".to_owned()))
+        );
+        assert!(parse_scope("model:openia:gemini-x").is_err());
+        assert!(parse_scope("model:openai:").is_err());
+        assert!(parse_scope("model:gemini-x").is_err());
+        // Unchanged.
+        assert_eq!(parse_scope("global").unwrap(), ("global", None));
+        assert!(parse_scope("tenant:x").is_err());
     }
 }

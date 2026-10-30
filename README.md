@@ -248,7 +248,7 @@ The gateway exposes standard operational endpoints for your SRE stack:
 
 - `GET /healthz` - liveness ping
 - `GET /readyz` - readiness
-- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, and `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` decision, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
+- `GET /metrics` - Prometheus text format: `tollgate_up`, `tollgate_requests_total` by decision (`allowed`, `estimated`, `rejected_budget`, `unpriced`, `error`, `unauthenticated`), `tollgate_cost_micros_total`, `tollgate_budget_limit_micros` labelled by scope, period and whether the cap is hard, and `tollgate_unmatchable_budgets`, the number of configured budgets that cannot match some or all of their requests: a key id that is not a UUID, a provider that is not enabled, a model with no current price, or a model also priced under a second name with no budget at least as hard of its own. A Vertex budget while `/v1/chat/completions` also reaches Vertex is logged but not counted, since no budget can clear it. Alert on it being above zero; a budget staged on purpose for a disabled provider or an unpriced model keeps it raised until it can match. Counters are process-lifetime and reset on restart. A scrape reads process memory only and deliberately queries neither Postgres nor Valkey, so budget *spend* is not exported: those figures live in the two stores that fail during an incident, and an observability path that dies with the thing it observes is worse than one with a stated limit. Spend is on `/console/budgets`, which queries Postgres and says so. That describes `serve`. `tollgate demo` deliberately exposes a different set: it adds a `tollgate_budget_spent_micros` gauge (everything it knows is already in memory), omits the `estimated` decision and the `tollgate_unmatchable_budgets` gauge, and labels `tollgate_budget_limit_micros` by scope only. Do not size a dashboard on what the demo shows.
 
 Traces export via OTLP when `TOLLGATE_TELEMETRY__OTLP_ENDPOINT` is set. The endpoint must be `http://host:port` or `unix:///path`: export is plaintext gRPC with no TLS compiled in, so send traces to a local OpenTelemetry Collector and let it use TLS to your backend. Any other value is refused at startup, and an empty value disables export.
 
@@ -335,8 +335,23 @@ cargo run -- admin budget set --scope api_key:<id> --period monthly --limit 25
 ```
 
 Scopes are `global`, `api_key:<uuid>`, `provider:<name>`, or
-`model:<provider:model>`, where the provider slug must be lowercase and match
-`^[a-z][a-z0-9_-]*$`; periods are `daily`, `weekly`, or `monthly`. Revoke a
+`model:<provider:model>`; periods are `daily`, `weekly`, or `monthly`.
+`admin budget set` refuses a scope that could never match a request: a key id
+that is not a UUID (any UUID form is accepted and stored in canonical form), a
+provider other than `anthropic`, `mock`, `openai` or `vertex`, or a model with no
+current price. Pass `--allow-unpriced` to set a model's cap before its price, so
+the cap applies once the model is priced and the gateway has reloaded. The CLI
+checks the provider name against the four this build knows, not against what a
+deployment has enabled, so a budget for a provider that is switched off is
+accepted and then reported by the warning and the gauge below. Scopes follow the route a request
+uses: `/v1/chat/completions` is `openai` whatever its upstream, so
+`provider:vertex` does not cover it, and `/v1/{provider}/...` uses the path
+segment. A model priced under two names (for example `gemini-x` and
+`google/gemini-x`) needs a budget under each, and each budget enforces its own
+limit, so split the intended cap between them. At startup
+and whenever the set changes on reload, the gateway logs a warning for every
+budget that cannot match some or all of its requests, and
+`tollgate_unmatchable_budgets` counts those a budget change could fix. Revoke a
 key with `admin key revoke --key <key-or-prefix>`. Set model prices (per 1,000,000
 tokens) so spend can be costed:
 
@@ -401,7 +416,11 @@ that `exact` adds to every request. So the header is what Tollgate costs you in
 Budget and price changes apply within the reload interval
 (`TOLLGATE_RELOAD__INTERVAL`, default 15s) without restarting the gateway; set it
 to `0s` to read config only at startup. A changed limit applies to the existing
-spend counter; a brand-new budget starts counting when it is first picked up.
+spend counter; a brand-new budget's counter, if it has none yet, is seeded from
+the spend already recorded this period when it is first picked up. Each load also re-checks every
+budget against the enabled providers and current prices, logs any that cannot
+match (once per change) and updates `tollgate_unmatchable_budgets`; with `0s`
+that check runs only at startup.
 
 ### Admission modes and the hard-stop guarantee
 
@@ -455,7 +474,7 @@ Known limitations in this release, stated up front:
 - **A `cache_control` block carrying an explicit `ttl` is refused on the Anthropic path.** A 1-hour cache write bills at a different multiple of the input rate than the default 5-minute write, and one configured cache-write rate cannot express both, so an operator who priced the 5m write would reserve at that rate and settle above it. The request gets a `400`.
 - **`exact` admission is a strict cap only over what the request body reveals.** The reservation is computed from the tokens the request presents. Two classes escape it: server-injected tool-use prompt tokens, and prompts that reference a stored context cache by name, where the body is small but the metered prompt is the full cached size. Both settle correctly and are never under-charged, but they can settle above their reservation and so overshoot a hard cap on the request that crosses it. On Vertex the second case is not merely hard but impossible: `:countTokens` refuses the `cachedContent` field outright, so no pre-flight count can see a cached prompt's real size.
 - **Observe endpoints are flat-authorized.** Any valid key can view the whole deployment's budgets and usage (single-tenant by design). This concerns only the read-only console and `/console/*` endpoints; budget *enforcement* is still per key. Per-tenant scoping is an Enterprise-edition concern.
-- **`/metrics` reports decisions and limits, not spend.** A scrape reads process memory and queries neither Postgres nor Valkey, so there is no `tollgate_budget_spent` series: the authoritative figures live in the two stores that fail during the incident you would be using metrics to diagnose. Counters reset on restart. For spend, read `/console/budgets`, which queries and says so.
+- **`/metrics` reports decisions, limits and the number of unmatchable budgets, not spend.** A scrape reads process memory and queries neither Postgres nor Valkey, so there is no `tollgate_budget_spent` series: the authoritative figures live in the two stores that fail during the incident you would be using metrics to diagnose. Counters reset on restart. For spend, read `/console/budgets`, which queries and says so.
 - **Some spend is estimated rather than measured, and says so.** When usage cannot be trusted (an upstream that timed out after the request was sent, a response body that will not parse, self-contradictory token counts, a stream without the provider's finish, usage and end marker), Tollgate charges the request's reservation rather than releasing it, because the provider may well have served and billed it. Those rows are recorded as `estimated`, and `/console/usage` reports `measured_cost` alongside `estimated_cost`. This deliberately over-charges: releasing instead would under-charge a request the provider is invoicing. Two `estimated` cases charge less than the full reservation on purpose: a 2xx that reports no usage at all (a safety-blocked response) is charged the reserved prompt leg, and an Anthropic stream that errored before generating anything is charged the same.
 - **Soft budgets count and log, and refuse nothing.** `admin budget set --hard-stop false` records spend against a budget and logs a WARN each time it is exceeded, but never returns a `402`. There is no alerting, no metric, and no console indication beyond the flag itself, so a soft cap is a log line, not a notification. Budgets are hard by default.
 - **Postgres is on the request path, and an outage looks like mass key revocation.** Every request does one Postgres lookup to verify its API key, and one insert to append to the ledger. There is no key cache. If Postgres is unreachable, key verification fails and clients receive `401`, not `503`, and those refusals also land on the `unauthenticated` metric, so a database outage reads there like a burst of credential guessing. Reserve and settle normally touch only Valkey, but reserve also reads the ledger whenever a budget counter is absent, which is the first request of every period and any request after a cache loss, and it refuses with `503` if the ledger cannot answer. See the durability section of [`docs/OPERATIONS.md`](./docs/OPERATIONS.md). The ledger insert is best effort: a failure is logged and the request still succeeds, so a sustained Postgres outage means spend that Valkey enforced and the ledger never recorded.
@@ -499,6 +518,11 @@ TOLLGATE_DATABASE__URL="$(gcloud secrets versions access latest --secret=<prefix
 ```
 
 Run it before the first deploy, and again before any deploy that adds a migration.
+Migration 0011 stores per-key budget ids in canonical form and can refuse,
+listing the rows, if an id is not a UUID or two budgets name one key and period.
+Budgets that were silently never enforced start enforcing once each instance
+loads them, against spend already recorded; the changelog has a query that
+previews them.
 
 **It enables no upstream provider.** Every provider defaults to disabled, so the module as applied serves health, metrics and the console and refuses every proxied request. That is fail-closed on purpose. Opt in with the `provider_env` variable:
 

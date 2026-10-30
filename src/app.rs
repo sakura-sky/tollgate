@@ -37,7 +37,9 @@ use crate::backends::{
     PgKeyStore, PgSpendLedger, PgUsageSink, RedisBudgetBackend, SpendLedger, budget_spent,
     load_budgets, load_prices,
 };
-use crate::budget::{Budget, RequestCtx, Scope};
+use crate::budget::{
+    Budget, PROVIDER_ANTHROPIC, PROVIDER_MOCK, PROVIDER_OPENAI, PROVIDER_VERTEX, RequestCtx, Scope,
+};
 use crate::config::Config;
 use crate::gateway::{
     GatewayCore, KeyStore, Metrics, ReserveError, Settlement, UsageSink, outcome_response,
@@ -120,6 +122,168 @@ impl CoreParts {
             metrics: self.metrics.clone(),
         }
     }
+}
+
+/// One problem with one budget. `counted` findings raise the
+/// `tollgate_unmatchable_budgets` gauge because the operator can clear them; the
+/// Vertex-route note cannot be cleared by any budget, so it is logged only.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BudgetFinding {
+    budget: String,
+    reason: String,
+    counted: bool,
+}
+
+/// Find every budget that cannot match some or all of the requests it appears to
+/// cover, so it is reported rather than silently not applying. A budget can have
+/// more than one finding.
+///
+/// Cannot match anything:
+/// - an `api_key` id that is not a UUID (only possible for a row written outside
+///   the CLI before migration 0011 added its constraint);
+/// - a `provider` this deployment has not enabled;
+/// - a `model` whose provider is not enabled, or which has no current price
+///   (an unpriced model is refused before budgets are consulted).
+///
+/// Matches only part of the traffic it appears to cover:
+/// - a priced `model` that is also priced under a second name differing by a
+///   `/` prefix (such as `x` and `google/x`), when that name has no budget of its
+///   own for the same period that is at least as hard: requests sent under the
+///   other name are not covered;
+/// - a `vertex` provider or model budget when the OpenAI-compatible route also
+///   reaches Vertex: those requests are scoped as `openai`. Logged, not counted.
+///
+/// It does not refuse to boot: a budget for a provider that is switched off for
+/// now is legitimate configuration. It makes the gap visible. Aliases that do not
+/// differ by a `/` prefix (dated model ids, say) are not detected.
+fn unmatchable_budgets(
+    budgets: &[Budget],
+    prices: &PriceBook,
+    is_enabled: impl Fn(&str) -> bool,
+    openai_reaches_vertex: bool,
+) -> Vec<BudgetFinding> {
+    let mut out = Vec::new();
+    let mut add = |budget: &str, reason: String, counted: bool| {
+        out.push(BudgetFinding {
+            budget: budget.to_owned(),
+            reason,
+            counted,
+        });
+    };
+    let vertex_route_note = || {
+        "requests to /v1/chat/completions also reach Vertex, are scoped as `openai`, and are \
+         not covered by this budget"
+            .to_owned()
+    };
+    for b in budgets {
+        let at = format!("{} ({})", b.scope, b.period.as_str());
+        match &b.scope {
+            Scope::Global => {}
+            Scope::ApiKey(id) => {
+                if crate::budget::canonical_key_id(id).is_none() {
+                    add(
+                        &at,
+                        "the key id is not a UUID, so it matches no key".to_owned(),
+                        true,
+                    );
+                }
+            }
+            Scope::Provider(p) => {
+                if !is_enabled(p) {
+                    add(
+                        &at,
+                        format!("provider {p:?} is not enabled in this deployment"),
+                        true,
+                    );
+                } else if p == PROVIDER_VERTEX && openai_reaches_vertex {
+                    add(&at, vertex_route_note(), false);
+                }
+            }
+            Scope::Model(pm) => {
+                let (p, m) = pm.split_once(':').unwrap_or((pm.as_str(), ""));
+                if !is_enabled(p) {
+                    add(
+                        &at,
+                        format!("provider {p:?} is not enabled in this deployment"),
+                        true,
+                    );
+                    continue;
+                }
+                if prices.lookup(p, m).is_none() {
+                    let reason =
+                        format!("{p}/{m} has no current price, and unpriced models are refused");
+                    add(&at, reason, true);
+                    continue;
+                }
+                if p == PROVIDER_VERTEX && openai_reaches_vertex {
+                    add(&at, vertex_route_note(), false);
+                }
+                let tail = |s: &str| s.rsplit_once('/').map(|(_, t)| t.to_owned());
+                // Covered only by a budget for the same period that is at least as
+                // hard: a soft cap on the alias does not stop its traffic.
+                let has_own_budget = |alias: &str| {
+                    let scope = Scope::Model(format!("{p}:{alias}"));
+                    budgets.iter().any(|o| {
+                        o.scope == scope && o.period == b.period && (o.hard_stop || !b.hard_stop)
+                    })
+                };
+                let mut aliases: Vec<&str> = prices
+                    .models_for(p)
+                    .filter(|other| {
+                        *other != m
+                            && (tail(other).as_deref() == Some(m)
+                                || tail(m).as_deref() == Some(*other))
+                            && !has_own_budget(other)
+                    })
+                    .collect();
+                aliases.sort_unstable();
+                for alias in aliases {
+                    let reason = format!(
+                        "{p}/{alias} is also priced and has no budget at least as hard for \
+                         this period, so requests sent as {alias:?} are not covered"
+                    );
+                    add(&at, reason, true);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Log the findings when they differ from the last report, and set the gauge to
+/// the number of distinct budgets with a counted finding every time. Returns
+/// whether anything was logged. Comparing with the last report keeps a standing
+/// problem from logging every reload cycle.
+fn report_unmatchable(
+    last: &mut Vec<BudgetFinding>,
+    now: Vec<BudgetFinding>,
+    metrics: &Metrics,
+) -> bool {
+    let budgets: std::collections::BTreeSet<&str> = now
+        .iter()
+        .filter(|f| f.counted)
+        .map(|f| f.budget.as_str())
+        .collect();
+    metrics.unmatchable_budgets.store(
+        u64::try_from(budgets.len()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if now == *last {
+        return false;
+    }
+    for f in &now {
+        tracing::warn!(
+            budget = %f.budget,
+            reason = %f.reason,
+            "a configured budget cannot match some or all of its requests"
+        );
+    }
+    if now.is_empty() && !last.is_empty() {
+        tracing::info!("every configured budget can now match its requests");
+    }
+    *last = now;
+    true
 }
 
 /// Refuse to serve against a database that is behind this binary.
@@ -389,7 +553,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     if cfg.providers.enable_mock {
-        providers.insert("mock".to_owned(), Arc::new(MockProvider));
+        providers.insert(PROVIDER_MOCK.to_owned(), Arc::new(MockProvider));
     }
     let mut anthropic_handle: Option<Arc<crate::providers::AnthropicProvider>> = None;
     if cfg.providers.anthropic.enabled {
@@ -400,12 +564,15 @@ pub async fn serve(cfg: Config) -> Result<()> {
             cfg.providers.anthropic.base_url.clone(),
             cfg.providers.anthropic.version.clone(),
         ));
-        providers.insert("anthropic".to_owned(), arc.clone() as Arc<dyn Provider>);
+        providers.insert(
+            PROVIDER_ANTHROPIC.to_owned(),
+            arc.clone() as Arc<dyn Provider>,
+        );
         anthropic_handle = Some(arc);
     }
     if cfg.providers.vertex.enabled {
         providers.insert(
-            "vertex".to_owned(),
+            PROVIDER_VERTEX.to_owned(),
             Arc::new(crate::providers::VertexProvider::new(
                 http.clone(),
                 cfg.providers.vertex.project.clone(),
@@ -435,7 +602,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
             _ => unreachable!("openai upstream validated at boot"),
         };
         let arc = Arc::new(p);
-        providers.insert("openai".to_owned(), arc.clone() as Arc<dyn Provider>);
+        providers.insert(PROVIDER_OPENAI.to_owned(), arc.clone() as Arc<dyn Provider>);
         openai_handle = Some(arc);
     }
     let admission_exact = admission_mode == "exact";
@@ -457,13 +624,26 @@ pub async fn serve(cfg: Config) -> Result<()> {
         metrics: Arc::new(Metrics::default()),
     };
 
+    // Report, once at boot, every budget that cannot match some or all of its
+    // requests.
+    let openai_reaches_vertex =
+        cfg.providers.openai.enabled && cfg.providers.openai.upstream == "vertex";
+    let unmatchable = unmatchable_budgets(
+        &budgets,
+        &prices,
+        |p| parts.providers.contains_key(p),
+        openai_reaches_vertex,
+    );
+    report_unmatchable(&mut Vec::new(), unmatchable.clone(), &parts.metrics);
+
     let core = Arc::new(ArcSwap::from_pointee(parts.build(budgets.clone(), prices)));
     let budgets_view = Arc::new(ArcSwap::from_pointee(budgets));
 
     // Periodically reload budgets and prices from Postgres so `admin budget set`
     // and `admin price set` take effect without a restart. Only the config
     // swaps; spend counters are left untouched, so a changed limit applies to the
-    // existing counter and a new budget starts counting when it is picked up.
+    // existing counter and a new budget's counter, if it has none yet, is seeded
+    // from the spend already recorded this period when it is picked up.
     if !cfg.reload.interval.is_zero() {
         spawn_reload_task(
             db.clone(),
@@ -473,6 +653,8 @@ pub async fn serve(cfg: Config) -> Result<()> {
             cfg.reload.interval,
             cache_fallback,
             long_context,
+            unmatchable,
+            openai_reaches_vertex,
         );
         tracing::info!(interval = ?cfg.reload.interval, "config hot-reload enabled");
     }
@@ -502,6 +684,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
 /// Background task: reload budgets and prices from Postgres on an interval and
 /// atomically swap them into the live core. On any load error it logs and keeps
 /// the current config rather than dropping enforcement.
+#[allow(clippy::too_many_arguments)]
 fn spawn_reload_task(
     db: PgPool,
     parts: CoreParts,
@@ -510,6 +693,9 @@ fn spawn_reload_task(
     interval: Duration,
     cache_fallback: crate::pricing::CacheRateFallback,
     long_context: crate::pricing::LongContextTier,
+    // The set reported at boot, so the first reload does not repeat it.
+    mut last_unmatchable: Vec<BudgetFinding>,
+    openai_reaches_vertex: bool,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -560,6 +746,13 @@ fn spawn_reload_task(
                     "config reload: no Global budget; the deployment-wide backstop is not enforced"
                 );
             }
+            let unmatchable = unmatchable_budgets(
+                &budgets,
+                &prices,
+                |p| parts.providers.contains_key(p),
+                openai_reaches_vertex,
+            );
+            report_unmatchable(&mut last_unmatchable, unmatchable, &parts.metrics);
             core.store(Arc::new(parts.build(budgets.clone(), prices)));
             budgets_view.store(Arc::new(budgets));
             tracing::debug!(budgets = n_b, priced_models = n_p, "reloaded config");
@@ -734,7 +927,7 @@ async fn anthropic_messages(
     }
     let core = state.core.load_full();
     let outcome = core
-        .evaluate("anthropic", "messages", &headers, &body)
+        .evaluate(PROVIDER_ANTHROPIC, "messages", &headers, &body)
         .await;
     anthropic_outcome_response(outcome)
 }
@@ -899,7 +1092,7 @@ async fn openai_chat(State(state): State<AppState>, headers: HeaderMap, body: St
     }
     let core = state.core.load_full();
     let outcome = core
-        .evaluate("openai", "chat/completions", &headers, &body)
+        .evaluate(PROVIDER_OPENAI, "chat/completions", &headers, &body)
         .await;
     openai_outcome_response(outcome)
 }
@@ -947,11 +1140,15 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
         }
     };
 
-    let Some(price) = core.prices.lookup("anthropic", &parsed.model).cloned() else {
+    let Some(price) = core
+        .prices
+        .lookup(PROVIDER_ANTHROPIC, &parsed.model)
+        .cloned()
+    else {
         record_stream_refusal(
             &core,
             &key_id,
-            "anthropic",
+            PROVIDER_ANTHROPIC,
             &parsed.model,
             "unpriced",
             started,
@@ -996,7 +1193,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
                 record_stream_refusal(
                     &core,
                     &key_id,
-                    "anthropic",
+                    PROVIDER_ANTHROPIC,
                     &parsed.model,
                     "error",
                     started,
@@ -1032,7 +1229,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
     let reservation = {
         let ctx = RequestCtx {
             key_id: &key_id,
-            provider: "anthropic",
+            provider: PROVIDER_ANTHROPIC,
             model: &parsed.model,
         };
         match core.budgets.reserve(&ctx, reserve_micros).await {
@@ -1041,7 +1238,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
                 record_stream_refusal(
                     &core,
                     &key_id,
-                    "anthropic",
+                    PROVIDER_ANTHROPIC,
                     &parsed.model,
                     "rejected_budget",
                     started,
@@ -1059,7 +1256,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
                 record_stream_refusal(
                     &core,
                     &key_id,
-                    "anthropic",
+                    PROVIDER_ANTHROPIC,
                     &parsed.model,
                     "error",
                     started,
@@ -1090,7 +1287,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
         reservation,
         reserve_micros,
         key_id,
-        "anthropic".to_owned(),
+        PROVIDER_ANTHROPIC.to_owned(),
         parsed.model.clone(),
         overhead_micros,
     );
@@ -1130,7 +1327,7 @@ async fn anthropic_messages_stream(state: AppState, headers: HeaderMap, body: St
             line_buf: Vec::new(),
             meter: crate::providers::AnthropicStreamMeter::new(),
         },
-        "anthropic",
+        PROVIDER_ANTHROPIC,
         parsed.model,
     ));
 
@@ -1210,11 +1407,11 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         }
     };
 
-    let Some(price) = core.prices.lookup("openai", &parsed.model).cloned() else {
+    let Some(price) = core.prices.lookup(PROVIDER_OPENAI, &parsed.model).cloned() else {
         record_stream_refusal(
             &core,
             &key_id,
-            "openai",
+            PROVIDER_OPENAI,
             &parsed.model,
             "unpriced",
             started,
@@ -1244,7 +1441,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
     let reservation = {
         let ctx = RequestCtx {
             key_id: &key_id,
-            provider: "openai",
+            provider: PROVIDER_OPENAI,
             model: &parsed.model,
         };
         match core.budgets.reserve(&ctx, reserve_micros).await {
@@ -1253,7 +1450,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
                 record_stream_refusal(
                     &core,
                     &key_id,
-                    "openai",
+                    PROVIDER_OPENAI,
                     &parsed.model,
                     "rejected_budget",
                     started,
@@ -1268,8 +1465,16 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
             }
             Err(ReserveError::Backend(m)) => {
                 tracing::error!(error = %m, "budget backend error on stream reserve");
-                record_stream_refusal(&core, &key_id, "openai", &parsed.model, "error", started, 0)
-                    .await;
+                record_stream_refusal(
+                    &core,
+                    &key_id,
+                    PROVIDER_OPENAI,
+                    &parsed.model,
+                    "error",
+                    started,
+                    0,
+                )
+                .await;
                 return openai_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "backend_error",
@@ -1288,7 +1493,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         reservation,
         reserve_micros,
         key_id,
-        "openai".to_owned(),
+        PROVIDER_OPENAI.to_owned(),
         parsed.model.clone(),
         overhead_micros,
     );
@@ -1339,7 +1544,7 @@ async fn openai_chat_stream(state: AppState, headers: HeaderMap, body: String) -
         // there is no prompt-leg discount.
         reserve_micros,
         meter,
-        "openai",
+        PROVIDER_OPENAI,
         parsed.model,
     ));
 
@@ -2270,6 +2475,15 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     }
     let _ = write!(
         body,
+        "# HELP tollgate_unmatchable_budgets Configured budgets that cannot match some or all of \
+         their requests and that a budget change could fix (see the startup and reload \
+         warnings for which and why).\n\
+         # TYPE tollgate_unmatchable_budgets gauge\n\
+         tollgate_unmatchable_budgets {}\n",
+        load(&m.unmatchable_budgets),
+    );
+    let _ = write!(
+        body,
         "# HELP tollgate_cost_micros_total Settled cost since start, in currency micros.\n\
          # TYPE tollgate_cost_micros_total counter\n\
          tollgate_cost_micros_total {}\n\
@@ -3142,5 +3356,137 @@ mod tests {
         let (end, _, (actual, _, decision)) = relay(&[early, early], false, Client::Reads).await;
         assert_eq!(end, StreamEnd::Eof);
         assert_eq!((actual, decision), (RESERVE, "estimated"));
+    }
+
+    // ---- Budgets that can never match ------------------------------------
+
+    fn budget(scope: Scope) -> Budget {
+        Budget {
+            scope,
+            period: crate::budget::Period::Monthly,
+            limit_micros: 1_000_000,
+            hard_stop: true,
+        }
+    }
+
+    #[test]
+    fn unmatchable_budgets_names_each_dead_or_partial_budget() {
+        let prices = PriceBook::from_prices([
+            ModelPrice::new("openai", "gemini-x", 1, 1),
+            ModelPrice::new("openai", "google/gemini-x", 1, 1),
+            ModelPrice::new("anthropic", "claude-y", 1, 1),
+            ModelPrice::new("vertex", "gemini-z", 1, 1),
+        ]);
+        let enabled = |p: &str| matches!(p, "openai" | "anthropic" | "vertex");
+        let budgets = [
+            budget(Scope::Global),
+            budget(Scope::ApiKey(
+                "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8".to_owned(),
+            )),
+            budget(Scope::ApiKey("not-a-uuid".to_owned())),
+            budget(Scope::Provider("openai".to_owned())),
+            budget(Scope::Provider("mock".to_owned())),
+            budget(Scope::Model("anthropic:claude-y".to_owned())),
+            budget(Scope::Model("anthropic:claude-typo".to_owned())),
+            budget(Scope::Model("openai:gemini-x".to_owned())),
+        ];
+        let out = unmatchable_budgets(&budgets, &prices, enabled, false);
+        let has = |budget: &str, reason: &str| {
+            out.iter()
+                .any(|f| f.budget.starts_with(budget) && f.reason.contains(reason))
+        };
+        assert!(has("api_key:not-a-uuid", "not a UUID"), "{out:?}");
+        assert!(has("provider:mock", "not enabled"), "{out:?}");
+        assert!(
+            has("model:anthropic:claude-typo", "no current price"),
+            "{out:?}"
+        );
+        assert!(
+            has("model:openai:gemini-x", "google/gemini-x is also priced"),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.len(),
+            4,
+            "three dead budgets and one alias note: {out:?}"
+        );
+
+        // Budgeting the alias as well, for the same period, clears the note.
+        let mut both = budgets.to_vec();
+        both.push(budget(Scope::Model("openai:google/gemini-x".to_owned())));
+        let out = unmatchable_budgets(&both, &prices, enabled, false);
+        assert!(
+            !out.iter().any(|f| f.reason.contains("also priced")),
+            "{out:?}"
+        );
+
+        // A soft cap on the alias does not cover a hard-capped model.
+        let mut soft = budgets.to_vec();
+        let mut alias = budget(Scope::Model("openai:google/gemini-x".to_owned()));
+        alias.hard_stop = false;
+        soft.push(alias);
+        let out = unmatchable_budgets(&soft, &prices, enabled, false);
+        assert!(
+            out.iter().any(|f| f.reason.contains("also priced")),
+            "{out:?}"
+        );
+
+        // A Vertex budget is partial when the OpenAI-compatible route reaches
+        // Vertex too, and fine when it does not. No budget can clear that, so it
+        // is logged but not counted on the gauge.
+        let vertex = [
+            budget(Scope::Provider("vertex".to_owned())),
+            budget(Scope::Model("vertex:gemini-z".to_owned())),
+        ];
+        let notes = unmatchable_budgets(&vertex, &prices, enabled, true);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().all(|f| !f.counted), "{notes:?}");
+        assert!(unmatchable_budgets(&vertex, &prices, enabled, false).is_empty());
+
+        // A valid configuration reports nothing.
+        let ok = unmatchable_budgets(
+            &[
+                budget(Scope::Global),
+                budget(Scope::Model("anthropic:claude-y".to_owned())),
+            ],
+            &prices,
+            enabled,
+            false,
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn unmatchable_report_logs_on_change_and_counts_budgets_not_lines() {
+        use std::sync::atomic::Ordering;
+        let m = Metrics::default();
+        let mut last = Vec::new();
+        let finding = |budget: &str, reason: &str, counted: bool| BudgetFinding {
+            budget: budget.to_owned(),
+            reason: reason.to_owned(),
+            counted,
+        };
+        // Two findings for one budget count as one budget, and an uncounted
+        // finding does not count at all.
+        let dead = vec![
+            finding("model:openai:x (monthly)", "alias a", true),
+            finding("model:openai:x (monthly)", "alias b", true),
+            finding("provider:vertex (monthly)", "route", false),
+        ];
+        assert!(
+            report_unmatchable(&mut last, dead.clone(), &m),
+            "first report logs"
+        );
+        assert_eq!(m.unmatchable_budgets.load(Ordering::Relaxed), 1);
+        assert!(
+            !report_unmatchable(&mut last, dead, &m),
+            "unchanged set stays quiet"
+        );
+        assert_eq!(m.unmatchable_budgets.load(Ordering::Relaxed), 1);
+        assert!(
+            report_unmatchable(&mut last, Vec::new(), &m),
+            "the fix is reported"
+        );
+        assert_eq!(m.unmatchable_budgets.load(Ordering::Relaxed), 0);
     }
 }

@@ -560,7 +560,13 @@ impl BudgetBackend for RedisBudgetBackend {
 fn scope_from_row(scope_type: &str, scope_id: Option<String>) -> Option<Scope> {
     match scope_type {
         "global" => Some(Scope::Global),
-        "api_key" => scope_id.map(Scope::ApiKey),
+        // Canonical form, so a row written in any accepted form still matches
+        // its key. One that is not a UUID at all is kept as it is, where it can
+        // never match, and is reported by the unmatchable-budget warning rather
+        // than dropped: dropping a budget is a silent fail-open.
+        "api_key" => {
+            scope_id.map(|id| Scope::ApiKey(crate::budget::canonical_key_id(&id).unwrap_or(id)))
+        }
         "provider" => scope_id.map(Scope::Provider),
         "model" => scope_id.map(Scope::Model),
         _ => None,
@@ -597,6 +603,17 @@ pub async fn load_budgets(pool: &PgPool) -> Result<Vec<Budget>, sqlx::Error> {
             limit_micros: row.get::<i64, _>("limit_micros"),
             hard_stop: row.get::<bool, _>("hard_stop"),
         });
+    }
+    // Two rows can now name one key (one canonical, one not, written before
+    // migration 0011 or outside the CLI). Both would reserve against the same
+    // counter, so merge them to the stricter budget and say so.
+    let (budgets, merged) = crate::budget::merge_duplicate_budgets(budgets);
+    for m in &merged {
+        tracing::warn!(
+            budget = %m,
+            "two budgets name the same scope and period; enforcing the stricter one. \
+             Remove the duplicate row"
+        );
     }
     Ok(budgets)
 }
@@ -1579,5 +1596,34 @@ mod redis_live_tests {
                 "round {round}: counter moved by {moved}; 2000 means the reserve was REPLAYED"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The load path, not just the CLI: a row stored in any form `parse_str`
+    /// accepts, by an older binary or by hand, still enforces against its key,
+    /// and one that is not a UUID is kept (to be reported), never dropped.
+    #[test]
+    fn scope_from_row_canonicalises_api_key_ids_and_keeps_bad_ones() {
+        assert_eq!(
+            scope_from_row(
+                "api_key",
+                Some("A1A2A3A4B1B2C1C2D1D2D3D4D5D6D7D8".to_owned())
+            ),
+            Some(Scope::ApiKey(
+                "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8".to_owned()
+            ))
+        );
+        assert_eq!(
+            scope_from_row("api_key", Some("not-a-uuid".to_owned())),
+            Some(Scope::ApiKey("not-a-uuid".to_owned()))
+        );
+        assert_eq!(
+            scope_from_row("provider", Some("vertex".to_owned())),
+            Some(Scope::Provider("vertex".to_owned()))
+        );
     }
 }

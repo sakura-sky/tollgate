@@ -9,8 +9,16 @@ Notable changes per release.
 
 ## Unreleased
 
+Upgrading requires migration 0011, which can refuse to run and starts enforcing
+per-key budgets that were previously ignored. Read the upgrade note under Fixed
+first.
+
 ### Added
 
+- `admin budget set --allow-unpriced`, to set a model's cap before its price.
+- The `tollgate_unmatchable_budgets` gauge on `/metrics` (not exposed by
+  `tollgate demo`), counting budgets that cannot match some or all of their
+  requests.
 - The compose file can run Tollgate itself: `docker compose -f
   compose/docker-compose.yaml --profile app up -d --build`. The service is behind
   the `app` profile, so a plain `up -d` still starts only Postgres and Valkey and
@@ -61,6 +69,35 @@ Notable changes per release.
 
 ### Fixed
 
+- A per-key budget set with its key id in any form the uuid parser accepts
+  other than lowercase with hyphens (upper case, no hyphens, braces, a
+  `urn:uuid:` prefix) was accepted
+  and stored as typed, and never enforced: the key ran under the wider budgets
+  only. Ids are now stored and loaded in canonical form, and migration 0011
+  converts existing rows and adds a constraint so no other form can be stored.
+  **Upgrade note:** budgets that were silently not enforced start enforcing,
+  against the spend already recorded this period, as soon as an instance loads
+  them: an instance already running at its next config reload after 0011 is
+  applied, or at restart if `TOLLGATE_RELOAD__INTERVAL` is `0s`. An instance of
+  this version cannot start until 0011 is applied. A key over its intended cap
+  is refused straight away. To see which budgets this affects before migrating:
+  `SELECT id, scope_id, period, limit_micros FROM budgets WHERE scope_type =
+  'api_key' AND scope_id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';`.
+  The migration refuses, listing the rows, if an id is not a UUID at all or two
+  budgets name the same key and period in different forms; fix those and run it
+  again. Two rows for the same scope and period that still reach the gateway are
+  merged to the stricter one, with a warning.
+- `admin budget set` refuses `provider:` and `model:` scopes that could never
+  match: a provider this build does not have, or a model with no current price
+  (`--allow-unpriced` stages a model's cap before its price). Every budget that
+  cannot match some or all of its requests is logged at startup and when the set
+  changes on reload, and counted by the new gauge. That includes a budgeted
+  model also priced under a second name with no budget at least as hard of its
+  own. A Vertex
+  budget while `/v1/chat/completions` also reaches Vertex is logged but not
+  counted, since no budget can clear it: those requests are scoped as `openai`. The `budget.set` audit row now records the scope as
+  stored, with the typed form, `--allow-unpriced` and whether the model was
+  priced (null for other scopes) in its metadata. A rejected key id is no longer echoed back.
 - Streams on `/v1/chat/completions` that finished but whose client then
   disconnected or stopped reading are now charged their measured usage instead
   of their full reservation. The common case is a client that stops reading as

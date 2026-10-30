@@ -91,7 +91,10 @@ fn preload() -> Preloaded {
     let usage = Arc::new(MemUsageSink::new());
 
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
-    providers.insert("mock".to_owned(), Arc::new(MockProvider));
+    providers.insert(
+        crate::budget::PROVIDER_MOCK.to_owned(),
+        Arc::new(MockProvider),
+    );
 
     let core = GatewayCore {
         dummy_hash: hasher.hash("tollgate-fixed-dummy-secret"),

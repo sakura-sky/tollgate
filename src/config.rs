@@ -52,8 +52,9 @@ pub struct ReloadConfig {
     /// How often to reload budgets and model prices from Postgres so `admin
     /// budget set` / `price set` take effect without a restart. Set to `0s` to
     /// disable (config is then read only at startup). Changed limits apply to
-    /// the existing spend counters; a brand-new budget starts counting from when
-    /// it is picked up (a full period backfill still needs a restart).
+    /// the existing spend counters; a brand-new budget's counter, if it has none
+    /// yet, is seeded from the spend already recorded this period when it is
+    /// first picked up.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
 }

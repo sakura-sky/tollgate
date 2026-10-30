@@ -62,6 +62,73 @@ impl Period {
     }
 }
 
+/// Every provider id this build can register, and so every id a `provider:`
+/// or `model:` budget scope may name. The router registers and scopes requests
+/// under these constants, and `admin budget set` validates against
+/// [`PROVIDER_IDS`]. Add any new provider to that list.
+pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+pub const PROVIDER_MOCK: &str = "mock";
+pub const PROVIDER_OPENAI: &str = "openai";
+pub const PROVIDER_VERTEX: &str = "vertex";
+pub const PROVIDER_IDS: [&str; 4] = [
+    PROVIDER_ANTHROPIC,
+    PROVIDER_MOCK,
+    PROVIDER_OPENAI,
+    PROVIDER_VERTEX,
+];
+
+/// The canonical text of an API key id: the lowercase, hyphenated UUID that
+/// [`RequestCtx::key_id`] carries, which is what an `api_key` scope is compared
+/// against. Accepts, after trimming surrounding whitespace, every form
+/// `uuid::Uuid::parse_str` accepts and a `urn:uuid:` prefix in any case. `None`
+/// when the text is not a UUID at all.
+///
+/// A per-key budget stored in any other form never matches its key, which
+/// silently leaves the key under only the wider budgets: a fail-open. Every
+/// place an id enters or is read back from the budget table goes through this.
+#[must_use]
+pub fn canonical_key_id(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let bare = match raw.get(..9) {
+        Some(p) if p.eq_ignore_ascii_case("urn:uuid:") => &raw[9..],
+        _ => raw,
+    };
+    uuid::Uuid::parse_str(bare).ok().map(|u| u.to_string())
+}
+
+/// Collapse budgets that share a scope and period into one, keeping the lower
+/// limit and a hard stop if either was one, so two rows for the same key never
+/// both reserve against one counter. Returns the merged list and a description
+/// of each merge for the caller to log.
+///
+/// The schema refuses such duplicates once migration 0011 has run, but a row
+/// written outside the CLI, or before the migration, must still enforce once.
+#[must_use]
+pub fn merge_duplicate_budgets(budgets: Vec<Budget>) -> (Vec<Budget>, Vec<String>) {
+    let mut out: Vec<Budget> = Vec::with_capacity(budgets.len());
+    let mut merged = Vec::new();
+    for b in budgets {
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|e| e.scope == b.scope && e.period == b.period)
+        {
+            merged.push(format!(
+                "{} ({}): limits {} and {}; keeping {}",
+                b.scope,
+                b.period.as_str(),
+                existing.limit_micros,
+                b.limit_micros,
+                existing.limit_micros.min(b.limit_micros)
+            ));
+            existing.limit_micros = existing.limit_micros.min(b.limit_micros);
+            existing.hard_stop = existing.hard_stop || b.hard_stop;
+        } else {
+            out.push(b);
+        }
+    }
+    (out, merged)
+}
+
 /// What a budget applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -438,5 +505,78 @@ mod tests {
             hard_stop: true,
         }]);
         assert!(budgets.try_reserve(&ctx(), now(), 1).is_err());
+    }
+
+    /// Every form `parse_str` accepts, plus a `urn:uuid:` prefix in any case and
+    /// surrounding whitespace, canonicalises to the id the request carries, so
+    /// the budget applies. The
+    /// request side is a hard-coded literal, not `Uuid::to_string()`, so this
+    /// cannot pass merely because both sides went through the same function.
+    #[test]
+    fn every_accepted_key_id_form_canonicalises_and_applies() {
+        const KEY: &str = "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8";
+        let ctx = RequestCtx {
+            key_id: KEY,
+            provider: "vertex",
+            model: "m",
+        };
+        for form in [
+            "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8",
+            "A1A2A3A4-B1B2-C1C2-D1D2-D3D4D5D6D7D8",
+            "a1a2a3a4b1b2c1c2d1d2d3d4d5d6d7d8",
+            "{a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8}",
+            "urn:uuid:a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8",
+            "URN:UUID:A1A2A3A4-B1B2-C1C2-D1D2-D3D4D5D6D7D8",
+            " a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8 ",
+        ] {
+            let canon = canonical_key_id(form).unwrap_or_else(|| panic!("{form:?} rejected"));
+            assert_eq!(canon, KEY, "{form:?}");
+            assert!(Scope::ApiKey(canon).applies_to(&ctx), "{form:?}");
+        }
+        // Control: the raw non-canonical text, unconverted, does not apply.
+        // This is the fail-open the canonical form closes.
+        assert!(!Scope::ApiKey("A1A2A3A4B1B2C1C2D1D2D3D4D5D6D7D8".to_owned()).applies_to(&ctx));
+        for bad in [
+            "",
+            "not-a-uuid",
+            "a1a2a3a4",
+            "urn:uuid:",
+            "g1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8",
+        ] {
+            assert_eq!(canonical_key_id(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn provider_ids_are_the_four_this_build_registers() {
+        assert_eq!(PROVIDER_IDS, ["anthropic", "mock", "openai", "vertex"]);
+    }
+
+    #[test]
+    fn duplicate_budgets_merge_to_the_stricter_one() {
+        let key = Scope::ApiKey("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8".to_owned());
+        let b = |scope: Scope, period: Period, limit: i64, hard_stop: bool| Budget {
+            scope,
+            period,
+            limit_micros: limit,
+            hard_stop,
+        };
+        let (out, merged) = merge_duplicate_budgets(vec![
+            b(key.clone(), Period::Monthly, 500, false),
+            b(key.clone(), Period::Monthly, 300, true),
+            // Same key, different period: not a duplicate.
+            b(key.clone(), Period::Daily, 100, true),
+            b(Scope::Global, Period::Monthly, 1_000, true),
+        ]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        let monthly = out
+            .iter()
+            .find(|x| x.scope == key && x.period == Period::Monthly)
+            .unwrap();
+        assert_eq!(monthly.limit_micros, 300);
+        assert!(monthly.hard_stop, "a hard stop on either row must survive");
+        let (_, none) = merge_duplicate_budgets(vec![b(Scope::Global, Period::Monthly, 1, true)]);
+        assert!(none.is_empty());
     }
 }

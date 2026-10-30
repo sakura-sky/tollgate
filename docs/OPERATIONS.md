@@ -279,3 +279,14 @@ Alert on two log messages. `usage ledger maintenance failed` is the early
 warning, weeks before anything visibly breaks. `failed to write usage event` is
 the ledger already losing rows. Neither affects the response a client gets, which
 is exactly why they need an alert rather than a dashboard.
+
+Alert too on `tollgate_unmatchable_budgets` being above zero. Each budget it
+counts fails to cover some or all of the requests it appears to. For a non-UUID
+key id or a model priced under a second name, those requests run under the other
+budgets that match them (or are denied if none does); for a disabled provider or an unpriced model they are refused
+anyway. A Vertex budget while `/v1/chat/completions` also reaches Vertex is
+logged but not counted, because no budget can clear it. The warning "a configured budget cannot match some
+or all of its requests" names each budget and the reason, and is logged at
+startup and whenever the set changes on reload. A budget staged on purpose for a
+disabled provider or an unpriced model (`admin budget set --allow-unpriced`)
+keeps the gauge raised until it can match.
