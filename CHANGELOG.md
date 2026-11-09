@@ -22,8 +22,10 @@ drops startup options (see Changed). Gemini models other than
 allowlist, `https://` media and client `labels` on native Vertex are refused
 by default, Gemini model ids are matched without case (see Changed), camelCase
 keys are refused on `/v1/chat/completions` with `upstream = vertex`, a bare
-model id there is priced and budgeted as `google/<id>` (see Changed), and native
-Vertex `maxOutputTokens: 0` is refused (see Security).
+model id there is priced and budgeted as `google/<id>` (see Changed), native
+Vertex `maxOutputTokens: 0` is refused (see Security), and a native Vertex path
+must be exactly `publishers/google/models/{model}:generateContent` (see
+Security).
 
 ### Security
 
@@ -91,6 +93,15 @@ Vertex `maxOutputTokens: 0` is refused (see Security).
   part is a `400`. String content is unchanged.
 - Refusals for a bad upstream path or a native Vertex path without a model no
   longer repeat the client's path.
+- Native Vertex accepts only the path
+  `publishers/google/models/{model}:generateContent`, with a model id of 1 to
+  256 ASCII letters, digits, `.`, `_` and `-` starting with a letter or digit,
+  and builds the upstream URL from that id one path segment at a time, for both
+  the call and the `exact` pre-flight count. Before this, a percent-encoded path
+  could change the upstream request so that what was forwarded differed from
+  what was priced. Any other path is now a `400` before any provider call.
+  Breaking: paths naming another publisher, or with other segments before
+  `models/`, used to be forwarded and are now refused.
 - The refusal of an unknown `anthropic-beta` value no longer repeats the
   client's string.
 - Breaking: on `/v1/chat/completions` with `upstream = vertex`, a top-level
@@ -271,6 +282,13 @@ Vertex `maxOutputTokens: 0` is refused (see Security).
 - `KeyStore::lookup` returns `Result<Option<KeyRecord>, KeyStoreError>` and
   `GatewayCore::authenticate` returns `Result<String, AuthError>`. The crate is
   not published, so this only matters to a fork.
+- The Anthropic adapter's buffered call refuses any path other than `messages`
+  and always targets `/v1/messages`.
+- When native Vertex or the OpenAI-compatible Vertex upstream is enabled,
+  `serve` refuses at startup, before the database is touched, a
+  `TOLLGATE_PROVIDERS__VERTEX__PROJECT` and `__LOCATION` that do not form a
+  valid URL. Such a deployment used to start and then fail every Vertex
+  request.
 
 ## v0.3.0
 
