@@ -238,8 +238,11 @@ gcs_buckets = ["my-shared-media"]
 
 # One row per (upstream, model). upstream: "vertex" (native generateContent) or
 # "vertex-openai" (/v1/chat/completions with providers.openai.upstream = "vertex").
-# model: the id as that route forwards it, matched without case; on
-# vertex-openai a bare id means the google/ one.
+# model: the id as that route forwards it, matched without case (prices and
+# budgets are matched exactly); on vertex-openai a bare id means the google/ one.
+# On vertex, model must also be 1 to 256 letters, digits, '.', '_' or '-'
+# starting with a letter or digit; a row, price or budget for any other id never
+# matches a native Vertex request.
 [[providers.models]]
 upstream = "vertex"
 model = "gemini-2.5-pro"
@@ -333,7 +336,11 @@ omitted tier means `auto`, so with `pin_service_tier` on, every outbound request
 carries `service_tier: "default"`. Leave it off for an OpenAI-compatible server
 that rejects the field. The Vertex upstream never gets it.
 
-**Native Vertex allowlist.** The README's Limitations list the fields a native
+**Native Vertex allowlist.** The request path must be exactly
+`/v1/vertex/publishers/google/models/{model}:generateContent`, where `{model}`
+is 1 to 256 ASCII letters, digits, `.`, `_` or `-` starting with a letter or
+digit; anything else is a `400`.
+The README's Limitations list the fields a native
 `:generateContent` body may carry. Anything else is a `400`, so an SDK that adds
 a new field will see refusals until it is reviewed and added. Keys in Google's
 own objects must be strict lowerCamelCase or strict snake_case; other
@@ -408,8 +415,10 @@ The default Terraform deploys a private posture, not an open one:
   traffic still leaves over Google's default public path; the application
   restricts destinations, the network does not.
 - The provider adapters only ever connect to fixed provider hostnames. A caller
-  supplies a provider name and a path suffix, both allowlisted; they never supply
-  a destination host. There is no user-controlled URL in the forward path.
+  supplies a provider name and a path suffix, never a destination host. On
+  native Vertex the model id from the path is placed in the upstream URL as one
+  path segment, so no character a caller sends becomes URL syntax; other routes
+  use fixed upstream paths.
 - The outbound HTTP client refuses redirects (`redirect::Policy::none()`), so a
   `3xx` from an upstream cannot bounce the request, and its credentials, to a
   different host.

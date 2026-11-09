@@ -492,6 +492,15 @@ pub async fn serve(cfg: Config) -> Result<()> {
             &cfg.providers.vertex.location,
         )?;
     }
+    if vertex_in_use {
+        reqwest::Url::parse(&crate::providers::vertex_base(
+            &cfg.providers.vertex.project,
+            &cfg.providers.vertex.location,
+        ))
+        .context(
+            "TOLLGATE_PROVIDERS__VERTEX__PROJECT and __LOCATION do not form a valid Vertex URL",
+        )?;
+    }
     if cfg.providers.openai.enabled {
         let oc = &cfg.providers.openai;
         match oc.upstream.as_str() {
@@ -673,7 +682,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
                     cfg.providers.vertex.project.clone(),
                     cfg.providers.vertex.location.clone(),
                     cfg.providers.vertex.access_token.clone(),
-                )
+                )?
                 .with_gcs_buckets(cfg.providers.media.gcs_buckets.clone())
                 .with_client_labels(cfg.providers.vertex.allow_client_labels)
                 .with_thinking_rules(thinking_rules.clone()),
@@ -3290,7 +3299,7 @@ mod tests {
         assert!(msg.contains("connecting to Postgres"), "control: {msg}");
 
         type Case = (&'static str, &'static str, fn(&mut Config));
-        let cases: [Case; 21] = [
+        let cases: [Case; 23] = [
             (
                 "additive thinking without a bound",
                 "thinking = \"additive\" needs max_thinking_tokens",
@@ -3390,6 +3399,26 @@ mod tests {
                 |c| {
                     c.providers.vertex.enabled = true;
                     c.providers.vertex.project = "p/../x".to_owned();
+                },
+            ),
+            (
+                "vertex base not a URL",
+                "do not form a valid Vertex URL",
+                |c| {
+                    c.providers.vertex.enabled = true;
+                    c.providers.vertex.project = "p".to_owned();
+                    c.providers.vertex.location = "xn--zz".to_owned();
+                },
+            ),
+            (
+                "vertex base not a URL, openai upstream only",
+                "do not form a valid Vertex URL",
+                |c| {
+                    c.providers.vertex.enabled = false;
+                    c.providers.openai.enabled = true;
+                    c.providers.openai.upstream = "vertex".to_owned();
+                    c.providers.vertex.project = "p".to_owned();
+                    c.providers.vertex.location = "xn--zz".to_owned();
                 },
             ),
             (
@@ -4656,6 +4685,7 @@ mod gate_tests {
                         "global".to_owned(),
                         "test-token".to_owned(),
                     )
+                    .expect("valid base")
                     .with_base(base.clone())
                     .with_gcs_buckets(vec!["tollgate-media".to_owned()]),
                 ),
@@ -6173,7 +6203,131 @@ mod gate_tests {
         }
     }
 
-    /// Requests a recording stub received: path, headers, body.
+    /// Only `publishers/google/models/{model}:generateContent` is served on
+    /// native Vertex. Any other path is refused before any provider call, and
+    /// a decoded `?` must not become a query.
+    #[tokio::test]
+    async fn a_native_vertex_path_other_than_the_one_shape_is_refused_before_any_provider_call() {
+        let (upstream, seen) = recording_upstream(
+            r#"{"totalTokens":5,"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":1,"totalTokenCount":6}}"#,
+        )
+        .await;
+        let g = "publishers/google/models/gemini-3.8-flash";
+        let refused = [
+            format!("{g}:generateContent%3Fx=1%26y=:generateContent"),
+            format!("{g}:generateContent%23:generateContent"),
+            format!("{g}%2Fx:generateContent"),
+            format!("{g}:generateContent%25:generateContent"),
+            format!("{g}:generateContent%253Fx=1:generateContent"),
+            format!("{g}:generateContent;x=1:generateContent"),
+            format!("{g}:generateContent:generateContent"),
+            "publishers//google/models/gemini-3.8-flash:generateContent".to_owned(),
+            "publishers/google/./models/gemini-3.8-flash:generateContent".to_owned(),
+            "publishers/zz-pub-marker/models/gemini-3.8-flash:generateContent".to_owned(),
+            "Publishers/Google/models/gemini-3.8-flash:generateContent".to_owned(),
+            "publishers/google/zz-seg-marker/models/gemini-3.8-flash:generateContent".to_owned(),
+            "projects/zz-proj-marker/publishers/google/models/gemini-3.8-flash:generateContent"
+                .to_owned(),
+            "models/gemini-3.8-flash:generateContent".to_owned(),
+        ];
+        let want = json!(format!(
+            "invalid request body: {}",
+            crate::providers::VERTEX_PATH_REFUSAL
+        ));
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 16}
+        })
+        .to_string();
+        async fn send_to(h: &Harness, path: &str, body: &str) -> Response {
+            h.send(with(
+                request(&Method::POST, path, Body::from(body.to_owned())),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await
+        }
+        // Two spellings at different rates, so a row priced under the wrong
+        // spelling shows in its cost. The stub reports 5 prompt and 1 output token.
+        let lower = ModelPrice::new(PROVIDER_VERTEX, "gemini-3.8-flash", 3_000_000, 15_000_000);
+        let upper = ModelPrice::new(PROVIDER_VERTEX, "Gemini-3.8-Flash", 1_000_000, 5_000_000);
+        let used = crate::pricing::Usage::new(5, 1);
+        assert_ne!(lower.cost_micros(used), upper.cost_micros(used));
+        let base = Options::default().deployment;
+        for exact in [false, true] {
+            seen.lock().unwrap().clear();
+            let h = harness(Options {
+                vertex_upstream: Some(upstream.clone()),
+                deployment: Deployment { exact, ..base },
+                prices: Some(vec![lower.clone(), upper.clone()]),
+                ..Options::default()
+            });
+            for path in &refused {
+                let resp = send_to(&h, &format!("/v1/vertex/{path}"), &body).await;
+                let ctx = format!("exact={exact} {path}");
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{ctx}");
+                assert_eq!(resp.headers()["x-tollgate-reason"], "bad_request", "{ctx}");
+                assert_eq!(body_json(resp).await["error"], want, "{ctx}");
+            }
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "exact={exact}: nothing reached Google"
+            );
+            assert!(
+                h.usage.snapshot().is_empty(),
+                "exact={exact}: no ledger row"
+            );
+
+            // Control: the one shape is forwarded, to exactly that path.
+            let resp = send_to(&h, VERTEX_PATH, &body).await;
+            assert_eq!(resp.status(), StatusCode::OK, "exact={exact}");
+            let rows = h.usage.snapshot();
+            assert_eq!(rows.len(), 1, "exact={exact}");
+            assert_eq!(rows[0].model, "gemini-3.8-flash", "exact={exact}");
+            assert_eq!(
+                rows[0].cost_micros,
+                lower.cost_micros(used),
+                "exact={exact}"
+            );
+            let paths: Vec<String> = seen.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+            let call = "/publishers/google/models/gemini-3.8-flash:generateContent";
+            let count = "/publishers/google/models/gemini-3.8-flash:countTokens";
+            if exact {
+                assert_eq!(paths, vec![count, call]);
+            } else {
+                assert_eq!(paths, vec![call]);
+            }
+
+            // Control: an upper-case id is still forwarded as sent, and priced
+            // and recorded under the same spelling.
+            seen.lock().unwrap().clear();
+            let resp = send_to(
+                &h,
+                "/v1/vertex/publishers/google/models/Gemini-3.8-Flash:generateContent",
+                &body,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "exact={exact}");
+            let paths: Vec<String> = seen.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+            let up = "/publishers/google/models/Gemini-3.8-Flash";
+            let want_paths = if exact {
+                vec![format!("{up}:countTokens"), format!("{up}:generateContent")]
+            } else {
+                vec![format!("{up}:generateContent")]
+            };
+            assert_eq!(paths, want_paths, "exact={exact}");
+            let rows = h.usage.snapshot();
+            assert_eq!(rows.len(), 2, "exact={exact}");
+            assert_eq!(rows[1].model, "Gemini-3.8-Flash", "exact={exact}");
+            assert_eq!(
+                rows[1].cost_micros,
+                upper.cost_micros(used),
+                "exact={exact}"
+            );
+        }
+    }
+
+    /// Requests a recording stub received: path and query, headers, body.
     type Seen = Arc<std::sync::Mutex<Vec<(String, HeaderMap, String)>>>;
 
     /// A local upstream that records every request and answers each with one
@@ -6185,9 +6339,12 @@ mod gate_tests {
             move |uri: axum::http::Uri, headers: HeaderMap, req_body: String| {
                 let s = s.clone();
                 async move {
-                    s.lock()
-                        .unwrap()
-                        .push((uri.path().to_owned(), headers, req_body));
+                    s.lock().unwrap().push((
+                        uri.path_and_query()
+                            .map_or_else(|| uri.path().to_owned(), |pq| pq.as_str().to_owned()),
+                        headers,
+                        req_body,
+                    ));
                     ([(header::CONTENT_TYPE, "application/json")], body)
                 }
             },
