@@ -117,6 +117,17 @@ Vertex `maxOutputTokens: 0` is refused (see Security).
   `cache_control` TTL and of an unpriced model no longer repeat the client's
   TTL or model id. The legacy `/v1/{provider}` route's unpriced refusal still
   returns the client's own `model` field in its body, unchanged from before.
+- RUSTSEC-2026-0459 (SQLite before 3.54.0, in `libsqlite3-sys`) does not
+  reach the binary. `libsqlite3-sys` is in `Cargo.lock` only through sqlx's
+  SQLite driver, which Tollgate does not enable, so `cargo audit` ignores the
+  advisory, as it already ignores RUSTSEC-2023-0071 (`rsa`, through the MySQL
+  driver). CI now fails if either driver, or either of those crates, enters
+  the build graph, so each ignore is checked against its reason on every run.
+- `quinn-udp` is updated to 0.5.16 for RUSTSEC-2026-0538 (a receive loop that
+  can spin after a truncated datagram on some non-Linux targets). It is in
+  `Cargo.lock` only through reqwest's HTTP/3 support, which Tollgate does not
+  enable, so it is not compiled into the binary; the update keeps
+  `cargo audit` clean without another ignore.
 
 ### Added
 

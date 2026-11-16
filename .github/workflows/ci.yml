@@ -161,6 +161,47 @@ jobs:
       - name: Install Rust (stable, for the audit tool)
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      # The advisories the audit step ignores are ignored only because the
+      # crates they name never compile into Tollgate. cargo-audit reads
+      # Cargo.lock, and that lists sqlx's MySQL and SQLite drivers although
+      # neither is built: both are optional dependencies, and sqlx features
+      # Tollgate enables (`chrono`, `uuid`, `migrate`) name them through weak
+      # `?/` references. Such a reference puts an optional dependency in
+      # Cargo.lock without turning it on. cargo-audit reports them all the
+      # same, so the ignores rest on the build graph, and this step checks that
+      # graph on every run.
+      #
+      # It fails if the sqlx MySQL or SQLite driver (`sqlx-mysql`,
+      # `sqlx-sqlite`), or a crate behind an ignored advisory (`rsa`,
+      # `libsqlite3-sys`), is in the graph for any target, in any workspace
+      # member, with all features, through a normal, build or dev dependency.
+      # `--workspace` matters because cargo-audit applies the ignores to the
+      # whole lockfile, members included. The advisory crates are matched by
+      # name as well, because another dependency could bring them in without
+      # either driver.
+      #
+      # `+stable` because rust-toolchain.toml would otherwise select 1.88, which
+      # this job does not install. The listing goes to a file, not a pipe: this
+      # `run` uses GitHub's default `bash -e` without pipefail, so a failed
+      # `cargo tree` piped into grep would match nothing and pass. For the same
+      # reason `sqlx-postgres` must be in the listing, so an empty or reformatted
+      # one fails rather than passes. Network access is needed: `cargo tree`
+      # fetches every package in Cargo.lock, for all targets.
+      - name: Check ignored advisories stay out of the build graph
+        run: |
+          graph="${RUNNER_TEMP:?}/build-graph.txt"
+          cargo +stable tree --locked --workspace --all-features --target all \
+            -e normal,build,dev --prefix none --format '{p}' > "$graph"
+          if ! grep -q '^sqlx-postgres ' "$graph"; then
+            echo "::error::cargo tree did not list sqlx-postgres, so its output cannot be trusted"
+            exit 1
+          fi
+          if found=$(grep -E '^(sqlx-mysql|rsa|sqlx-sqlite|libsqlite3-sys) ' "$graph"); then
+            echo "::error::A crate behind an advisory the audit step ignores is now in the build graph. Remove the dependency, or drop its ignore from this workflow and .cargo/audit.toml and deal with the advisory."
+            cut -d ' ' -f 1,2 <<< "$found" | sort -u
+            exit 1
+          fi
+          echo "Not in the build graph: sqlx-mysql, rsa, sqlx-sqlite, libsqlite3-sys"
       # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
       # this directory, but the audit tool itself should build on current stable.
       #
@@ -190,27 +231,46 @@ jobs:
       # understands. That is the correct direction for a security gate, and
       # `--locked` fixes the tool's own dependency tree either way.
       - name: Install cargo-audit
+        # This step and the next run even when the build-graph check fails, so
+        # one run still reports a new advisory, including the weekly one.
+        if: ${{ !cancelled() }}
         run: cargo +stable install cargo-audit --locked --version ">=0.22, <1.0"
       - name: Audit dependencies
+        if: ${{ !cancelled() }}
         # `--deny warnings` because the default exits 0 on the warning-class
         # advisories (unmaintained, unsound, yanked). Those are exactly the
         # early signals worth acting on while there is still time to move off
         # the crate, and a gate that passes on them is not a gate.
         #
-        # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel) has no fixed
-        # release. It is ignored because the code never compiles into the
-        # binary: `rsa` has exactly one reverse dependency in Cargo.lock,
-        # `sqlx-mysql`, which is an optional dependency of sqlx that no enabled
-        # feature turns on. We do not enable sqlx's `mysql` feature, and every
-        # other reference to it uses weak activation (`sqlx-mysql?/...`), which
-        # cannot enable an optional dependency that is otherwise off.
+        # RUSTSEC-2023-0071 (rsa "Marvin" timing sidechannel) is fixed in rsa
+        # 0.10.0, but sqlx-mysql 0.8.6 requires `rsa = "0.9"`, so no fix is
+        # reachable on sqlx 0.8. It is ignored because the code never compiles
+        # into the binary: `rsa` has exactly one reverse dependency in
+        # Cargo.lock, `sqlx-mysql`, which is an optional dependency of sqlx
+        # that no enabled feature turns on. We do not enable sqlx's `mysql`
+        # feature, and every other reference to it uses weak activation
+        # (`sqlx-mysql?/...`), which cannot enable an optional dependency that
+        # is otherwise off.
         #
-        # To re-verify, read those reverse dependencies out of Cargo.lock.
-        # Do not reach for `cargo tree -i rsa`: for a package that is in the
-        # lockfile but not in the build graph, that exits non-zero with
-        # "package ID specification `rsa` did not match any packages", which
-        # looks like a broken command rather than an answer.
+        # RUSTSEC-2026-0459 (libsqlite3-sys: SQLite before 3.54.0 can return
+        # uninitialised page-cache memory for a crafted database and WAL pair)
+        # is ignored for the same reason. `libsqlite3-sys` has exactly one
+        # reverse dependency in Cargo.lock, `sqlx-sqlite`, another optional
+        # dependency of sqlx. Only sqlx's `sqlite`, `sqlite-unbundled` and
+        # `sqlite-preupdate-hook` features turn it on (`all-databases` reaches
+        # it through `sqlite`). We enable none of them, and every other
+        # reference uses weak activation (`sqlx-sqlite?/...`). No sqlx 0.8
+        # release accepts the patched libsqlite3-sys 0.39, so there is no
+        # update to take instead.
         #
-        # This ignore stops being valid the moment anyone adds `mysql` to the
-        # sqlx feature list. Everything else stays strict.
-        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
+        # Each ignore stops being valid the moment its crate enters the build
+        # graph, and the "Check ignored advisories stay out of the build graph"
+        # step above fails the job when that happens. Everything else stays
+        # strict.
+        #
+        # `+stable` here too, so the rustup `cargo` shim runs the audit on
+        # stable rather than resolving rust-toolchain.toml to 1.88, which this
+        # job does not install, and cargo-audit's own `cargo -V` call for the
+        # crates.io index (used for yanked-crate detection) gets the same
+        # stable cargo.
+        run: cargo +stable audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
