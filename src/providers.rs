@@ -944,8 +944,10 @@ impl Provider for AnthropicProvider {
         body: &str,
         parsed: &ParsedRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let path = safe_rest_path(rest_path)?;
-        let url = format!("{}/v1/{path}", self.base_url);
+        if rest_path != "messages" {
+            return Err(bad("only the messages endpoint is supported"));
+        }
+        let url = format!("{}/v1/messages", self.base_url);
         let mut request = self
             .http
             .post(&url)
@@ -1361,6 +1363,11 @@ const MAX_LABEL_CHARS: usize = 63;
 fn bad(message: &str) -> ProviderError {
     ProviderError::BadRequest(message.to_owned())
 }
+
+/// Fixed text: the path is the client's.
+pub(crate) const VERTEX_PATH_REFUSAL: &str = "only publishers/google/models/{model}:generateContent \
+     is supported, with a model id of letters, digits, '.', '_' and '-' (streaming and other \
+     endpoints are not)";
 
 /// Check a canonical native Vertex body against the allowlist. `labels` are
 /// accepted only when the operator allowed them.
@@ -1946,7 +1953,7 @@ fn vertex_host(location: &str) -> String {
 /// host a location maps to. `project` and `location` are validated at boot
 /// (`app::validate_vertex_target`), so neither can carry a `/`, `?`, `#`, `@`
 /// or port into the URL.
-fn vertex_base(project: &str, location: &str) -> String {
+pub(crate) fn vertex_base(project: &str, location: &str) -> String {
     format!(
         "https://{host}/v1/projects/{project}/locations/{location}",
         host = vertex_host(location)
@@ -1956,8 +1963,8 @@ fn vertex_base(project: &str, location: &str) -> String {
 /// Adapter for Vertex AI (Gemini) `generateContent`.
 pub struct VertexProvider {
     http: reqwest::Client,
-    /// `vertex_base(project, location)`, computed once.
-    base: String,
+    /// `vertex_base(project, location)`, parsed once.
+    base: reqwest::Url,
     tokens: TokenSource,
     /// `providers.media.gcs_buckets`: the only buckets a `gs://` URI may name.
     gcs_buckets: Vec<String>,
@@ -1968,21 +1975,23 @@ pub struct VertexProvider {
 }
 
 impl VertexProvider {
-    #[must_use]
     pub fn new(
         http: reqwest::Client,
         project: String,
         location: String,
         static_token: String,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProviderError> {
+        let base = reqwest::Url::parse(&vertex_base(&project, &location)).map_err(|_| {
+            ProviderError::Upstream("the Vertex base URL is not a valid URL".to_owned())
+        })?;
+        Ok(Self {
             tokens: TokenSource::new(static_token),
             http,
-            base: vertex_base(&project, &location),
+            base,
             gcs_buckets: Vec::new(),
             thinking: ThinkingRules::default(),
             allow_client_labels: false,
-        }
+        })
     }
 
     /// Accept client `labels` (default: refused).
@@ -2010,6 +2019,8 @@ impl VertexProvider {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_base(mut self, base: String) -> Self {
+        let base = reqwest::Url::parse(&base).expect("test base parses");
+        assert!(!base.cannot_be_a_base(), "test base must take a path");
         self.base = base;
         self
     }
@@ -2037,19 +2048,41 @@ impl VertexProvider {
         check_file_uris(&canonical, &self.gcs_buckets)?;
         Ok(canonical)
     }
+
+    /// `{base}/publishers/google/models/{model}:{method}`, built one path
+    /// segment at a time so every character of `model` is path data, never
+    /// URL syntax.
+    fn model_url(&self, model: &str, method: &str) -> Result<reqwest::Url, ProviderError> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|()| {
+                ProviderError::Upstream("the Vertex base URL cannot take a path".to_owned())
+            })?
+            .pop_if_empty()
+            .extend([
+                "publishers",
+                "google",
+                "models",
+                &format!("{model}:{method}"),
+            ]);
+        Ok(url)
+    }
 }
 
-/// Extract the model id from a Vertex path like
-/// `publishers/google/models/gemini-1.5-pro:generateContent`.
+/// The longest model id the native Vertex path accepts.
+const VERTEX_MODEL_MAX_BYTES: usize = 256;
+
+/// The model id of the one native Vertex path Tollgate serves,
+/// `publishers/google/models/{model}:generateContent`, or `None` for any
+/// other path. Checked after the path has been percent-decoded, so no
+/// character of the id can be URL syntax, and the id that is priced is the
+/// one that is called.
 fn extract_vertex_model(rest_path: &str) -> Option<String> {
-    let after = rest_path.split("models/").nth(1)?;
-    let end = after.find([':', '/']).unwrap_or(after.len());
-    let model = &after[..end];
-    if model.is_empty() {
-        None
-    } else {
-        Some(model.to_owned())
-    }
+    let model = rest_path
+        .strip_prefix("publishers/google/models/")?
+        .strip_suffix(":generateContent")?;
+    crate::provider::clean_token(model, VERTEX_MODEL_MAX_BYTES)
+        .filter(|m| m.starts_with(|c: char| c.is_ascii_alphanumeric()))
 }
 
 /// Gemini reports FOUR disjoint token classes, per the documented total:
@@ -2149,15 +2182,7 @@ impl Provider for VertexProvider {
     fn parse_request(&self, rest_path: &str, body: &str) -> Result<ParsedRequest, ProviderError> {
         // Allowlist: only non-streaming generateContent. This rejects
         // :streamGenerateContent (unmeterable here) and other resources.
-        let path = safe_rest_path(rest_path)?;
-        if !path.ends_with(":generateContent") {
-            return Err(ProviderError::BadRequest(
-                "only ...:generateContent is supported (streaming and other endpoints are not)"
-                    .to_owned(),
-            ));
-        }
-        let model = extract_vertex_model(path)
-            .ok_or_else(|| bad("could not determine the model from the request path"))?;
+        let model = extract_vertex_model(rest_path).ok_or_else(|| bad(VERTEX_PATH_REFUSAL))?;
         // Here, not later: under `exact` admission the count call comes next,
         // and `countTokens` would itself read a `gs://` object.
         let v = self.checked_body(body)?;
@@ -2204,16 +2229,15 @@ impl Provider for VertexProvider {
         body: &str,
         _parsed: &ParsedRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let path = safe_rest_path(rest_path)?;
+        let model = extract_vertex_model(rest_path).ok_or_else(|| bad(VERTEX_PATH_REFUSAL))?;
         // Checked again here so the forward never depends on the caller having
         // run `parse_request`; the bytes sent are the client's (see
         // `checked_body` for why that is the request that was checked).
         self.checked_body(body)?;
         let token = self.tokens.token(&self.http).await?;
-        let url = format!("{base}/{path}", base = self.base);
         let resp = self
             .http
-            .post(&url)
+            .post(self.model_url(&model, "generateContent")?)
             .bearer_auth(token)
             .header("content-type", "application/json")
             .body(body.to_owned())
@@ -2234,20 +2258,16 @@ impl Provider for VertexProvider {
         &self,
         rest_path: &str,
         body: &str,
-        parsed: &ParsedRequest,
+        _parsed: &ParsedRequest,
     ) -> Result<u64, ProviderError> {
-        let model = extract_vertex_model(rest_path).unwrap_or_else(|| parsed.model.clone());
+        let model = extract_vertex_model(rest_path).ok_or_else(|| bad(VERTEX_PATH_REFUSAL))?;
         // Built from the checked value: a separate, allowlisted request, so the
         // key order the forward preserves does not matter here.
         let payload = vertex_count_payload(&self.checked_body(body)?)?;
         let token = self.tokens.token(&self.http).await?;
-        let url = format!(
-            "{base}/publishers/google/models/{model}:countTokens",
-            base = self.base
-        );
         let resp = self
             .http
-            .post(&url)
+            .post(self.model_url(&model, "countTokens")?)
             .bearer_auth(token)
             .header("content-type", "application/json")
             .json(&payload)
@@ -3487,6 +3507,135 @@ mod tests {
     }
 
     #[test]
+    fn vertex_model_path_is_exactly_one_shape() {
+        let path = |m: &str| format!("publishers/google/models/{m}:generateContent");
+        let long = "a".repeat(256);
+        for m in [
+            "gemini-3.8-flash",
+            "gemini-1.5-pro",
+            "gemini-2.0-flash-001",
+            "Gemini-3.8-Flash",
+            "gemini-2.5-flash-preview-05-20",
+            "a_b",
+            "0abc",
+            long.as_str(),
+        ] {
+            assert_eq!(extract_vertex_model(&path(m)).as_deref(), Some(m), "{m}");
+        }
+        let too_long = "a".repeat(257);
+        for m in [
+            "m?x",
+            "m#x",
+            "m/x",
+            "m%x",
+            "m%3Fx",
+            "m:x",
+            "m;x",
+            "m@001",
+            "m+x",
+            "m x",
+            "m\tx",
+            "m\r\nx",
+            "m\0x",
+            "m\\x",
+            "caf\u{e9}",
+            "\u{ff47}emini",
+            "",
+            ".",
+            "..",
+            "-x",
+            "_x",
+            ".x",
+            too_long.as_str(),
+        ] {
+            assert_eq!(extract_vertex_model(&path(m)), None, "{m:?}");
+        }
+        for p in [
+            "publishers/zz-pub/models/gemini-3.8-flash:generateContent",
+            "Publishers/Google/models/gemini-3.8-flash:generateContent",
+            "projects/p/publishers/google/models/gemini-3.8-flash:generateContent",
+            "models/gemini-3.8-flash:generateContent",
+            "publishers//google/models/gemini-3.8-flash:generateContent",
+            "publishers/google//models/gemini-3.8-flash:generateContent",
+            "publishers/google/./models/gemini-3.8-flash:generateContent",
+            "publishers/google/models/gemini-3.8-flash:streamGenerateContent",
+            "publishers/google/models/gemini-3.8-flash:countTokens",
+            "publishers/google/models/gemini-3.8-flash:GenerateContent",
+            "publishers/google/models/gemini-3.8-flash:generateContent/",
+            "/publishers/google/models/gemini-3.8-flash:generateContent",
+            "publishers/google/models/gemini-3.8-flash:generateContent:generateContent",
+            "publishers/google/models/gemini-3.8-flash:generateContent;x=1",
+            "endpoints/123:generateContent",
+        ] {
+            assert_eq!(extract_vertex_model(p), None, "{p}");
+        }
+    }
+
+    #[test]
+    fn vertex_urls_are_built_by_segment() {
+        let prod = VertexProvider::new(
+            reqwest::Client::new(),
+            "example.com:my-project".to_owned(),
+            "us-central1".to_owned(),
+            "t".to_owned(),
+        )
+        .expect("valid base");
+        let want = "https://us-central1-aiplatform.googleapis.com/v1/projects/example.com:my-project/locations/us-central1/publishers/google/models/gemini-3.8-flash";
+        for method in ["generateContent", "countTokens"] {
+            let u = prod.model_url("gemini-3.8-flash", method).unwrap();
+            assert_eq!(u.as_str(), format!("{want}:{method}"));
+            assert_eq!(u.query(), None);
+            assert_eq!(u.fragment(), None);
+        }
+        for (base, want) in [
+            ("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ("http://127.0.0.1:1/", "http://127.0.0.1:1"),
+            // A path ending in `/` must not give a doubled slash.
+            ("http://127.0.0.1:1/x/", "http://127.0.0.1:1/x"),
+        ] {
+            let p = vertex_test_provider().with_base(base.to_owned());
+            for method in ["generateContent", "countTokens"] {
+                assert_eq!(
+                    p.model_url("gemini-3.8-flash", method).unwrap().as_str(),
+                    format!("{want}/publishers/google/models/gemini-3.8-flash:{method}"),
+                    "{base}"
+                );
+            }
+        }
+        let u = prod.model_url("a?b#c/d%e", "generateContent").unwrap();
+        assert_eq!(u.query(), None);
+        assert_eq!(u.fragment(), None);
+        assert_eq!(u.host_str(), Some("us-central1-aiplatform.googleapis.com"));
+        assert!(
+            u.path()
+                .ends_with("/models/a%3Fb%23c%2Fd%25e:generateContent"),
+            "{u}"
+        );
+    }
+
+    #[test]
+    fn vertex_new_refuses_a_base_that_is_not_a_url() {
+        match VertexProvider::new(
+            reqwest::Client::new(),
+            "p".to_owned(),
+            "xn--zz".to_owned(),
+            "t".to_owned(),
+        ) {
+            Err(ProviderError::Upstream(m)) => {
+                assert_eq!(m, "the Vertex base URL is not a valid URL")
+            }
+            Err(e) => panic!("expected an upstream error, got {e:?}"),
+            Ok(_) => panic!("xn--zz must not form a base"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "test base must take a path")]
+    fn vertex_with_base_refuses_a_base_that_cannot_take_a_path() {
+        let _ = vertex_test_provider().with_base("mailto:x".to_owned());
+    }
+
+    #[test]
     fn vertex_model_extraction_and_usage() {
         assert_eq!(
             extract_vertex_model("publishers/google/models/gemini-1.5-pro:generateContent")
@@ -4591,6 +4740,7 @@ mod tests {
             "global".to_owned(),
             "t".to_owned(),
         )
+        .expect("valid base")
         .with_gcs_buckets(vec![ALLOWED_BUCKET.to_owned()])
     }
 
@@ -5130,8 +5280,20 @@ mod tests {
         }
     }
 
-    /// A local upstream that records each request (path, headers, body) and
-    /// answers every one with `reply`.
+    /// A native Vertex adapter pointed at a local stub.
+    fn vertex_stub_provider(base: String) -> VertexProvider {
+        VertexProvider::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            "p".to_owned(),
+            "global".to_owned(),
+            "t".to_owned(),
+        )
+        .expect("valid base")
+        .with_base(base)
+    }
+
+    /// A local upstream that records each request (path and query, headers,
+    /// body) and answers every one with `reply`.
     async fn recording_stub(
         reply: &'static str,
     ) -> (
@@ -5144,9 +5306,12 @@ mod tests {
             move |uri: http::Uri, headers: http::HeaderMap, body: String| {
                 let s = s.clone();
                 async move {
-                    s.lock()
-                        .unwrap()
-                        .push((uri.path().to_owned(), headers, body));
+                    s.lock().unwrap().push((
+                        uri.path_and_query()
+                            .map_or_else(|| uri.path().to_owned(), |pq| pq.as_str().to_owned()),
+                        headers,
+                        body,
+                    ));
                     ([(http::header::CONTENT_TYPE, "application/json")], reply)
                 }
             },
@@ -5175,6 +5340,7 @@ mod tests {
             "global".to_owned(),
             "t".to_owned(),
         )
+        .expect("valid base")
         .with_base(base);
         let snake = r#"{"contents":[{"role":"user","parts":[{"text":"caf\u00e9 café"}]}],
                        "system_instruction":{"parts":[{"text":"x"}]},
@@ -5192,11 +5358,13 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 4);
         for (i, body) in [(0, snake), (2, ordered)] {
-            assert!(seen[i].0.ends_with(":countTokens"), "{}", seen[i].0);
-            assert!(
-                seen[i + 1].0.ends_with(":generateContent"),
-                "{}",
-                seen[i + 1].0
+            assert_eq!(
+                seen[i].0,
+                "/publishers/google/models/gemini-3.8-flash:countTokens"
+            );
+            assert_eq!(
+                seen[i + 1].0,
+                "/publishers/google/models/gemini-3.8-flash:generateContent"
             );
             assert_eq!(seen[i + 1].2, body, "the forwarded bytes are the client's");
         }
@@ -5317,7 +5485,7 @@ mod tests {
         assert!(
             vertex_test_provider()
                 .parse_request(
-                    "publishers/meta/models/llama-4:generateContent",
+                    "publishers/google/models/llama-4:generateContent",
                     &with_generation_config(&serde_json::json!({"maxOutputTokens": 16})),
                 )
                 .is_ok()
@@ -5990,6 +6158,13 @@ mod tests {
                 other => panic!("expected a 400, got {other:?}"),
             }
         }
+        match vertex_test_provider().parse_request(
+            "publishers/google/models/secret-name?:generateContent",
+            &with_generation_config(&serde_json::json!({"maxOutputTokens": 16})),
+        ) {
+            Err(ProviderError::BadRequest(m)) => assert_eq!(m, VERTEX_PATH_REFUSAL),
+            other => panic!("expected a 400, got {other:?}"),
+        }
         match safe_rest_path("/secret-name") {
             Err(ProviderError::BadRequest(m)) => assert!(!m.contains("secret-name"), "{m}"),
             other => panic!("expected a 400, got {other:?}"),
@@ -6013,6 +6188,71 @@ mod tests {
             .as_deref(),
             Some("prompt-caching-2024-07-31,pdfs-2024-09-25,interleaved-thinking-2025-05-14")
         );
+    }
+
+    /// The forward and the count check the path themselves.
+    #[tokio::test]
+    async fn vertex_forward_and_count_refuse_any_other_path() {
+        let (base, seen) = recording_stub(
+            r#"{"totalTokens":3,"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}"#,
+        )
+        .await;
+        let p = vertex_stub_provider(base);
+        let body = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}"#;
+        let parsed = p.parse_request(GENERATE, body).unwrap();
+        for bad_path in [
+            "publishers/google/models/gemini-3.8-flash:generateContent?x=1&y=:generateContent",
+            "publishers/zz-pub-marker/models/gemini-3.8-flash:generateContent",
+        ] {
+            match p.forward(bad_path, body, &parsed).await {
+                Err(ProviderError::BadRequest(m)) => assert_eq!(m, VERTEX_PATH_REFUSAL),
+                other => panic!("{bad_path}: expected a 400, got {other:?}"),
+            }
+            match p.count_input_tokens(bad_path, body, &parsed).await {
+                Err(ProviderError::BadRequest(m)) => assert_eq!(m, VERTEX_PATH_REFUSAL),
+                other => panic!("{bad_path}: expected a 400, got {other:?}"),
+            }
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the stub");
+        p.count_input_tokens(GENERATE, body, &parsed).await.unwrap();
+        p.forward(GENERATE, body, &parsed).await.unwrap();
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/publishers/google/models/gemini-3.8-flash:countTokens",
+                "/publishers/google/models/gemini-3.8-flash:generateContent",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_forward_refuses_any_path_but_messages() {
+        let (base, seen) =
+            recording_stub(r#"{"type":"message","usage":{"input_tokens":3,"output_tokens":1}}"#)
+                .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let p = AnthropicProvider::new(
+            client.clone(),
+            client,
+            "k".to_owned(),
+            base,
+            "2023-06-01".to_owned(),
+        );
+        let body = r#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
+        let parsed = p.parse_request("messages", body).unwrap();
+        for bad_path in ["messages?x=1", "complete"] {
+            match p.forward(bad_path, body, &parsed).await {
+                Err(ProviderError::BadRequest(m)) => {
+                    assert_eq!(m, "only the messages endpoint is supported");
+                }
+                other => panic!("{bad_path}: expected a 400, got {other:?}"),
+            }
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the stub");
+        p.forward("messages", body, &parsed).await.unwrap();
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|r| r.0.clone()).collect();
+        assert_eq!(paths, vec!["/v1/messages"]);
     }
 
     /// Betas go on the Messages call, buffered and streamed, and never on the
