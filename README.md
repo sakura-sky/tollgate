@@ -639,7 +639,7 @@ That variable refuses any secret-shaped name (`API_KEY`, `ACCESS_TOKEN`, `SECRET
 
 ## CI
 
-Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`. No cloud credentials are needed.
+Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`, with a check that the crates behind its ignored advisories stay out of the build graph. No cloud credentials are needed.
 
 The MSRV was 1.85 until it became a liability: it pinned the `redis` crate five minor versions back, because redis 1.2.3 and later require 1.88, so dependabot kept opening updates CI had to reject. The toolchain files, the workflow, the Dockerfile and `cloudbuild.yaml` all move together with `rust-version` in `Cargo.toml`, or CI ends up contradicting the manifest.
 

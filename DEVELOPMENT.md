@@ -50,9 +50,22 @@ on purpose rather than a side effect.
 cargo audit
 ```
 
-`.cargo/audit.toml` already matches CI's settings, including its ignore and its
-`--deny warnings`, so a local run gives the same answer CI gives. A gate that
-disagrees with the one in CI is a gate people learn to ignore.
+`.cargo/audit.toml` already matches CI's settings, including its ignores and
+its `--deny warnings`, so a local run gives the same answer CI gives. A gate
+that disagrees with the one in CI is a gate people learn to ignore.
+
+Each ignore holds only while the crate it names stays out of the build graph,
+and CI checks that on every run. The same check by hand exits 0 when it
+passes. It exits non-zero if `cargo tree` fails, if `sqlx-postgres` is missing
+from the listing (so the listing cannot be trusted), or if one of the crates is
+in the graph, which it then prints:
+
+```bash
+graph=$(cargo tree --locked --workspace --all-features --target all \
+  -e normal,build,dev --prefix none --format '{p}') &&
+  grep -q '^sqlx-postgres ' <<< "$graph" &&
+  ! grep -E '^(sqlx-mysql|rsa|sqlx-sqlite|libsqlite3-sys) ' <<< "$graph"
+```
 
 ## Database migrations
 
