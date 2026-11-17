@@ -121,9 +121,10 @@ pub struct Usage {
     /// Prompt tokens written into a provider-side cache. Can cost MORE than
     /// fresh input (1.25x to 2x on Anthropic, by TTL).
     pub cache_write_tokens: u64,
-    /// Set when the upstream's own numbers contradicted each other, so these
-    /// counts are a guess rather than a measurement. Callers must charge the
-    /// reservation instead of costing them: see [`Usage::is_untrustworthy`].
+    /// Set when the upstream's own numbers contradicted each other, or when a
+    /// native Vertex 2xx reported no usage, so these counts are a guess rather
+    /// than a measurement. Callers must charge the reservation instead of
+    /// costing them: see [`Usage::is_untrustworthy`].
     #[serde(default)]
     pub suspect: bool,
     /// Set when the prompt classes OVERLAP rather than partitioning the prompt.
@@ -165,7 +166,8 @@ impl Usage {
         }
     }
 
-    /// Mark these counts as derived from a self-contradictory response.
+    /// Mark these counts as untrusted: derived from a self-contradictory
+    /// response, or standing in for usage a native Vertex 2xx did not report.
     #[must_use]
     pub fn into_suspect(mut self) -> Self {
         self.suspect = true;
@@ -250,10 +252,11 @@ impl Usage {
             || self.cache_write_tokens > MAX_PLAUSIBLE_TOKENS_PER_LEG
     }
 
-    /// True when these counts must NOT be costed: either implausible, or derived
-    /// from a response whose own numbers contradicted each other.
+    /// True when these counts must NOT be costed: either implausible, or
+    /// suspect (derived from a response whose own numbers contradicted each
+    /// other, or standing in for usage a native Vertex 2xx did not report).
     ///
-    /// Both cases are metering failures rather than expensive requests. Costing
+    /// Each case is a metering failure rather than an expensive request. Costing
     /// a contradictory report means picking one reading of it, and the readings
     /// differ by the size of the cache: guessing cheap under-charges, guessing
     /// expensive settles above a reservation that was computed from the honest

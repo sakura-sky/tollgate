@@ -1,0 +1,22 @@
+{
+  "candidates": [
+    {
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 9,
+    "totalTokenCount": 289,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 9
+      }
+    ],
+    "thoughtsTokenCount": 280
+  },
+  "modelVersion": "gemini-3.8-flash",
+  "createTime": "2026-11-05T14:51:44.248342Z",
+  "responseId": "test-response-id"
+}

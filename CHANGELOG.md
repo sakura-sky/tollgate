@@ -173,6 +173,20 @@ Security).
   forwarded on the Messages call, buffered and streaming (every header
   instance, comma-split, deduplicated), and not on the `exact` pre-flight
   count.
+- A native Vertex `2xx` with no `usageMetadata` object, or with no positive
+  `promptTokenCount` in it, was charged only its reserved prompt leg (or,
+  where it carried other counts but no prompt count, only what those counts
+  cost, recorded as `allowed`), although a reply without usage does not show
+  what the request cost. It is now charged its full reservation and recorded
+  as `estimated`, with or without candidates, and logged at WARN,
+  `vertex 2xx reported no usage; charging the reservation`. In a live check
+  every `2xx` Vertex returned reported usage, including replies with no output
+  and replies stopped for safety, so this is not expected in normal operation.
+  A non-`2xx` is still charged what it reports, and the Anthropic and OpenAI
+  routes, `/v1/chat/completions` with `upstream = vertex` included, still
+  charge a buffered `2xx` whose usage costs nothing its reserved prompt leg.
+  The ERROR line for usage that cannot be trusted now reads
+  `upstream usage is implausible, self-contradictory or missing; charging the reservation`.
 
 ### Changed
 

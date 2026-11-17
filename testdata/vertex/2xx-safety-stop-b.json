@@ -1,0 +1,62 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model"
+      },
+      "finishReason": "SAFETY",
+      "safetyRatings": [
+        {
+          "category": "HARM_CATEGORY_HATE_SPEECH",
+          "probability": "LOW",
+          "probabilityScore": 0.12751742,
+          "severity": "HARM_SEVERITY_LOW",
+          "severityScore": 0.12895161
+        },
+        {
+          "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+          "probability": "NEGLIGIBLE",
+          "probabilityScore": 0.0042283237,
+          "severity": "HARM_SEVERITY_LOW",
+          "severityScore": 0.25156772
+        },
+        {
+          "category": "HARM_CATEGORY_HARASSMENT",
+          "probability": "HIGH",
+          "blocked": true,
+          "probabilityScore": 0.9999391,
+          "severity": "HARM_SEVERITY_MEDIUM",
+          "severityScore": 0.75848454
+        },
+        {
+          "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          "probability": "NEGLIGIBLE",
+          "probabilityScore": 0.00035215667,
+          "severity": "HARM_SEVERITY_NEGLIGIBLE"
+        }
+      ]
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 18,
+    "candidatesTokenCount": 3,
+    "totalTokenCount": 177,
+    "trafficType": "ON_DEMAND",
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 18
+      }
+    ],
+    "candidatesTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 3
+      }
+    ],
+    "thoughtsTokenCount": 156
+  },
+  "modelVersion": "gemini-3.8-flash",
+  "createTime": "2026-11-05T14:51:55.611973Z",
+  "responseId": "test-response-id"
+}
