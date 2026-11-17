@@ -946,8 +946,10 @@ impl GatewayCore {
         // Settle by upstream status.
         let is_success = (200..300).contains(&resp.status);
         let metered = price.cost_micros(resp.usage);
-        // An implausible token count is a metering FAILURE, not an expensive
-        // request. Costing it would saturate to i64::MAX, and because the budget
+        // Usage that cannot be trusted is a metering FAILURE, not an expensive
+        // request: an implausible token count, counts that contradict each
+        // other, or a native Vertex 2xx that reported no usage. Costing an
+        // implausible count would saturate to i64::MAX, and because the budget
         // counter can never be lowered (reconcile only raises) that would wedge
         // the deployment until the period rolled over, while the ledger row it
         // wrote would overflow SUM(cost_micros) on every later reconciliation.
@@ -964,15 +966,19 @@ impl GatewayCore {
                 cache_write_tokens = resp.usage.cache_write_tokens,
                 suspect = resp.usage.suspect,
                 status = resp.status,
-                "upstream usage is implausible or self-contradictory; charging the reservation"
+                "upstream usage is implausible, self-contradictory or missing; charging the reservation"
             );
             (Usage::default(), reserve, "estimated")
         } else if is_success {
             if metered == 0 {
-                // 2xx with no usage reported (e.g. a safety-blocked response):
-                // charge the INPUT we reserved (the provider processed it), not
-                // the full worst-case reservation, so it can't grief a shared
-                // budget, but never zero.
+                // A 2xx whose reported usage costs nothing, on every route
+                // except a native Vertex reply without usage: charge the INPUT
+                // we reserved (the provider processed it), not the full
+                // worst-case reservation, so it can't grief a shared budget,
+                // but never zero. Every 2xx native Vertex returned in a live
+                // check reported usage, safety stops included, so its adapter
+                // marks one without usage as suspect and it is charged the
+                // full reservation above.
                 //
                 // Priced at the same prompt rate the reservation used, not the
                 // plain input rate. On a write-capable adapter the prompt may
@@ -992,8 +998,9 @@ impl GatewayCore {
                 (resp.usage, metered, "allowed")
             }
         } else {
-            // Non-2xx: charge whatever the provider reported it billed (usually
-            // zero), never the reservation; record as an error.
+            // Non-2xx whose usage can be trusted: charge whatever the provider
+            // reported it billed (usually zero); record as an error. Untrusted
+            // usage on a non-2xx is charged the reservation above.
             (resp.usage, metered, "error")
         };
         guard

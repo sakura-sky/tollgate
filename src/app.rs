@@ -6583,4 +6583,336 @@ mod gate_tests {
         assert!(!text.contains("context-1m"), "{text}");
         assert!(!text.contains("<script>"), "{text}");
     }
+
+    // -----------------------------------------------------------------------
+    // Settling a native Vertex 2xx: from its usage, or at the reservation
+    // when it reports none
+    // -----------------------------------------------------------------------
+
+    /// Replies captured from live Vertex (`gemini-3.8-flash`), with the
+    /// response id and thought signature replaced.
+    const VERTEX_LIVE_2XX: [(&str, &str, u64, u64); 6] = [
+        // (name, body, input tokens, output tokens) as the ledger must record them.
+        (
+            "stop",
+            include_str!("../testdata/vertex/2xx-stop.json"),
+            6,
+            325,
+        ),
+        (
+            "max tokens, empty text",
+            include_str!("../testdata/vertex/2xx-max-tokens-empty-text.json"),
+            7,
+            0,
+        ),
+        (
+            "max tokens, thinking only",
+            include_str!("../testdata/vertex/2xx-max-tokens-thinking-only.json"),
+            12,
+            12,
+        ),
+        (
+            "stop sequence, no output",
+            include_str!("../testdata/vertex/2xx-stop-sequence-no-output.json"),
+            9,
+            280,
+        ),
+        // Stopped for safety, and reports its candidate and thinking tokens.
+        (
+            "safety stop a",
+            include_str!("../testdata/vertex/2xx-safety-stop-a.json"),
+            15,
+            330,
+        ),
+        (
+            "safety stop b",
+            include_str!("../testdata/vertex/2xx-safety-stop-b.json"),
+            18,
+            159,
+        ),
+    ];
+    const VERTEX_LIVE_400: &str = include_str!("../testdata/vertex/400-invalid-argument.json");
+
+    /// What the stub's `:countTokens` answers, so `exact` reserves a known prompt.
+    const VERTEX_COUNTED: u64 = 20;
+    const VERTEX_MAX_OUTPUT: u64 = 512;
+
+    /// A Vertex stub: `:countTokens` answers [`VERTEX_COUNTED`], and
+    /// `:generateContent` answers `status` with `body`.
+    async fn vertex_stub(status: u16, body: &'static str) -> String {
+        let app = Router::new().fallback(move |uri: axum::http::Uri| async move {
+            if uri.path().ends_with(":countTokens") {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    format!(r#"{{"totalTokens":{VERTEX_COUNTED}}}"#),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::from_u16(status).unwrap(),
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_owned(),
+            )
+                .into_response()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Send one native Vertex request to a stub answering `status` and `body`,
+    /// and return the response status and the one ledger row.
+    async fn vertex_settle(
+        exact: bool,
+        status: u16,
+        body: &'static str,
+    ) -> (StatusCode, crate::gateway::StoredUsage) {
+        let h = harness(Options {
+            vertex_upstream: Some(vertex_stub(status, body).await),
+            deployment: Deployment {
+                exact,
+                ..Options::default().deployment
+            },
+            ..Options::default()
+        });
+        let req = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": VERTEX_MAX_OUTPUT}
+        })
+        .to_string();
+        let resp = h
+            .send(with(
+                request(&Method::POST, VERTEX_PATH, Body::from(req)),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        let rows = h.usage.snapshot();
+        assert_eq!(rows.len(), 1, "exact={exact}: {rows:?}");
+        (resp.status(), rows[0].clone())
+    }
+
+    /// The full reservation for the request [`vertex_settle`] sends, read from
+    /// a 2xx whose body does not parse, which is a metering failure and is
+    /// charged the reservation. Under `exact` it is also checked against the
+    /// price.
+    async fn vertex_reservation(exact: bool) -> i64 {
+        let (status, row) = vertex_settle(exact, 200, "not json").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(row.decision, "estimated");
+        if exact {
+            let price = ModelPrice::new(PROVIDER_VERTEX, "gemini-3.8-flash", 3_000_000, 15_000_000);
+            assert_eq!(
+                row.cost_micros,
+                price.reserve_micros(
+                    VERTEX_COUNTED,
+                    VERTEX_MAX_OUTPUT,
+                    crate::pricing::PromptReserveProfile::default()
+                )
+            );
+        }
+        row.cost_micros
+    }
+
+    /// Every 2xx real Vertex returned in a live check carried `usageMetadata`,
+    /// including replies with no output and replies stopped for safety. Each is
+    /// charged from its own usage, never the reservation.
+    #[tokio::test]
+    async fn native_vertex_live_replies_are_charged_from_their_usage() {
+        let price = ModelPrice::new(PROVIDER_VERTEX, "gemini-3.8-flash", 3_000_000, 15_000_000);
+        for exact in [false, true] {
+            let reserve = vertex_reservation(exact).await;
+            for (name, body, input, output) in VERTEX_LIVE_2XX {
+                let ctx = format!("exact={exact} {name}");
+                let (status, row) = vertex_settle(exact, 200, body).await;
+                assert_eq!(status, StatusCode::OK, "{ctx}");
+                assert_eq!(row.decision, "allowed", "{ctx}");
+                assert_eq!(
+                    (row.input_tokens, row.output_tokens),
+                    (input, output),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    row.cost_micros,
+                    price.cost_micros(crate::pricing::Usage::new(input, output)),
+                    "{ctx}"
+                );
+                assert_ne!(row.cost_micros, reserve, "{ctx}: not the reservation");
+            }
+        }
+    }
+
+    /// A native Vertex 2xx without `usageMetadata` is charged the full
+    /// reservation and recorded `estimated`, with candidates or without, and
+    /// the client still gets the reply.
+    #[tokio::test]
+    async fn a_native_vertex_2xx_without_usage_is_charged_the_reservation() {
+        const NO_USAGE: [(&str, &str); 7] = [
+            (
+                "candidates, no usageMetadata",
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"modelVersion":"gemini-3.8-flash"}"#,
+            ),
+            (
+                "prompt block, no candidates, no usageMetadata",
+                r#"{"promptFeedback":{"blockReason":"SAFETY"},"modelVersion":"gemini-3.8-flash"}"#,
+            ),
+            ("empty object", "{}"),
+            (
+                "usageMetadata null",
+                r#"{"candidates":[],"usageMetadata":null}"#,
+            ),
+            (
+                "usageMetadata empty",
+                r#"{"candidates":[],"usageMetadata":{}}"#,
+            ),
+            (
+                "usageMetadata all zero",
+                r#"{"candidates":[],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}"#,
+            ),
+            (
+                "usageMetadata without a prompt count",
+                r#"{"candidates":[],"usageMetadata":{"candidatesTokenCount":3,"totalTokenCount":3}}"#,
+            ),
+        ];
+        for exact in [false, true] {
+            let reserve = vertex_reservation(exact).await;
+            for (name, body) in NO_USAGE {
+                let ctx = format!("exact={exact} {name}");
+                let (status, row) = vertex_settle(exact, 200, body).await;
+                assert_eq!(status, StatusCode::OK, "{ctx}");
+                assert_eq!(row.decision, "estimated", "{ctx}");
+                assert_eq!(row.cost_micros, reserve, "{ctx}");
+                assert_eq!((row.input_tokens, row.output_tokens), (0, 0), "{ctx}");
+            }
+            // Any 2xx, not only 200: a 201 is passed on and charged the same.
+            let (status, row) = vertex_settle(exact, 201, NO_USAGE[0].1).await;
+            assert_eq!(status, StatusCode::CREATED, "exact={exact}");
+            assert_eq!(
+                (row.decision.as_str(), row.cost_micros),
+                ("estimated", reserve)
+            );
+            // A 2xx error body without usage: the reservation, and still a 502.
+            let (status, row) =
+                vertex_settle(exact, 200, r#"{"error":{"code":500,"status":"INTERNAL"}}"#).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "exact={exact}");
+            assert_eq!(
+                (row.decision.as_str(), row.cost_micros),
+                ("estimated", reserve)
+            );
+
+            // Control: a real Vertex 400 has no usageMetadata either, and is
+            // charged nothing. The rule is for a 2xx only.
+            let (status, row) = vertex_settle(exact, 400, VERTEX_LIVE_400).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "exact={exact}");
+            assert_eq!((row.decision.as_str(), row.cost_micros), ("error", 0));
+        }
+    }
+
+    /// The Anthropic and OpenAI routes, and the Vertex OpenAI-compatible
+    /// route, keep charging a 2xx without usage its reserved prompt leg: more
+    /// than nothing, less than the reservation.
+    #[tokio::test]
+    async fn a_2xx_without_usage_elsewhere_is_still_charged_the_prompt_leg() {
+        const ANTHROPIC: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":"end_turn"}"#;
+        const OPENAI: &str = r#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}"#;
+        let cases: [(&str, &str, bool, &'static str); 5] = [
+            ("/v1/messages", BUFFERED_BODY, false, ANTHROPIC),
+            ("/v1/anthropic/messages", BUFFERED_BODY, false, ANTHROPIC),
+            ("/v1/chat/completions", BUFFERED_BODY, false, OPENAI),
+            ("/v1/openai/chat/completions", BUFFERED_BODY, false, OPENAI),
+            (
+                "/v1/chat/completions",
+                r#"{"model":"gemini-3.8-flash","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+                true,
+                OPENAI,
+            ),
+        ];
+        for (path, body, on_vertex, answer) in cases {
+            let ctx = format!("{path} on_vertex={on_vertex}");
+            let settle = |reply: &'static str| async move {
+                let h = harness(Options {
+                    upstream: Some(stub_typed(200, "application/json", reply).await),
+                    openai_on_vertex: on_vertex,
+                    prices: on_vertex.then(|| {
+                        vec![ModelPrice::new(
+                            PROVIDER_OPENAI,
+                            "google/gemini-3.8-flash",
+                            3_000_000,
+                            15_000_000,
+                        )]
+                    }),
+                    ..Options::default()
+                });
+                let resp = h
+                    .send(with(
+                        request(&Method::POST, path, Body::from(body)),
+                        "x-tollgate-key",
+                        &h.key,
+                    ))
+                    .await;
+                let rows = h.usage.snapshot();
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                (resp.status(), rows[0].clone())
+            };
+            let (status, reserved) = settle("not json").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{ctx}");
+            assert_eq!(reserved.decision, "estimated", "{ctx}");
+            let (status, row) = settle(answer).await;
+            assert_eq!(status, StatusCode::OK, "{ctx}");
+            assert_eq!(row.decision, "estimated", "{ctx}");
+            assert!(row.cost_micros > 0, "{ctx}: never zero");
+            assert!(
+                row.cost_micros < reserved.cost_micros,
+                "{ctx}: the prompt leg ({}) and not the reservation ({})",
+                row.cost_micros,
+                reserved.cost_micros
+            );
+        }
+    }
+
+    /// The reply without usage is logged by the adapter, saying whether a
+    /// `usageMetadata` object was there, and by the gateway; a reply with usage
+    /// is not, and neither is a non-2xx without usage.
+    #[tokio::test]
+    async fn a_native_vertex_2xx_without_usage_is_logged() {
+        const WARN: &str = "vertex 2xx reported no usage; charging the reservation";
+        const ERROR: &str = "upstream usage is implausible, self-contradictory or missing; charging the reservation";
+        for (status, body, present) in [
+            (200, r#"{"candidates":[]}"#, Some(false)),
+            (
+                200,
+                r#"{"candidates":[],"usageMetadata":null}"#,
+                Some(false),
+            ),
+            (200, r#"{"candidates":[],"usageMetadata":{}}"#, Some(true)),
+            // Controls: a reply with usage, and a real Vertex 400 without
+            // usage, log neither line.
+            (200, VERTEX_LIVE_2XX[0].1, None),
+            (400, VERTEX_LIVE_400, None),
+        ] {
+            let captured = Captured::default();
+            let _guard = captured.install(tracing::Level::WARN);
+            let (got, _) = vertex_settle(false, status, body).await;
+            assert_eq!(got.as_u16(), status, "{body}");
+            let lines = captured.lines();
+            let find = |m: &str| lines.iter().find(|l| l["fields"]["message"] == m).cloned();
+            match present {
+                Some(p) => {
+                    let warn = find(WARN).unwrap_or_else(|| panic!("no WARN: {body}"));
+                    assert_eq!(warn["level"], "WARN");
+                    assert_eq!(warn["fields"]["usage_metadata_present"], p, "{body}");
+                    let error = find(ERROR).unwrap_or_else(|| panic!("no ERROR: {body}"));
+                    assert_eq!(error["level"], "ERROR");
+                }
+                None => {
+                    assert!(find(WARN).is_none(), "WARN logged: {status} {body}");
+                    assert!(find(ERROR).is_none(), "ERROR logged: {status} {body}");
+                }
+            }
+        }
+    }
 }

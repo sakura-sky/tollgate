@@ -2173,6 +2173,36 @@ fn parse_vertex_usage(v: &Value) -> Usage {
     }
 }
 
+/// Usage for a native Vertex `generateContent` reply with HTTP status `status`.
+///
+/// In a live check, every 2xx Vertex returned carried `usageMetadata` with a
+/// positive `promptTokenCount`: replies capped at `MAX_TOKENS` with no output,
+/// replies that spent their whole budget on thinking, an empty reply after a
+/// stop sequence, and replies stopped for safety, which report their candidate
+/// and thinking tokens. So a 2xx without a positive prompt count does not say
+/// the request cost nothing; it says nothing about what it cost. Its usage is
+/// marked suspect, so the gateway charges the full reservation and records the
+/// row as `estimated`, with or without candidates.
+///
+/// A non-2xx is read as reported: unless its counts contradict each other or
+/// are implausible, the gateway charges what it reports, usually nothing.
+fn vertex_reply_usage(status: u16, v: &Value) -> Usage {
+    let reported = v
+        .get("usageMetadata")
+        .and_then(|m| m.get("promptTokenCount"))
+        .and_then(Value::as_u64)
+        .is_some_and(|p| p > 0);
+    if reported || !(200..300).contains(&status) {
+        return parse_vertex_usage(v);
+    }
+    tracing::warn!(
+        // Diagnostic only: whether an object was there at all.
+        usage_metadata_present = v.get("usageMetadata").is_some_and(|m| m.is_object()),
+        "vertex 2xx reported no usage; charging the reservation"
+    );
+    Usage::default().into_suspect()
+}
+
 #[async_trait]
 impl Provider for VertexProvider {
     fn id(&self) -> &str {
@@ -2245,7 +2275,7 @@ impl Provider for VertexProvider {
             .await
             .map_err(|e| classify_transport_error(&e))?;
         let (status, meta, json) = json_or_classified(resp).await?;
-        let usage = parse_vertex_usage(&json);
+        let usage = vertex_reply_usage(status, &json);
         Ok(ProviderResponse {
             status,
             body: json,
@@ -4719,11 +4749,88 @@ mod tests {
 
     #[test]
     fn vertex_absent_usage_metadata_is_zero() {
-        // No usageMetadata at all must yield a zero Usage so the gateway's
-        // 2xx-with-no-usage fallback engages instead of metering something wrong.
+        // No usageMetadata at all reads as zero counts. A 2xx like this is
+        // charged the reservation by `vertex_reply_usage`, not costed from these.
         let v: Value = serde_json::from_str(r#"{"candidates":[]}"#).unwrap();
         let u = parse_vertex_usage(&v);
         assert_eq!(u, Usage::default());
+    }
+
+    #[test]
+    fn vertex_live_replies_are_read_from_their_usage() {
+        // Replies captured from live Vertex, with the response id and thought
+        // signature replaced. Expected (fresh input, output) per the four-class
+        // rule: output is candidates plus thoughts.
+        let cases = [
+            (include_str!("../testdata/vertex/2xx-stop.json"), 6, 325),
+            (
+                include_str!("../testdata/vertex/2xx-max-tokens-empty-text.json"),
+                7,
+                0,
+            ),
+            (
+                include_str!("../testdata/vertex/2xx-max-tokens-thinking-only.json"),
+                12,
+                12,
+            ),
+            (
+                include_str!("../testdata/vertex/2xx-stop-sequence-no-output.json"),
+                9,
+                280,
+            ),
+            // Stopped for safety: 19 candidate and 311 thinking tokens reported.
+            (
+                include_str!("../testdata/vertex/2xx-safety-stop-a.json"),
+                15,
+                330,
+            ),
+            (
+                include_str!("../testdata/vertex/2xx-safety-stop-b.json"),
+                18,
+                159,
+            ),
+        ];
+        for (body, input, output) in cases {
+            let v: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                vertex_reply_usage(200, &v),
+                Usage::new(input, output),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_2xx_without_usage_is_suspect_and_a_non_2xx_is_not() {
+        let suspect = Usage::default().into_suspect();
+        for body in [
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#,
+            r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#,
+            "{}",
+            r#"{"usageMetadata":null}"#,
+            r#"{"usageMetadata":"6"}"#,
+            r#"{"usageMetadata":{}}"#,
+            r#"{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}"#,
+            r#"{"usageMetadata":{"promptTokenCount":"6","candidatesTokenCount":1}}"#,
+            r#"{"usageMetadata":{"promptTokenCount":6.0,"candidatesTokenCount":1}}"#,
+            r#"{"usageMetadata":{"candidatesTokenCount":3,"totalTokenCount":3}}"#,
+        ] {
+            let v: Value = serde_json::from_str(body).unwrap();
+            // Any 2xx, not only 200.
+            for status in [200, 201, 299] {
+                assert_eq!(vertex_reply_usage(status, &v), suspect, "{status} {body}");
+            }
+            // Control: the same body on a non-2xx is read as reported.
+            assert!(!vertex_reply_usage(400, &v).suspect, "{body}");
+        }
+        // Control: one positive prompt count is enough to be read.
+        let v: Value = serde_json::from_str(r#"{"usageMetadata":{"promptTokenCount":1}}"#).unwrap();
+        assert_eq!(vertex_reply_usage(200, &v), Usage::new(1, 0));
+        // A real Vertex 400 carries no usage and is charged nothing.
+        let v: Value =
+            serde_json::from_str(include_str!("../testdata/vertex/400-invalid-argument.json"))
+                .unwrap();
+        assert_eq!(vertex_reply_usage(400, &v), Usage::default());
     }
 
     // -----------------------------------------------------------------------

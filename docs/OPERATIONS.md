@@ -352,6 +352,20 @@ A `fileData` that is not an object is a `403`. `labels` are refused unless
 billing export; allowed, they are limited to 64 entries of at most 63
 characters.
 
+**Native Vertex replies without usage.** A native Vertex `2xx` whose body has
+no `usageMetadata` object, or one without a positive `promptTokenCount`, is
+charged its full reservation and recorded as `estimated`, with or without
+candidates. It logs a WARN,
+`vertex 2xx reported no usage; charging the reservation`, with
+`usage_metadata_present`, and an ERROR,
+`upstream usage is implausible, self-contradictory or missing; charging the reservation`.
+Every `2xx` Vertex returned in a live check reported usage, including replies
+stopped for safety, so treat either line as worth investigating: Tollgate
+received a reply unlike any seen in that check. That check never produced a
+prompt blocked outright (`promptFeedback` with no candidates); if Vertex sends
+one without usage, it is charged the full reservation too. A non-`2xx` is
+charged what it reports, usually nothing.
+
 **Content parts on the Vertex OpenAI-compatible route.** A message `content`
 array may carry only `{"type": "text", "text": ...}` parts until media support
 lands; any other part type, or another key in a part, is a `400`.
