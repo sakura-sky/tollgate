@@ -54,17 +54,29 @@ cargo audit
 its `--deny warnings`, so a local run gives the same answer CI gives. A gate
 that disagrees with the one in CI is a gate people learn to ignore.
 
-Each ignore holds only while the crate it names stays out of the build graph,
-and CI checks that on every run. The same check by hand exits 0 when it
-passes. It exits non-zero if `cargo tree` fails, if `sqlx-postgres` is missing
-from the listing (so the listing cannot be trusted), or if one of the crates is
-in the graph, which it then prints:
+The ignores fall into two groups. RUSTSEC-2023-0071 (`rsa`) and
+RUSTSEC-2026-0459 (`libsqlite3-sys`) each hold only while the crate it names
+stays out of the build graph, and CI checks that on every run. The same check
+by hand exits 0 when it passes. It exits non-zero if `cargo tree` fails, if
+`sqlx-postgres` is missing from the listing (so the listing cannot be trusted),
+or if one of the crates is in the graph, which it then prints:
 
 ```bash
 graph=$(cargo tree --locked --workspace --all-features --target all \
   -e normal,build,dev --prefix none --format '{p}') &&
   grep -q '^sqlx-postgres ' <<< "$graph" &&
   ! grep -E '^(sqlx-mysql|rsa|sqlx-sqlite|libsqlite3-sys) ' <<< "$graph"
+```
+
+RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542 (`humantime`) are
+informational "unmaintained" notices, not vulnerabilities, against crates
+Tollgate does compile in. They are ignored until Tollgate moves from chrono to
+`time` and replaces humantime-serde, and that change removes both ignores. CI
+checks the reverse for these two: it fails if either crate leaves the build
+graph while the check still names it. By hand, against the same listing:
+
+```bash
+grep -q '^chrono ' <<< "$graph" && grep -q '^humantime ' <<< "$graph"
 ```
 
 ## Database migrations

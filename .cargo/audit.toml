@@ -7,6 +7,12 @@
 # is worse than no gate.
 
 [advisories]
+# The ignores fall into two groups, held for different reasons and checked in
+# different ways. Keep this list, the audit step in .github/workflows/ci.yml
+# and DEVELOPMENT.md in step.
+#
+# Not in the build graph.
+#
 # RUSTSEC-2023-0071, the rsa "Marvin" timing sidechannel. rsa 0.10.0 fixes
 # it, but sqlx-mysql 0.8.6 requires `rsa = "0.9"`, so no fix is reachable on
 # sqlx 0.8. Ignored because the code never compiles into the binary: `rsa` has
@@ -22,10 +28,30 @@
 # None is enabled, and every other reference uses weak activation
 # (`sqlx-sqlite?/...`).
 #
-# Each justification ends the moment its crate enters the build graph. CI
-# checks that on every run and fails if `sqlx-mysql`, `sqlx-sqlite`, `rsa` or
-# `libsqlite3-sys` appears; DEVELOPMENT.md shows the same check to run by hand.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459"]
+# Each of these two justifications ends the moment its crate enters the build
+# graph. CI checks that on every run and fails if `sqlx-mysql`, `sqlx-sqlite`,
+# `rsa` or `libsqlite3-sys` appears; DEVELOPMENT.md shows the same check to run
+# by hand.
+#
+# In the build graph, until the migration off them.
+#
+# RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0542 (humantime) are
+# informational "unmaintained" notices, not vulnerabilities: neither reports a
+# flaw, and neither lists a patched version. Both crates are compiled into the
+# binary. chrono is a direct dependency and also reaches it through sqlx's
+# `chrono` feature; humantime arrives through humantime-serde, which parses the
+# duration settings. The humantime notice gives chrono's status as its reason,
+# although humantime 2.4.0 has no runtime dependencies (chrono is only one of
+# its dev-dependencies).
+#
+# These two ignores are temporary. An ignored advisory drops out of
+# `cargo audit` output altogether, so this comment and a CI check are what keep
+# the two notices on record. They are removed by the change that moves Tollgate
+# from chrono to `time` (through sqlx's `time` feature) and replaces
+# humantime-serde with a parser for the documented duration formats. A CI step
+# fails once chrono or humantime has left the build graph, so the change that
+# removes them has to remove that step, and these ignores go with it.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0459", "RUSTSEC-2026-0542", "RUSTSEC-2026-0543"]
 
 [output]
 # Match CI, which runs with --deny warnings. Unmaintained, unsound and yanked

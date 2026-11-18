@@ -139,6 +139,14 @@ Security).
   `Cargo.lock` only through reqwest's HTTP/3 support, which Tollgate does not
   enable, so it is not compiled into the binary; the update keeps
   `cargo audit` clean without another ignore.
+- `cargo audit` ignores RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542
+  (`humantime`) for now. Both are informational "unmaintained" notices, not
+  vulnerabilities: neither reports a flaw, and neither lists a patched
+  version. Unlike `rsa` and `libsqlite3-sys`, these crates are compiled in,
+  so the ignores are temporary. They will be removed when Tollgate moves from
+  chrono to `time` and replaces humantime-serde with its own parser for the
+  documented duration formats. A CI check fails if either crate leaves the
+  build graph while the check still names it.
 
 ### Added
 
