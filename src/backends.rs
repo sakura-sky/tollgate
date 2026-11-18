@@ -1063,7 +1063,7 @@ pub async fn reconcile_counters(
 ///
 /// ```text
 /// docker compose -f compose/docker-compose.yaml up -d valkey
-/// TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --lib redis_live -- --ignored --test-threads=1
+/// TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:23379 cargo test --lib redis_live -- --ignored --test-threads=1
 /// ```
 ///
 /// Run the whole file on the CURRENT redis version and again on the candidate,

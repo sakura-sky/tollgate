@@ -25,7 +25,8 @@ keys are refused on `/v1/chat/completions` with `upstream = vertex`, a bare
 model id there is priced and budgeted as `google/<id>` (see Changed), native
 Vertex `maxOutputTokens: 0` is refused (see Security), and a native Vertex path
 must be exactly `publishers/google/models/{model}:generateContent` (see
-Security).
+Security). The dev compose stack has moved to ports 23432, 23379 and 23080, so
+a local `.env` that points at 5432 or 6379 needs updating (see Changed).
 
 ### Security
 
@@ -322,6 +323,26 @@ Security).
   `TOLLGATE_PROVIDERS__VERTEX__PROJECT` and `__LOCATION` that do not form a
   valid URL. Such a deployment used to start and then fail every Vertex
   request.
+- The dev compose stack publishes on new loopback ports: Postgres on
+  `127.0.0.1:23432` (was 5432), Valkey on `127.0.0.1:23379` (was 6379) and the
+  `app` profile's gateway on `127.0.0.1:23080` (was 8080), so it no longer
+  collides with services already on the usual ports. Each can be moved with
+  `TOLLGATE_DEV_PG_PORT`, `TOLLGATE_DEV_VALKEY_PORT` or
+  `TOLLGATE_DEV_HTTP_PORT`. A local `.env` copied from an earlier
+  `.env.example` still points at 5432 and 6379 and needs its
+  `TOLLGATE_DATABASE__URL` and `TOLLGATE_REDIS__URL` updating. A host command
+  (`serve`, `admin ...`) run without `.env` exported takes the URLs, unless
+  already set in the environment, from a `--config` file or `tollgate.toml` if
+  one sets them, and otherwise from the built-in `127.0.0.1:5432` and
+  `127.0.0.1:6379`, so export it first with `set -a; source .env; set +a`.
+  Ports inside the stack, the production Terraform and the built-in defaults
+  (including the `0.0.0.0:8080` bind) are unchanged.
+- The development examples bind or publish only on the host's loopback
+  address: `.env.example` sets `TOLLGATE_HTTP__BIND=127.0.0.1:8080` (was
+  `0.0.0.0:8080`) and the `docker run` example in DEVELOPMENT.md publishes on
+  `127.0.0.1:8080`. To reach a gateway from another machine, set
+  `TOLLGATE_HTTP__BIND` or the published address explicitly. A `.env` copied
+  from an earlier `.env.example` keeps `0.0.0.0:8080` until you change it.
 
 ## v0.3.0
 

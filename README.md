@@ -225,7 +225,7 @@ key-authenticated JSON endpoints you would call with curl.
 Requires Rust 1.88, Docker, and Docker Compose.
 
 ```bash
-# 1. Bring up Postgres + Valkey
+# 1. Bring up Postgres + Valkey (by default on 127.0.0.1:23432 and 127.0.0.1:23379)
 docker compose -f compose/docker-compose.yaml up -d
 
 # 2. Configure. Edit .env and set TOLLGATE_SECURITY__API_KEY_PEPPER to a real
@@ -253,10 +253,17 @@ docker compose -f compose/docker-compose.yaml --profile app up -d --build
 
 The `tollgate` service sits behind the `app` profile, so step 1 still starts
 only the dependencies. It reads `.env`, overrides the database and Valkey URLs to
-the compose service names, publishes on `127.0.0.1:8080`, and sets
+the compose service names, publishes on `127.0.0.1:23080`, and sets
 `TOLLGATE_DATABASE__AUTO_MIGRATE=true` so it boots on a fresh volume. That
 setting is for local dev only: in production keep `admin migrate` an explicit
-step.
+step. Check it with `curl -s http://localhost:23080/healthz`.
+
+The stack's host ports sit away from the usual 5432, 6379 and 8080 so it can
+run beside services already using those, and the gateway in step 4 (which binds
+8080 from `.env`) can run next to the one in Docker. Each can be moved with
+`TOLLGATE_DEV_PG_PORT`, `TOLLGATE_DEV_VALKEY_PORT` or `TOLLGATE_DEV_HTTP_PORT`;
+see [`DEVELOPMENT.md`](./DEVELOPMENT.md#local-stack) for where Compose reads them
+from.
 
 ## Monitoring
 
@@ -645,7 +652,7 @@ The MSRV was 1.85 until it became a liability: it pinned the `redis` crate five 
 
 The audit job also runs on a weekly schedule. Advisories are filed against dependencies we already have, not against our commits, so a job that only runs on push leaves a new advisory invisible until someone happens to push.
 
-A separate job runs the Valkey enforcement battery against a real server, because the ordinary suite uses an in-memory budget backend and never executes the Lua that actually reserves and settles budgets. Those tests are `#[ignore]`d so a developer without a server is not blocked; run them locally with `docker compose -f compose/docker-compose.yaml up -d valkey` then `TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --lib redis_live -- --ignored --test-threads=1`.
+A separate job runs the Valkey enforcement battery against a real server, because the ordinary suite uses an in-memory budget backend and never executes the Lua that actually reserves and settles budgets. Those tests are `#[ignore]`d so a developer without a server is not blocked; run them locally with `docker compose -f compose/docker-compose.yaml up -d valkey` then `TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:23379 cargo test --lib redis_live -- --ignored --test-threads=1`.
 
 Separately, [`cloudbuild.yaml`](./cloudbuild.yaml) runs the same fmt/clippy/test gates and then builds the container image and pushes it to Artifact Registry. Trigger substitutions: `_REGION`, `_AR_REPO`.
 

@@ -10,6 +10,42 @@
 - Terraform 1.7+ for infrastructure
 - `gcloud` CLI for GCP interaction
 
+## Local stack
+
+`compose/docker-compose.yaml` publishes everything on loopback, on ports chosen
+to stay clear of a Postgres, Redis or gateway already running on the machine:
+
+| Service | Host address | Override | Inside the stack |
+| --- | --- | --- | --- |
+| Postgres | `127.0.0.1:23432` | `TOLLGATE_DEV_PG_PORT` | `postgres:5432` |
+| Valkey | `127.0.0.1:23379` | `TOLLGATE_DEV_VALKEY_PORT` | `valkey:6379` |
+| Tollgate (`app` profile) | `127.0.0.1:23080` | `TOLLGATE_DEV_HTTP_PORT` | `tollgate:8080` |
+
+Inside its container the gateway binds `0.0.0.0:8080`, so the port can be
+published.
+
+`.env.example` points at the first two. Compose reads the overrides from the
+shell first, then from `compose/.env`. A repo-root `.env` counts only once it is
+exported into the shell (as the README quick start does with
+`set -a; source .env; set +a`) or passed with `--env-file .env`, which then
+replaces `compose/.env` for these settings; `compose/.env` still reaches the
+`app` container through `env_file`. Do not use `--project-directory .` with
+this file: it renames the Compose project, so it starts new, empty volumes, and
+it moves the relative `build` and `env_file` paths. If you move a port, change
+the matching URL in your `.env` as well.
+
+Commands run on the host (`cargo run -- serve`, `cargo run -- admin ...`) do
+not read `.env` themselves, so export it first with
+`set -a; source .env; set +a`. Without it, and with neither URL already set in
+the environment, each comes from the `--config` file (also `TOLLGATE_CONFIG`)
+or else a `tollgate.toml` in the working directory, if that file sets it, and
+otherwise from the built-in `127.0.0.1:5432` and `127.0.0.1:6379`, which no
+longer match the compose stack.
+
+```bash
+TOLLGATE_DEV_PG_PORT=33432 docker compose -f compose/docker-compose.yaml up -d
+```
+
 ## Day-to-day loop
 
 ```bash
@@ -23,6 +59,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked --all-targets
 
 # Run the gateway
+set -a; source .env; set +a
 cargo run --bin tollgate -- serve
 ```
 
@@ -36,7 +73,7 @@ without a server:
 
 ```bash
 docker compose -f compose/docker-compose.yaml up -d valkey
-TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+TOLLGATE_TEST_REDIS_URL=redis://127.0.0.1:23379 \
   cargo test --lib redis_live -- --ignored --test-threads=1
 ```
 
@@ -88,6 +125,7 @@ Migrations live in `migrations/` and are embedded into the binary by `sqlx::migr
 $EDITOR migrations/0012_your_change.sql
 
 # Apply against your local Postgres
+set -a; source .env; set +a
 cargo run --bin tollgate -- admin migrate
 ```
 
@@ -98,6 +136,7 @@ Queries in this repo are checked at runtime, not compile time: there is no `sqlx
 If you have a local OpenTelemetry Collector listening on the default gRPC port:
 
 ```bash
+set -a; source .env; set +a
 TOLLGATE_TELEMETRY__OTLP_ENDPOINT=http://127.0.0.1:4317 \
   cargo run --bin tollgate -- serve
 ```
@@ -108,7 +147,7 @@ Without that env var set, traces stay in-process and only the JSON-formatted log
 
 ```bash
 docker build -t tollgate:dev .
-docker run --rm -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 \
   -e TOLLGATE_DATABASE__URL=postgres://... \
   -e TOLLGATE_REDIS__URL=redis://... \
   -e TOLLGATE_SECURITY__API_KEY_PEPPER=... \
