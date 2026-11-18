@@ -7,6 +7,20 @@
 # That starts Postgres and Valkey only. To run Tollgate itself in the stack as
 # well (needs a .env with a real pepper first, see the README):
 #   docker compose -f compose/docker-compose.yaml --profile app up -d --build
+#
+# Host ports are on loopback and away from the usual defaults, so the stack can
+# run beside a Postgres, Redis or gateway already on this machine:
+#   Postgres 127.0.0.1:23432, Valkey 127.0.0.1:23379, Tollgate 127.0.0.1:23080
+# Override them with TOLLGATE_DEV_PG_PORT, TOLLGATE_DEV_VALKEY_PORT and
+# TOLLGATE_DEV_HTTP_PORT. Compose takes these from the shell first, then from
+# compose/.env. A repo-root .env counts only once it is exported into the shell
+# (as the README quick start does with `set -a; source .env; set +a`) or passed
+# with --env-file .env, which then replaces compose/.env for these settings
+# (compose/.env still reaches the app container through env_file below). Do not
+# use `--project-directory .` with this file: it renames the Compose project, so
+# it starts new, empty volumes, and it moves the relative `build` and `env_file`
+# paths.
+# Moving a port means updating the matching URL in your .env too.
 
 services:
   postgres:
@@ -20,7 +34,7 @@ services:
       # Loopback only. Docker publishes on all interfaces by default, which on a
       # laptop on an untrusted network is an open Postgres with the password
       # below.
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${TOLLGATE_DEV_PG_PORT:-23432}:5432"
     volumes:
       - tollgate_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -41,7 +55,7 @@ services:
     ports:
       # Loopback only. Valkey here has no password at all, and it holds live
       # budget counters.
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${TOLLGATE_DEV_VALKEY_PORT:-23379}:6379"
     volumes:
       - tollgate_valkey_data:/data
     healthcheck:
@@ -78,7 +92,7 @@ services:
     ports:
       # Loopback only, like the dependencies above. The container binds 0.0.0.0
       # so the port can be published at all; the host side stays private.
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${TOLLGATE_DEV_HTTP_PORT:-23080}:8080"
 
 volumes:
   tollgate_pg_data:
