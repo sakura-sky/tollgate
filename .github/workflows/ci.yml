@@ -161,17 +161,15 @@ jobs:
       - name: Install Rust (stable, for the audit tool)
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
-      # Two of the advisories the audit step ignores, RUSTSEC-2023-0071 and
-      # RUSTSEC-2026-0459, are ignored only because the crates they name never
-      # compile into Tollgate. (The other two rest on a different reason and
-      # have their own check, after this step.) cargo-audit reads
+      # The advisories the audit step ignores are ignored only because the
+      # crates they name never compile into Tollgate. cargo-audit reads
       # Cargo.lock, and that lists sqlx's MySQL and SQLite drivers although
       # neither is built: both are optional dependencies, and sqlx features
-      # Tollgate enables (`chrono`, `uuid`, `migrate`) name them through weak
+      # Tollgate enables (`time`, `uuid`, `migrate`) name them through weak
       # `?/` references. Such a reference puts an optional dependency in
       # Cargo.lock without turning it on. cargo-audit reports them all the
-      # same, so those ignores rest on the build graph, and this step checks
-      # that graph on every run.
+      # same, so the ignores rest on the build graph, and this step checks that
+      # graph on every run.
       #
       # It fails if the sqlx MySQL or SQLite driver (`sqlx-mysql`,
       # `sqlx-sqlite`), or a crate behind an ignored advisory (`rsa`,
@@ -204,32 +202,6 @@ jobs:
             exit 1
           fi
           echo "Not in the build graph: sqlx-mysql, rsa, sqlx-sqlite, libsqlite3-sys"
-      # The reverse check, for the two temporary ignores in the audit step
-      # (RUSTSEC-2026-0543, chrono, and RUSTSEC-2026-0542, humantime). Both are
-      # "unmaintained" notices against crates Tollgate compiles in, ignored
-      # until it moves off them. This step checks only that chrono and
-      # humantime are still in the build graph; it does not read the ignore
-      # lists. It fails once either crate has gone, so the change that removes
-      # a crate has to change this step, and removes that crate's ignore, here
-      # and in .cargo/audit.toml, at the same time. A crate that leaves the
-      # build graph but stays in Cargo.lock is still reported by cargo-audit;
-      # its ignore then belongs with the step above, under that step's reason.
-      # This step reads the listing the step above wrote and checked, and runs
-      # only when that step passed.
-      - name: Check temporarily ignored crates are still in the build graph
-        run: |
-          graph="${RUNNER_TEMP:?}/build-graph.txt"
-          stale=0
-          for crate in chrono humantime; do
-            if ! grep -q "^${crate} " "$graph"; then
-              echo "::error::${crate} is no longer in the build graph. Remove its advisory from the ignores in this workflow and .cargo/audit.toml, and remove it from this check."
-              stale=1
-            fi
-          done
-          if [ "$stale" -ne 0 ]; then
-            exit 1
-          fi
-          echo "Still in the build graph: chrono, humantime"
       # Use +stable explicitly: the repo's rust-toolchain.toml pins the MSRV in
       # this directory, but the audit tool itself should build on current stable.
       #
@@ -259,8 +231,8 @@ jobs:
       # understands. That is the correct direction for a security gate, and
       # `--locked` fixes the tool's own dependency tree either way.
       - name: Install cargo-audit
-        # This step and the next run even when either build-graph check fails,
-        # so one run still reports a new advisory, including the weekly one.
+        # This step and the next run even when the build-graph check fails, so
+        # one run still reports a new advisory, including the weekly one.
         if: ${{ !cancelled() }}
         run: cargo +stable install cargo-audit --locked --version ">=0.22, <1.0"
       - name: Audit dependencies
@@ -291,32 +263,14 @@ jobs:
         # release accepts the patched libsqlite3-sys 0.39, so there is no
         # update to take instead.
         #
-        # Each of those two ignores stops being valid the moment its crate
-        # enters the build graph, and the "Check ignored advisories stay out of
-        # the build graph" step above fails the job when that happens.
-        #
-        # RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0542 (humantime) are
-        # ignored for a different reason. They are informational "unmaintained"
-        # notices, not vulnerabilities: neither reports a flaw, and neither
-        # lists a patched version. Both crates ARE compiled in: chrono directly
-        # and through sqlx's `chrono` feature, humantime through
-        # humantime-serde. The humantime notice gives chrono's status as its
-        # reason, although humantime 2.4.0 has no runtime dependencies.
-        #
-        # These two ignores are temporary. The change that moves Tollgate from
-        # chrono to `time` (through sqlx's `time` feature) and replaces
-        # humantime-serde with a parser for the documented duration formats
-        # removes them, and the "Check temporarily ignored crates are still in
-        # the build graph" step above fails the job once either crate goes,
-        # for as long as that step still names it. An ignored advisory drops
-        # out of cargo-audit's output altogether, so these comments and that
-        # step are what keep the two notices on record until then.
-        #
-        # Everything else stays strict.
+        # Each ignore stops being valid the moment its crate enters the build
+        # graph, and the "Check ignored advisories stay out of the build graph"
+        # step above fails the job when that happens. Everything else stays
+        # strict.
         #
         # `+stable` here too, so the rustup `cargo` shim runs the audit on
         # stable rather than resolving rust-toolchain.toml to 1.88, which this
         # job does not install, and cargo-audit's own `cargo -V` call for the
         # crates.io index (used for yanked-crate detection) gets the same
         # stable cargo.
-        run: cargo +stable audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459 --ignore RUSTSEC-2026-0542 --ignore RUSTSEC-2026-0543
+        run: cargo +stable audit --deny warnings --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459

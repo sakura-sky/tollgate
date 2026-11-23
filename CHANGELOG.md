@@ -26,7 +26,8 @@ model id there is priced and budgeted as `google/<id>` (see Changed), native
 Vertex `maxOutputTokens: 0` is refused (see Security), and a native Vertex path
 must be exactly `publishers/google/models/{model}:generateContent` (see
 Security). The dev compose stack has moved to ports 23432, 23379 and 23080, so
-a local `.env` that points at 5432 or 6379 needs updating (see Changed).
+a local `.env` that points at 5432 or 6379 needs updating, and duration
+settings take one whole number and one unit (both in Changed).
 
 ### Security
 
@@ -149,14 +150,13 @@ a local `.env` that points at 5432 or 6379 needs updating (see Changed).
   credentials are read. The update keeps `cargo audit` clean without another
   ignore. One behaviour change: a configured upstream base URL with `^` in its
   path is now sent with `%5E` in its place.
-- `cargo audit` ignores RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542
-  (`humantime`) for now. Both are informational "unmaintained" notices, not
-  vulnerabilities: neither reports a flaw, and neither lists a patched
-  version. Unlike `rsa` and `libsqlite3-sys`, these crates are compiled in,
-  so the ignores are temporary. They will be removed when Tollgate moves from
-  chrono to `time` and replaces humantime-serde with its own parser for the
-  documented duration formats. A CI check fails if either crate leaves the
-  build graph while the check still names it.
+- Tollgate no longer depends on `chrono` or `humantime`, which RustSec lists
+  as unmaintained (RUSTSEC-2026-0543 and RUSTSEC-2026-0542). Timestamps use
+  the `time` crate, through sqlx's `time` feature, at 0.3.47 or later, which
+  carries the fix for RUSTSEC-2026-0009. Duration settings are read by
+  Tollgate's own parser in place of `humantime-serde`. Budget counter keys in
+  Valkey, spend windows and the values sent to Postgres are unchanged, so old
+  and new instances can run side by side during a rollout.
 
 ### Added
 
@@ -208,6 +208,20 @@ a local `.env` that points at 5432 or 6379 needs updating (see Changed).
 
 ### Changed
 
+- Breaking: duration settings (`TOLLGATE_HTTP__REQUEST_TIMEOUT`,
+  `TOLLGATE_HTTP__SHUTDOWN_GRACE`, `TOLLGATE_DATABASE__ACQUIRE_TIMEOUT`,
+  `TOLLGATE_RELOAD__INTERVAL`, `TOLLGATE_RETENTION__WINDOW`,
+  `TOLLGATE_PROVIDERS__REQUEST_TIMEOUT`, and the same keys in
+  `tollgate.toml`) take one whole number followed by `ms`, `s`, `m`, `h` or
+  `d`, such as `15s`, `10m` or `90d`. Every value in `.env.example` and the
+  docs still parses, and each of the five units means what it meant before.
+  Compound values (`1m30s`), fractions (`1.5h`), spaces inside a value, any
+  other unit name (such as `5min`, `2hr`, `90days`, `1wk` or `5µs`), the units
+  `ns`, `us`, `w`, `M` and `y`, and a bare `"0"` string in `tollgate.toml` were
+  accepted before and are now refused at startup with a message naming the
+  setting. A bare non-negative whole number, such as
+  `TOLLGATE_RELOAD__INTERVAL=0`, was already refused; its message now names
+  the unit it needs (`0s`).
 - Breaking: on `/v1/chat/completions` with `upstream = vertex`, a bare model id
   is priced, budgeted, recorded in the ledger and logged under the
   `google/`-prefixed id it is forwarded as, so `gemini-x` and `google/gemini-x`

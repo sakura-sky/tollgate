@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use redis::aio::ConnectionManager;
 use sqlx::{PgPool, Row};
+use time::{Date, Month, OffsetDateTime, UtcDateTime};
 
 use crate::budget::{Budget, BudgetDenied, Period, RequestCtx, Reservation, Scope, resolve};
 use crate::gateway::{
@@ -205,7 +205,7 @@ pub trait SpendLedger: Send + Sync {
     /// # Errors
     /// Returns a message when the spend cannot be determined. The caller must
     /// then refuse the request: admitting it would admit it unenforced.
-    async fn spent_micros(&self, budget: &Budget, now: DateTime<Utc>) -> Result<i64, String>;
+    async fn spent_micros(&self, budget: &Budget, now: UtcDateTime) -> Result<i64, String>;
 }
 
 /// The real one: the Postgres ledger.
@@ -222,7 +222,7 @@ impl PgSpendLedger {
 
 #[async_trait]
 impl SpendLedger for PgSpendLedger {
-    async fn spent_micros(&self, budget: &Budget, now: DateTime<Utc>) -> Result<i64, String> {
+    async fn spent_micros(&self, budget: &Budget, now: UtcDateTime) -> Result<i64, String> {
         budget_spent(&self.pool, budget, now)
             .await
             .map_err(|e| e.to_string())
@@ -260,7 +260,7 @@ impl RedisBudgetBackend {
     /// Only the keys the script reported missing, not every applicable budget: a
     /// `SUM` over a global monthly scope is not a query to run for a counter
     /// that is sitting there.
-    async fn seed_keys(&self, keys: &[String], now: DateTime<Utc>) -> Result<(), String> {
+    async fn seed_keys(&self, keys: &[String], now: UtcDateTime) -> Result<(), String> {
         let script = redis::Script::new(SEED_LUA);
         for b in &self.budgets {
             let key = crate::budget::counter_key(&b.scope, b.period, now);
@@ -460,7 +460,7 @@ impl BudgetBackend for RedisBudgetBackend {
         ctx: &RequestCtx<'_>,
         reserve_micros: i64,
     ) -> Result<Reservation, ReserveError> {
-        let now = Utc::now();
+        let now = UtcDateTime::now();
         let slots = resolve(&self.budgets, ctx, now);
         // Mandatory backstop: no applicable budget means reject, never allow.
         if slots.is_empty() {
@@ -795,27 +795,35 @@ pub async fn load_prices(
 }
 
 /// The `[start, end)` window of `period` containing `now`, in UTC.
-fn period_window(period: Period, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let at_midnight = |d: NaiveDate| Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap());
+///
+/// Each bound is a UTC midnight. `end` is the first day of the next period,
+/// computed as a calendar date rather than by adding seconds. `time`'s dates
+/// end at 9999-12-31, so the start of the next period cannot always be named,
+/// and this panics: from 9999-12-31 for a daily period, from 9999-12-27 (the
+/// last Monday) for a weekly one, and from 9999-12-01 for a monthly one. A
+/// real clock never gets that far.
+fn period_window(period: Period, now: UtcDateTime) -> (UtcDateTime, UtcDateTime) {
+    let at_midnight = |d: Date| d.midnight().as_utc();
+    let next_day = |d: Date| d.next_day().expect("the clock is before 9999-12-31");
+    let d = now.date();
     match period {
-        Period::Daily => {
-            let start = at_midnight(now.date_naive());
-            (start, start + Duration::days(1))
-        }
+        Period::Daily => (at_midnight(d), at_midnight(next_day(d))),
         Period::Weekly => {
-            let back = i64::from(now.weekday().num_days_from_monday());
-            let start = at_midnight(now.date_naive() - Duration::days(back));
-            (start, start + Duration::days(7))
+            let back = i64::from(d.weekday().number_days_from_monday());
+            let start = d - time::Duration::days(back);
+            (
+                at_midnight(start),
+                at_midnight(start + time::Duration::days(7)),
+            )
         }
         Period::Monthly => {
-            let d = now.date_naive();
-            let first = NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap();
-            let (ny, nm) = if d.month() == 12 {
-                (d.year() + 1, 1)
-            } else {
-                (d.year(), d.month() + 1)
+            let first = d.replace_day(1).expect("day 1 exists in every month");
+            let (ny, nm) = match d.month() {
+                Month::December => (d.year() + 1, Month::January),
+                m => (d.year(), m.next()),
             };
-            let next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
+            let next =
+                Date::from_calendar_date(ny, nm, 1).expect("the clock is before December 9999");
             (at_midnight(first), at_midnight(next))
         }
     }
@@ -833,9 +841,12 @@ fn period_window(period: Period, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime
 pub async fn budget_spent(
     pool: &PgPool,
     budget: &Budget,
-    now: DateTime<Utc>,
+    now: UtcDateTime,
 ) -> Result<i64, sqlx::Error> {
+    // sqlx 0.8 encodes `OffsetDateTime`, not `UtcDateTime`. Both bounds are
+    // UTC, so the conversion only changes the type.
     let (start, end) = period_window(budget.period, now);
+    let (start, end) = (OffsetDateTime::from(start), OffsetDateTime::from(end));
     let base = "SELECT COALESCE(SUM(cost_micros), 0)::bigint FROM usage_events \
                 WHERE cost_micros > 0 AND started_at >= $1 AND started_at < $2";
     let spent = match &budget.scope {
@@ -914,7 +925,7 @@ pub async fn seed_missing_counters(
     conn: &ConnectionManager,
     budgets: &[Budget],
 ) -> Result<usize, sqlx::Error> {
-    let now = Utc::now();
+    let now = UtcDateTime::now();
     let mut seeded = 0usize;
     for b in budgets {
         let key = crate::budget::counter_key(&b.scope, b.period, now);
@@ -978,7 +989,7 @@ pub async fn reconcile_counters(
     conn: &ConnectionManager,
     budgets: &[Budget],
 ) -> Result<usize, sqlx::Error> {
-    let now = Utc::now();
+    let now = UtcDateTime::now();
     let mut restored = 0usize;
     for b in budgets {
         let spent = budget_spent(pool, b, now).await?;
@@ -1087,7 +1098,7 @@ mod redis_live_tests {
 
     #[async_trait]
     impl SpendLedger for ZeroLedger {
-        async fn spent_micros(&self, _b: &Budget, _now: DateTime<Utc>) -> Result<i64, String> {
+        async fn spent_micros(&self, _b: &Budget, _now: UtcDateTime) -> Result<i64, String> {
             Ok(0)
         }
     }
@@ -1192,7 +1203,7 @@ mod redis_live_tests {
 
     #[async_trait]
     impl SpendLedger for FixedLedger {
-        async fn spent_micros(&self, _b: &Budget, _now: DateTime<Utc>) -> Result<i64, String> {
+        async fn spent_micros(&self, _b: &Budget, _now: UtcDateTime) -> Result<i64, String> {
             Ok(self.0)
         }
     }
@@ -1202,7 +1213,7 @@ mod redis_live_tests {
 
     #[async_trait]
     impl SpendLedger for BrokenLedger {
-        async fn spent_micros(&self, _b: &Budget, _now: DateTime<Utc>) -> Result<i64, String> {
+        async fn spent_micros(&self, _b: &Budget, _now: UtcDateTime) -> Result<i64, String> {
             Err("ledger unavailable".to_owned())
         }
     }
@@ -1243,8 +1254,11 @@ mod redis_live_tests {
 
         // And the counter is now present at the ledger's figure, so the next
         // request does not pay for the repair again.
-        let key =
-            crate::budget::counter_key(&Scope::ApiKey(id.to_owned()), Period::Monthly, Utc::now());
+        let key = crate::budget::counter_key(
+            &Scope::ApiKey(id.to_owned()),
+            Period::Monthly,
+            UtcDateTime::now(),
+        );
         assert_eq!(counter(&mut conn, &key).await, 99_000);
 
         // A reserve that DOES fit is admitted and increments from the rebuilt
@@ -1300,8 +1314,11 @@ mod redis_live_tests {
 
         // The ledger says 40,000 has been spent this period.
         let be = RedisBudgetBackend::new(conn.clone(), budgets, Arc::new(FixedLedger(40_000)));
-        let key =
-            crate::budget::counter_key(&Scope::ApiKey(id.to_owned()), Period::Monthly, Utc::now());
+        let key = crate::budget::counter_key(
+            &Scope::ApiKey(id.to_owned()),
+            Period::Monthly,
+            UtcDateTime::now(),
+        );
 
         // Request A reserves 30,000 against the rebuilt counter: 40k + 30k.
         let a = be.reserve(&ctx(id), 30_000).await.expect("A fits");
@@ -1672,6 +1689,102 @@ mod redis_live_tests {
 mod tests {
     use super::*;
 
+    fn at(y: i32, m: u8, d: u8, h: u8) -> UtcDateTime {
+        at_ns(y, m, d, h, 0, 0, 0)
+    }
+
+    fn at_ns(y: i32, m: u8, d: u8, h: u8, mi: u8, s: u8, ns: u32) -> UtcDateTime {
+        Date::from_calendar_date(y, Month::try_from(m).unwrap(), d)
+            .unwrap()
+            .with_hms_nano(h, mi, s, ns)
+            .unwrap()
+            .as_utc()
+    }
+
+    /// The ledger window behind every budget figure: UTC midnights, ISO weeks
+    /// from Monday, calendar months. Expected bounds are written out by hand.
+    #[test]
+    fn period_windows_are_utc_calendar_periods() {
+        let cases = [
+            // Exact midnight starts a new day; one nanosecond before it does not.
+            (
+                Period::Daily,
+                at_ns(2026, 12, 1, 0, 0, 0, 0),
+                at(2026, 12, 1, 0),
+                at(2026, 12, 2, 0),
+            ),
+            (
+                Period::Daily,
+                at_ns(2026, 11, 30, 23, 59, 59, 999_999_999),
+                at(2026, 11, 30, 0),
+                at(2026, 12, 1, 0),
+            ),
+            (
+                Period::Monthly,
+                at_ns(2026, 12, 31, 23, 59, 59, 999_999_999),
+                at(2026, 12, 1, 0),
+                at(2027, 1, 1, 0),
+            ),
+            (
+                Period::Monthly,
+                at_ns(2027, 1, 1, 0, 0, 0, 0),
+                at(2027, 1, 1, 0),
+                at(2027, 2, 1, 0),
+            ),
+            (
+                Period::Daily,
+                at(2024, 2, 29, 12),
+                at(2024, 2, 29, 0),
+                at(2024, 3, 1, 0),
+            ),
+            (
+                Period::Daily,
+                at(2026, 12, 31, 23),
+                at(2026, 12, 31, 0),
+                at(2027, 1, 1, 0),
+            ),
+            (
+                Period::Weekly,
+                at(2027, 1, 1, 9),
+                at(2026, 12, 28, 0),
+                at(2027, 1, 4, 0),
+            ),
+            (
+                Period::Weekly,
+                at(2027, 1, 4, 0),
+                at(2027, 1, 4, 0),
+                at(2027, 1, 11, 0),
+            ),
+            (
+                Period::Weekly,
+                at(2027, 1, 3, 23),
+                at(2026, 12, 28, 0),
+                at(2027, 1, 4, 0),
+            ),
+            (
+                Period::Monthly,
+                at(2026, 12, 15, 8),
+                at(2026, 12, 1, 0),
+                at(2027, 1, 1, 0),
+            ),
+            (
+                Period::Monthly,
+                at(2024, 2, 10, 0),
+                at(2024, 2, 1, 0),
+                at(2024, 3, 1, 0),
+            ),
+            (
+                Period::Monthly,
+                at(2026, 1, 31, 23),
+                at(2026, 1, 1, 0),
+                at(2026, 2, 1, 0),
+            ),
+        ];
+        for (period, now, start, end) in cases {
+            assert_eq!(period_window(period, now), (start, end), "{period:?} {now}");
+        }
+    }
+
     /// The load path, not just the CLI: a row stored in any form `parse_str`
     /// accepts, by an older binary or by hand, still enforces against its key,
     /// and one that is not a UUID is kept (to be reported), never dropped.
@@ -1694,5 +1807,348 @@ mod tests {
             scope_from_row("provider", Some("vertex".to_owned())),
             Some(Scope::Provider("vertex".to_owned()))
         );
+    }
+}
+
+/// Live tests of the spend query against a real Postgres. `#[ignore]`d so a
+/// developer without a server is not blocked. Run them with:
+///
+/// ```text
+/// docker compose -f compose/docker-compose.yaml up -d postgres
+/// TOLLGATE_TEST_DATABASE_URL=postgres://tollgate:tollgate@127.0.0.1:23432/postgres \
+///   cargo test --locked --lib pg_live -- --ignored --test-threads=1
+/// ```
+///
+/// The URL names a database the user can create others from. The test only
+/// connects to it, to create a database `tg_<uuid>` of its own and to drop it
+/// again; everything else, migrations included, runs in that new database.
+#[cfg(test)]
+mod pg_live_spend_tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use sqlx::Executor as _;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use time::{Date, Month};
+
+    fn at(y: i32, m: u8, d: u8, h: u8, mi: u8, s: u8, ns: u32) -> UtcDateTime {
+        Date::from_calendar_date(y, Month::try_from(m).unwrap(), d)
+            .unwrap()
+            .with_hms_nano(h, mi, s, ns)
+            .unwrap()
+            .as_utc()
+    }
+
+    fn budget(scope: Scope, period: Period) -> Budget {
+        Budget {
+            scope,
+            period,
+            limit_micros: 1,
+            hard_stop: true,
+        }
+    }
+
+    /// Rows either side of a day, an ISO week, a month and a year boundary,
+    /// written as SQL literals so no Rust timestamp code touches them. Each
+    /// cost is a distinct power of two, so a sum names exactly the rows it
+    /// counted. Returns the two key ids.
+    async fn seed(pool: &PgPool) -> (uuid::Uuid, uuid::Uuid) {
+        let mut ids = Vec::new();
+        for prefix in ["tgk_0000000000000001", "tgk_0000000000000002"] {
+            let id: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO api_keys (key_hash, prefix, label) VALUES ('x', $1, 'live') RETURNING id",
+            )
+            .bind(prefix)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let (k1, k2) = (ids[0], ids[1]);
+        let rows: [(uuid::Uuid, &str, &str, i64, &str, &str); 9] = [
+            (
+                k1,
+                "vertex",
+                "m1",
+                1,
+                "allowed",
+                "2026-11-30 23:59:59.999999+00",
+            ),
+            (k1, "vertex", "m1", 2, "allowed", "2026-12-01 00:00:00+00"),
+            (
+                k1,
+                "vertex",
+                "m1",
+                4,
+                "allowed",
+                "2026-12-31 23:59:59.999999+00",
+            ),
+            (k1, "vertex", "m1", 8, "allowed", "2027-01-01 00:00:00+00"),
+            (
+                k1,
+                "vertex",
+                "m1",
+                16,
+                "allowed",
+                "2027-01-03 23:59:59.999999+00",
+            ),
+            (k1, "vertex", "m1", 32, "allowed", "2027-01-04 00:00:00+00"),
+            // 2026-11-30 23:30 UTC, written with an offset.
+            (k1, "vertex", "m1", 64, "allowed", "2026-12-01 00:30:00+01"),
+            (
+                k2,
+                "anthropic",
+                "m2",
+                128,
+                "allowed",
+                "2026-12-01 01:00:00+00",
+            ),
+            // Never counted: a zero-cost row inside the 2026-12-01 day, its
+            // week and December, each of which a case below sums.
+            (k1, "vertex", "m1", 0, "error", "2026-12-01 06:00:00+00"),
+        ];
+        for (key, provider, model, cost, decision, started) in rows {
+            sqlx::query(
+                "INSERT INTO usage_events (api_key_id, provider, model, cost_micros, decision, started_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6::timestamptz)",
+            )
+            .bind(key)
+            .bind(provider)
+            .bind(model)
+            .bind(cost)
+            .bind(decision)
+            .bind(started)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        (k1, k2)
+    }
+
+    /// Expected sums are written out by hand from the rows above. The windows
+    /// are UTC whatever the session's time zone, because the bounds go to
+    /// Postgres as absolute instants.
+    async fn check(pool: &PgPool, k1: uuid::Uuid, tz: &str) {
+        let key1 = Scope::ApiKey(k1.to_string());
+        let vertex = Scope::Provider("vertex".to_owned());
+        let m2 = Scope::Model("anthropic:m2".to_owned());
+        let last_ns = 999_999_999;
+        let cases: Vec<(Scope, Period, UtcDateTime, i64)> = vec![
+            // Day: the row at the next midnight and the zero-cost row are out.
+            (
+                Scope::Global,
+                Period::Daily,
+                at(2026, 11, 30, 12, 0, 0, 0),
+                1 + 64,
+            ),
+            (
+                Scope::Global,
+                Period::Daily,
+                at(2026, 11, 30, 23, 59, 59, last_ns),
+                1 + 64,
+            ),
+            (
+                Scope::Global,
+                Period::Daily,
+                at(2026, 12, 1, 0, 0, 0, 0),
+                2 + 128,
+            ),
+            (key1.clone(), Period::Daily, at(2026, 12, 1, 0, 0, 0, 0), 2),
+            (
+                vertex.clone(),
+                Period::Daily,
+                at(2026, 12, 1, 0, 0, 0, 0),
+                2,
+            ),
+            (m2.clone(), Period::Daily, at(2026, 12, 1, 0, 0, 0, 0), 128),
+            (
+                Scope::Global,
+                Period::Daily,
+                at(2026, 12, 31, 23, 59, 59, last_ns),
+                4,
+            ),
+            (Scope::Global, Period::Daily, at(2027, 1, 1, 0, 0, 0, 0), 8),
+            // ISO week, Monday to Monday. 2026-11-30 and 2027-01-04 are Mondays.
+            (
+                Scope::Global,
+                Period::Weekly,
+                at(2026, 12, 2, 9, 0, 0, 0),
+                1 + 2 + 64 + 128,
+            ),
+            (
+                key1.clone(),
+                Period::Weekly,
+                at(2026, 12, 2, 9, 0, 0, 0),
+                1 + 2 + 64,
+            ),
+            (
+                Scope::Global,
+                Period::Weekly,
+                at(2027, 1, 3, 23, 59, 59, last_ns),
+                4 + 8 + 16,
+            ),
+            (
+                Scope::Global,
+                Period::Weekly,
+                at(2027, 1, 4, 0, 0, 0, 0),
+                32,
+            ),
+            // Month, across the year end.
+            (
+                Scope::Global,
+                Period::Monthly,
+                at(2026, 11, 15, 0, 0, 0, 0),
+                1 + 64,
+            ),
+            (
+                Scope::Global,
+                Period::Monthly,
+                at(2026, 12, 1, 0, 0, 0, 0),
+                2 + 4 + 128,
+            ),
+            (
+                vertex.clone(),
+                Period::Monthly,
+                at(2026, 12, 1, 0, 0, 0, 0),
+                2 + 4,
+            ),
+            (
+                Scope::Global,
+                Period::Monthly,
+                at(2026, 12, 31, 23, 59, 59, last_ns),
+                2 + 4 + 128,
+            ),
+            (
+                Scope::Global,
+                Period::Monthly,
+                at(2027, 1, 1, 0, 0, 0, 0),
+                8 + 16 + 32,
+            ),
+        ];
+        for (scope, period, now, want) in cases {
+            let got = budget_spent(pool, &budget(scope.clone(), period), now)
+                .await
+                .unwrap();
+            assert_eq!(
+                got, want,
+                "{scope} {period:?} at {now}, session time zone {tz}"
+            );
+        }
+        // The reserve path's repair reads the ledger through the same query.
+        let ledger = PgSpendLedger::new(pool.clone());
+        assert_eq!(
+            ledger
+                .spent_micros(
+                    &budget(Scope::Global, Period::Monthly),
+                    at(2027, 1, 1, 0, 0, 0, 0)
+                )
+                .await
+                .unwrap(),
+            8 + 16 + 32,
+            "spent_micros, session time zone {tz}"
+        );
+    }
+
+    /// Creates `tg_<uuid>` from the admin URL, runs `body` against it, then
+    /// drops it, also when `body` panics. The body gets the admin URL's
+    /// connection options with only the database changed, so `sslmode` and
+    /// every other parameter carry over, and it runs only once a session on
+    /// those options reports `tg_<uuid>` as its current database. A failed
+    /// drop is reported on stderr and the original panic carries on; after a
+    /// passing body it fails the test. A killed run cannot drop it
+    /// (DEVELOPMENT.md says how to remove what is left).
+    async fn in_fresh_database<F, Fut>(body: F)
+    where
+        F: FnOnce(PgConnectOptions) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let admin_opts: PgConnectOptions = std::env::var("TOLLGATE_TEST_DATABASE_URL")
+            .expect("TOLLGATE_TEST_DATABASE_URL names a database to create others from")
+            .parse()
+            .expect("a Postgres URL");
+        let name = format!("tg_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(admin_opts.clone())
+            .await
+            .expect("connects");
+        admin
+            .execute(format!("CREATE DATABASE {name}").as_str())
+            .await
+            .expect("creates a database");
+        let test_opts = admin_opts.clone().database(&name);
+        let outcome = std::panic::AssertUnwindSafe(async {
+            // Before anything runs: the options must reach the new database,
+            // never the one the URL names.
+            let probe = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(test_opts.clone())
+                .await
+                .expect("connects to the test database");
+            let current: String = sqlx::query_scalar("SELECT current_database()")
+                .fetch_one(&probe)
+                .await
+                .expect("reads the current database");
+            probe.close().await;
+            assert_eq!(current, name, "the test would run outside its own database");
+            body(test_opts).await;
+        })
+        .catch_unwind()
+        .await;
+        let dropped = admin
+            .execute(format!("DROP DATABASE {name} WITH (FORCE)").as_str())
+            .await;
+        admin.close().await;
+        match (outcome, dropped) {
+            (Ok(()), Ok(_)) => {}
+            (Ok(()), Err(e)) => panic!("test database {name} not dropped: {e}"),
+            (Err(panic), dropped) => {
+                if let Err(e) = dropped {
+                    eprintln!("test database {name} not dropped: {e}");
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    /// A pool on `opts` whose sessions use time zone `tz`.
+    async fn pool_in(opts: &PgConnectOptions, tz: &'static str) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    conn.execute(format!("SET TIME ZONE '{tz}'").as_str())
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(opts.clone())
+            .await
+            .expect("connects")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Postgres server: set TOLLGATE_TEST_DATABASE_URL"]
+    async fn pg_live_budget_spent_windows_at_period_boundaries() {
+        in_fresh_database(|opts| async move {
+            let pool = pool_in(&opts, "UTC").await;
+            crate::db::run_migrations(&pool).await.expect("migrates");
+            // Months outside the ones the migration creates still need a home.
+            pool.execute(
+                "CREATE TABLE usage_events_live_default PARTITION OF usage_events DEFAULT",
+            )
+            .await
+            .unwrap();
+            let (k1, _) = seed(&pool).await;
+            check(&pool, k1, "UTC").await;
+            pool.close().await;
+            // The same answers when the session is not on UTC, including a
+            // zone whose offset is not a whole hour.
+            for tz in ["Pacific/Chatham", "America/St_Johns"] {
+                let pool = pool_in(&opts, tz).await;
+                check(&pool, k1, tz).await;
+                pool.close().await;
+            }
+        })
+        .await;
     }
 }

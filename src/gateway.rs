@@ -25,9 +25,9 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
 use serde::Serialize;
 use serde_json::{Value, json};
+use time::UtcDateTime;
 
 use crate::pricing::format_micros;
 
@@ -1282,7 +1282,7 @@ impl BudgetBackend for Budgets {
         ctx: &RequestCtx<'_>,
         reserve_micros: i64,
     ) -> Result<Reservation, ReserveError> {
-        self.try_reserve(ctx, Utc::now(), reserve_micros)
+        self.try_reserve(ctx, UtcDateTime::now(), reserve_micros)
             .map_err(ReserveError::Denied)
     }
 
@@ -1362,7 +1362,7 @@ impl UsageSink for MemUsageSink {
 /// Convenience: spend on a scope's current-period counter (for inspection).
 #[must_use]
 pub fn spent(budgets: &Budgets, scope: &Scope, period: Period) -> i64 {
-    budgets.spent(scope, period, Utc::now())
+    budgets.spent(scope, period, UtcDateTime::now())
 }
 
 #[cfg(test)]

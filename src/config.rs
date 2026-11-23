@@ -7,6 +7,9 @@
 //! environment variables prefixed with `TOLLGATE_`. Nested fields use double
 //! underscores, e.g. `TOLLGATE_HTTP__BIND=0.0.0.0:8080`. A variable that matches
 //! no field is ignored silently, so a typo is a setting that never applies.
+//!
+//! Durations are one whole number and one unit (`ms`, `s`, `m`, `h` or `d`);
+//! see [`crate::duration`] for why the format is closed.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,7 +46,7 @@ pub struct RetentionConfig {
     /// table is append-only, so retention is by partition drop, not DELETE). Set
     /// `0s` to keep everything. Granularity is monthly: the current month is
     /// always retained.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "crate::duration")]
     pub window: Duration,
 }
 
@@ -55,7 +58,7 @@ pub struct ReloadConfig {
     /// the existing spend counters; a brand-new budget's counter, if it has none
     /// yet, is seeded from the spend already recorded this period when it is
     /// first picked up.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "crate::duration")]
     pub interval: Duration,
 }
 
@@ -80,7 +83,7 @@ pub struct ProvidersConfig {
     ///
     /// Streaming ignores this: it is bounded by the idle and max-duration
     /// guards instead, since a stream is expected to be long-lived.
-    #[serde(with = "humantime_serde", default = "default_provider_timeout")]
+    #[serde(with = "crate::duration", default = "default_provider_timeout")]
     pub request_timeout: Duration,
     /// How input tokens are counted for the pre-forward budget reservation:
     /// `fast` (over-estimate from body size, no extra call, lowest latency) or
@@ -289,9 +292,9 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpConfig {
     pub bind: SocketAddr,
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "crate::duration")]
     pub request_timeout: Duration,
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "crate::duration")]
     pub shutdown_grace: Duration,
 }
 
@@ -300,7 +303,7 @@ pub struct DatabaseConfig {
     /// Postgres connection URL, e.g. `postgres://user:pass@host:5432/dbname`.
     pub url: String,
     pub max_connections: u32,
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "crate::duration")]
     pub acquire_timeout: Duration,
     /// DEV ONLY: apply pending migrations when `serve` boots (the compose
     /// stack sets it). Production runs `admin migrate` as an explicit step.
@@ -434,6 +437,80 @@ mod tests {
             cfg.billing.cache_rate_fallback(),
             crate::pricing::CacheRateFallback::default(),
             "config default must not diverge from the pricing default"
+        );
+    }
+
+    /// A bare number is refused with a message that names the setting and
+    /// the unit it needs. `TOLLGATE_RELOAD__INTERVAL=0` reaches the parser as
+    /// a number, because figment's `Env` parses each variable with
+    /// `str::parse::<Value>()`; the value here is made the same way. An
+    /// unquoted `0` in TOML is a number too. Control: `0s` loads as zero.
+    #[test]
+    fn a_bare_number_names_the_setting_and_suggests_a_unit() {
+        let env_zero: figment::value::Value = "0".parse().expect("infallible");
+        let load = |f: Figment| {
+            Figment::from(Serialized::defaults(Config::default()))
+                .merge(f)
+                .extract::<Config>()
+                .map_err(|e| e.to_string())
+        };
+        for (form, figment) in [
+            (
+                "environment",
+                Figment::from(Serialized::default("reload.interval", env_zero)),
+            ),
+            (
+                "toml",
+                Figment::from(Toml::string("[reload]\ninterval = 0")),
+            ),
+        ] {
+            let err = load(figment).expect_err(form);
+            assert!(
+                err.contains("\"0\" has no unit") && err.contains("such as 0s"),
+                "{form}: {err}"
+            );
+            assert!(
+                err.to_lowercase().contains("reload.interval"),
+                "{form}: {err}"
+            );
+        }
+        let err = load(Figment::from(Toml::string("[reload]\ninterval = -1")))
+            .expect_err("a negative number");
+        assert!(err.contains("\"-1\" is not a duration"), "{err}");
+        let zero =
+            load(Figment::from(Toml::string("[reload]\ninterval = \"0s\""))).expect("0s loads");
+        assert_eq!(zero.reload.interval, Duration::ZERO);
+    }
+
+    /// Every load starts from the defaults, written out by
+    /// `Serialized::defaults` and parsed back, so each default duration must
+    /// survive that round trip or every deployment fails to start. A new
+    /// duration setting belongs in this list. Control: a default with a
+    /// fraction of a millisecond cannot be written out, and the load fails
+    /// rather than rounding it.
+    #[test]
+    fn default_durations_survive_the_load_round_trip() {
+        let durations = |c: &Config| {
+            [
+                c.http.request_timeout,
+                c.http.shutdown_grace,
+                c.database.acquire_timeout,
+                c.reload.interval,
+                c.retention.window,
+                c.providers.request_timeout,
+            ]
+        };
+        let loaded: Config = Figment::from(Serialized::defaults(Config::default()))
+            .extract()
+            .expect("the defaults load");
+        assert_eq!(durations(&loaded), durations(&Config::default()));
+
+        let mut odd = Config::default();
+        odd.reload.interval = Duration::from_micros(1_500);
+        assert!(
+            Figment::from(Serialized::defaults(odd))
+                .extract::<Config>()
+                .is_err()
         );
     }
 
