@@ -82,6 +82,8 @@ collected is caught rather than reported as green. Deleting one of these tests
 therefore means lowering that floor in the workflow, which is a decision to make
 on purpose rather than a side effect.
 
+The second gate is the advisory audit:
+
 ```bash
 # Advisories against the dependencies we already have
 cargo audit
@@ -91,12 +93,11 @@ cargo audit
 its `--deny warnings`, so a local run gives the same answer CI gives. A gate
 that disagrees with the one in CI is a gate people learn to ignore.
 
-The ignores fall into two groups. RUSTSEC-2023-0071 (`rsa`) and
-RUSTSEC-2026-0459 (`libsqlite3-sys`) each hold only while the crate it names
-stays out of the build graph, and CI checks that on every run. The same check
-by hand exits 0 when it passes. It exits non-zero if `cargo tree` fails, if
-`sqlx-postgres` is missing from the listing (so the listing cannot be trusted),
-or if one of the crates is in the graph, which it then prints:
+Each ignore holds only while the crate it names stays out of the build graph,
+and CI checks that on every run. The same check by hand exits 0 when it
+passes. It exits non-zero if `cargo tree` fails, if `sqlx-postgres` is missing
+from the listing (so the listing cannot be trusted), or if one of the crates is
+in the graph, which it then prints:
 
 ```bash
 graph=$(cargo tree --locked --workspace --all-features --target all \
@@ -105,15 +106,27 @@ graph=$(cargo tree --locked --workspace --all-features --target all \
   ! grep -E '^(sqlx-mysql|rsa|sqlx-sqlite|libsqlite3-sys) ' <<< "$graph"
 ```
 
-RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542 (`humantime`) are
-informational "unmaintained" notices, not vulnerabilities, against crates
-Tollgate does compile in. They are ignored until Tollgate moves from chrono to
-`time` and replaces humantime-serde, and that change removes both ignores. CI
-checks the reverse for these two: it fails if either crate leaves the build
-graph while the check still names it. By hand, against the same listing:
+One live test CI does not run, because CI has no Postgres service: the spend
+query's test against a real Postgres. It checks the daily, weekly and monthly
+windows at day, week, month and year boundaries, under session time zones
+other than UTC. Run it before changing anything that touches timestamps or the
+ledger. The URL names a database the user can create others from. The test
+only connects to it, creates a database `tg_<uuid>` of its own, runs the
+migrations and its checks there, and drops it when it ends, pass or fail:
 
 ```bash
-grep -q '^chrono ' <<< "$graph" && grep -q '^humantime ' <<< "$graph"
+docker compose -f compose/docker-compose.yaml up -d postgres
+TOLLGATE_TEST_DATABASE_URL=postgres://tollgate:tollgate@127.0.0.1:23432/postgres \
+  cargo test --locked --lib pg_live -- --ignored --test-threads=1
+```
+
+A run that is killed cannot drop its database. To remove any left behind,
+with no test run in progress:
+
+```bash
+psql postgres://tollgate:tollgate@127.0.0.1:23432/postgres -Atc \
+  "SELECT format('DROP DATABASE %I WITH (FORCE);', datname) FROM pg_database WHERE datname ~ '^tg_[0-9a-f]{32}$'" \
+  | psql postgres://tollgate:tollgate@127.0.0.1:23432/postgres
 ```
 
 ## Database migrations
@@ -161,7 +174,7 @@ The container will not start without `TOLLGATE_SECURITY__API_KEY_PEPPER` set to 
 - Error handling: `anyhow` for application errors, `thiserror` for typed errors that cross API boundaries (`AppError` in `src/error.rs`).
 - Logging: structured `tracing` events; never `println!` from library code.
 - Config: every new tunable lands in `src/config.rs` with a sensible default.
-- IDs: UUID v4. Timestamps: `TIMESTAMPTZ` in Postgres, `chrono::DateTime<Utc>` in Rust.
+- IDs: UUID v4. Timestamps: `TIMESTAMPTZ` in Postgres, `time::UtcDateTime` in Rust, converted to `OffsetDateTime` where sqlx binds it.
 - Money: store as integer micros (the deployment's configured currency × 1,000,000, see `TOLLGATE_BILLING__CURRENCY`) to avoid floating-point drift. The money path itself is currency-agnostic; the currency code is a display label only.
 
 ## What lives outside this repo

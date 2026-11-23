@@ -20,11 +20,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
-use chrono::Utc;
 use futures_util::StreamExt;
 use redis::aio::ConnectionManager;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use time::UtcDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -2998,7 +2998,7 @@ async fn console_budgets(
     Extension(_authed): Extension<Authed>,
 ) -> Response {
     let budgets = state.budgets.load_full();
-    let now = Utc::now();
+    let now = UtcDateTime::now();
     let mut out = Vec::with_capacity(budgets.len());
     for b in budgets.iter() {
         let spent = match budget_spent(&state.db, b, now).await {

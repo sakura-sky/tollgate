@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Datelike, Utc};
+use time::UtcDateTime;
 
 /// Budget period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,15 +40,20 @@ pub enum Period {
 
 impl Period {
     /// Deterministic period bucket key for `now` (e.g. monthly → `2026-08`).
+    ///
+    /// These strings name the live budget counters in Valkey, so their format
+    /// is part of the stored state: changing it moves every counter to a new
+    /// key part-way through a period.
     #[must_use]
-    pub fn bucket(self, now: DateTime<Utc>) -> String {
+    pub fn bucket(self, now: UtcDateTime) -> String {
+        let d = now.date();
         match self {
-            Period::Daily => now.format("%Y-%m-%d").to_string(),
+            Period::Daily => format!("{:04}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day()),
             Period::Weekly => {
-                let iso = now.iso_week();
-                format!("{}-W{:02}", iso.year(), iso.week())
+                let (year, week, _) = d.to_iso_week_date();
+                format!("{year}-W{week:02}")
             }
-            Period::Monthly => now.format("%Y-%m").to_string(),
+            Period::Monthly => format!("{:04}-{:02}", d.year(), u8::from(d.month())),
         }
     }
 
@@ -284,14 +289,14 @@ pub struct BudgetSlot {
 /// `tollgate:` prefix namespaces the keyspace so a shared Redis/Valkey cannot
 /// collide with another workload's keys.
 #[must_use]
-pub fn counter_key(scope: &Scope, period: Period, now: DateTime<Utc>) -> String {
+pub fn counter_key(scope: &Scope, period: Period, now: UtcDateTime) -> String {
     format!("tollgate:{}|{}", scope.key_string(), period.bucket(now))
 }
 
 /// The budgets that apply to a request, as [`BudgetSlot`]s. Used by backends
 /// that keep their own budget config (e.g. loaded from the database).
 #[must_use]
-pub fn resolve(configs: &[Budget], ctx: &RequestCtx<'_>, now: DateTime<Utc>) -> Vec<BudgetSlot> {
+pub fn resolve(configs: &[Budget], ctx: &RequestCtx<'_>, now: UtcDateTime) -> Vec<BudgetSlot> {
     configs
         .iter()
         .filter(|b| b.scope.applies_to(ctx))
@@ -323,7 +328,7 @@ impl Budgets {
         }
     }
 
-    fn counter_key(scope: &Scope, period: Period, now: DateTime<Utc>) -> String {
+    fn counter_key(scope: &Scope, period: Period, now: UtcDateTime) -> String {
         counter_key(scope, period, now)
     }
 
@@ -337,7 +342,7 @@ impl Budgets {
     pub fn try_reserve(
         &self,
         ctx: &RequestCtx<'_>,
-        now: DateTime<Utc>,
+        now: UtcDateTime,
         reserve_micros: i64,
     ) -> Result<Reservation, BudgetDenied> {
         let applicable: Vec<&Budget> = self
@@ -418,7 +423,7 @@ impl Budgets {
 
     /// Current spend on a scope's period counter (for inspection / the demo).
     #[must_use]
-    pub fn spent(&self, scope: &Scope, period: Period, now: DateTime<Utc>) -> i64 {
+    pub fn spent(&self, scope: &Scope, period: Period, now: UtcDateTime) -> i64 {
         let key = Self::counter_key(scope, period, now);
         self.counters
             .lock()
@@ -433,8 +438,102 @@ impl Budgets {
 mod tests {
     use super::*;
 
-    fn now() -> DateTime<Utc> {
-        Utc::now()
+    fn now() -> UtcDateTime {
+        UtcDateTime::now()
+    }
+
+    fn at(y: i32, m: u8, d: u8, h: u8, mi: u8, s: u8, ns: u32) -> UtcDateTime {
+        time::Date::from_calendar_date(y, time::Month::try_from(m).unwrap(), d)
+            .unwrap()
+            .with_hms_nano(h, mi, s, ns)
+            .unwrap()
+            .as_utc()
+    }
+
+    /// The bucket strings name live Valkey counters, so a deployment that
+    /// changes their format part-way through a period starts every counter
+    /// again from the ledger. Expected values are written out by hand,
+    /// including the ISO week-year cases where the week belongs to the
+    /// neighbouring year.
+    #[test]
+    fn bucket_strings_are_stable() {
+        let cases = [
+            (
+                at(2026, 11, 30, 23, 59, 59, 999_999_999),
+                "2026-11-30",
+                "2026-W49",
+                "2026-11",
+            ),
+            (
+                at(2026, 12, 1, 0, 0, 0, 0),
+                "2026-12-01",
+                "2026-W49",
+                "2026-12",
+            ),
+            (
+                at(2026, 12, 31, 12, 0, 0, 0),
+                "2026-12-31",
+                "2026-W53",
+                "2026-12",
+            ),
+            (
+                at(2027, 1, 1, 0, 0, 0, 0),
+                "2027-01-01",
+                "2026-W53",
+                "2027-01",
+            ),
+            (
+                at(2027, 1, 3, 23, 59, 59, 999_999_999),
+                "2027-01-03",
+                "2026-W53",
+                "2027-01",
+            ),
+            (
+                at(2027, 1, 4, 0, 0, 0, 0),
+                "2027-01-04",
+                "2027-W01",
+                "2027-01",
+            ),
+            (
+                at(2024, 12, 30, 0, 0, 0, 0),
+                "2024-12-30",
+                "2025-W01",
+                "2024-12",
+            ),
+            (
+                at(2021, 1, 3, 0, 0, 0, 0),
+                "2021-01-03",
+                "2020-W53",
+                "2021-01",
+            ),
+            (
+                at(2024, 2, 29, 12, 0, 0, 0),
+                "2024-02-29",
+                "2024-W09",
+                "2024-02",
+            ),
+            // Zero padding of a short year, as the stored keys have always had.
+            (
+                at(999, 1, 5, 0, 0, 0, 0),
+                "0999-01-05",
+                "999-W01",
+                "0999-01",
+            ),
+        ];
+        for (t, day, week, month) in cases {
+            assert_eq!(Period::Daily.bucket(t), day, "{t}");
+            assert_eq!(Period::Weekly.bucket(t), week, "{t}");
+            assert_eq!(Period::Monthly.bucket(t), month, "{t}");
+        }
+        assert_eq!(
+            counter_key(&Scope::Global, Period::Weekly, at(2027, 1, 1, 0, 0, 0, 0)),
+            "tollgate:global|2026-W53"
+        );
+        // Control: one nanosecond either side of midnight is a different day.
+        assert_ne!(
+            Period::Daily.bucket(at(2026, 12, 1, 0, 0, 0, 0)),
+            Period::Daily.bucket(at(2026, 11, 30, 23, 59, 59, 999_999_999))
+        );
     }
 
     fn ctx<'a>() -> RequestCtx<'a> {

@@ -22,8 +22,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
 use serde_json::json;
+use time::UtcDateTime;
 use tokio::net::TcpListener;
 
 use crate::apikey::KeyHasher;
@@ -151,7 +151,7 @@ async fn gateway(
         } => {
             let key_spent = state
                 .budgets
-                .spent(&Scope::ApiKey(key_id), Period::Monthly, Utc::now());
+                .spent(&Scope::ApiKey(key_id), Period::Monthly, UtcDateTime::now());
             (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
                 [("x-tollgate-overhead-us", overhead_micros.to_string())],
@@ -283,7 +283,7 @@ async fn admin_budgets(
     if let Some(refusal) = console_refusal(&state, &headers).await {
         return refusal;
     }
-    let now = Utc::now();
+    let now = UtcDateTime::now();
     let global = state.budgets.spent(&Scope::Global, Period::Monthly, now);
     let key = state.budgets.spent(
         &Scope::ApiKey(state.demo_key_id.clone()),
@@ -351,7 +351,7 @@ async fn metrics(State(state): State<Arc<DemoState>>) -> impl IntoResponse {
         }
     }
     let unauthenticated = state.unauthenticated.load(Ordering::Relaxed);
-    let now = Utc::now();
+    let now = UtcDateTime::now();
     let global_spent = state.budgets.spent(&Scope::Global, Period::Monthly, now);
     let key_spent = state.budgets.spent(
         &Scope::ApiKey(state.demo_key_id.clone()),

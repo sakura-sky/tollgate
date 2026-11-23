@@ -599,7 +599,7 @@ The open-source core is single-operator and single-tenant by design: CLI-managed
 
 ## Configuration
 
-Configuration is layered: built-in defaults → optional `tollgate.toml` → environment variables prefixed `TOLLGATE_`. Nested fields use double underscores (e.g. `TOLLGATE_HTTP__BIND=0.0.0.0:8080`). A name that does not match a field is ignored silently, so check spellings against [`src/config.rs`](./src/config.rs), which is the full schema.
+Configuration is layered: built-in defaults → optional `tollgate.toml` → environment variables prefixed `TOLLGATE_`. Nested fields use double underscores (e.g. `TOLLGATE_HTTP__BIND=0.0.0.0:8080`). A name that does not match a field is ignored silently, so check spellings against [`src/config.rs`](./src/config.rs), which is the full schema. Durations are one whole number and one unit, `ms`, `s`, `m`, `h` or `d` (for example `15s`, `10m` or `90d`); every command, including `serve` and `admin migrate`, reads the configuration before doing anything else and refuses any other form, naming the setting.
 
 ## Deployment (Cloud Run)
 
@@ -646,7 +646,7 @@ That variable refuses any secret-shaped name (`API_KEY`, `ACCESS_TOKEN`, `SECRET
 
 ## CI
 
-Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`, with checks that the crates behind two of its ignored advisories stay out of the build graph and that the crates behind the two temporary ignores are still in it (see [`.cargo/audit.toml`](./.cargo/audit.toml)). No cloud credentials are needed.
+Every pull request, and every push to `main`, a `release/**` branch, or a `v*` tag, runs [`.github/workflows/ci.yml`](./.github/workflows/ci.yml): `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked --all-targets` at the 1.88 MSRV, plus a REUSE licence-compliance check and `cargo audit`, with a check that the crates behind its ignored advisories stay out of the build graph. No cloud credentials are needed.
 
 The MSRV was 1.85 until it became a liability: it pinned the `redis` crate five minor versions back, because redis 1.2.3 and later require 1.88, so dependabot kept opening updates CI had to reject. The toolchain files, the workflow, the Dockerfile and `cloudbuild.yaml` all move together with `rust-version` in `Cargo.toml`, or CI ends up contradicting the manifest.
 

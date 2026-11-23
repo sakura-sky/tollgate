@@ -34,7 +34,6 @@ axum = "0.8"
 clap = { version = "4.5", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 http = "1"
-humantime-serde = "1"
 # For sqlx's logging levels (`LevelFilter`), which take the `log` crate's type.
 log = "0.4"
 # Defaults off: they carry `acl`, `streams`, `geospatial` and `num-bigint`, none
@@ -44,7 +43,7 @@ log = "0.4"
 redis = { version = "1.2", default-features = false, features = ["script", "tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "migrate", "uuid", "time"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tower = { version = "0.5", features = ["util"] }
@@ -52,7 +51,11 @@ tower-http = { version = "0.7", features = ["trace", "request-id", "timeout", "s
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Timestamps for budget periods and ledger queries. Only `std` (for the clock):
+# sqlx's `time` feature adds the formatting, parsing and macros features it needs
+# for its own codecs. 0.3.47 is the floor because earlier releases carry
+# RUSTSEC-2026-0009.
+time = { version = "0.3.47", default-features = false, features = ["std"] }
 
 # HTTP client for provider adapters (Vertex, Anthropic) and the GCP metadata server.
 #
