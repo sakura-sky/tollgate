@@ -140,6 +140,15 @@ a local `.env` that points at 5432 or 6379 needs updating (see Changed).
   `Cargo.lock` only through reqwest's HTTP/3 support, which Tollgate does not
   enable, so it is not compiled into the binary; the update keeps
   `cargo audit` clean without another ignore.
+- `url` is updated to 2.5.9 for RUSTSEC-2026-0592 (a stack overflow in
+  `Url::origin()` on a URL with many nested `blob:` prefixes), with
+  `form_urlencoded` 1.2.3, which `url` 2.5.9 requires. Tollgate is not
+  affected: neither Tollgate nor any dependency that uses `url` (reqwest,
+  tower-http, redis, sqlx) calls `Url::origin()`. A native Vertex
+  `fileData.fileUri` is parsed as a URL, but only its scheme, host and
+  credentials are read. The update keeps `cargo audit` clean without another
+  ignore. One behaviour change: a configured upstream base URL with `^` in its
+  path is now sent with `%5E` in its place.
 - `cargo audit` ignores RUSTSEC-2026-0543 (`chrono`) and RUSTSEC-2026-0542
   (`humantime`) for now. Both are informational "unmaintained" notices, not
   vulnerabilities: neither reports a flaw, and neither lists a patched
