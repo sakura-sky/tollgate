@@ -3156,6 +3156,38 @@ pub fn usage_from_sse_value(v: &Value, semantics: CacheSemantics) -> Option<Usag
     }
 }
 
+/// Usage for an OpenAI-protocol chat completions reply with HTTP status
+/// `status`, on the Vertex OpenAI-compatible endpoint or a custom upstream.
+///
+/// Every 2xx the Vertex OpenAI-compatible endpoint returned in a live check
+/// carried a positive `prompt_tokens`: replies cut off at `max_tokens` with no
+/// content, replies that only thought, an empty reply after a stop sequence,
+/// tool calls, and replies stopped by a safety filter, which report their
+/// completion and reasoning tokens. A request with an empty prompt was refused.
+/// So a 2xx without a positive prompt count does not say the request cost
+/// nothing; it says nothing about what it cost. Its usage is marked suspect,
+/// so the gateway charges the full reservation and records the row as
+/// `estimated`, whatever other counts it carried.
+///
+/// A non-2xx is read as reported: unless its counts contradict each other or
+/// are implausible, the gateway charges what it reports, usually nothing.
+fn openai_reply_usage(status: u16, v: &Value, semantics: CacheSemantics) -> Usage {
+    let reported = v
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .is_some_and(|p| p > 0);
+    if reported || !(200..300).contains(&status) {
+        return parse_openai_usage(v, semantics);
+    }
+    tracing::warn!(
+        // Diagnostic only: whether a usage object was there at all.
+        usage_present = v.get("usage").is_some_and(|u| u.is_object()),
+        "openai 2xx reported no usage; charging the reservation"
+    );
+    Usage::default().into_suspect()
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn id(&self) -> &str {
@@ -3199,7 +3231,7 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| classify_transport_error(&e))?;
         let (status, meta, json) = json_or_classified(resp).await?;
-        let usage = parse_openai_usage(&json, self.cache_semantics());
+        let usage = openai_reply_usage(status, &json, self.cache_semantics());
         Ok(ProviderResponse {
             status,
             body: json,
@@ -4693,10 +4725,11 @@ mod tests {
             491
         );
 
-        // Everything mistyped: meters zero. The buffered path then floors to the
-        // reserved input cost, and the streaming path charges the reservation
-        // because a zero-cost settle would otherwise bill a whole stream at one
-        // micro. Neither silently bills zero.
+        // Everything mistyped: meters zero. Neither path bills that: the reply
+        // has no positive integer prompt count, so a buffered 2xx
+        // (`openai_reply_usage`) and a finished stream
+        // (`OpenAiStreamMeter::settlement`) are both charged the full
+        // reservation.
         let v: Value = serde_json::from_str(
             r#"{"usage":{"prompt_tokens":-29,"completion_tokens":491.5,"total_tokens":"589"}}"#,
         )
@@ -4711,7 +4744,9 @@ mod tests {
     fn openai_missing_prompt_tokens_bills_the_whole_total_as_output() {
         // With no prompt_tokens to subtract, the residual attributes everything
         // to the output leg. That over-charges on any sane price book, where the
-        // output rate is at least the input rate, and never under-charges.
+        // output rate is at least the input rate, and never under-charges. A
+        // 2xx with no prompt count is not costed from this at all: it is charged
+        // the full reservation (`openai_reply_usage`).
         let v: Value =
             serde_json::from_str(r#"{"usage":{"completion_tokens":10,"total_tokens":589}}"#)
                 .unwrap();
@@ -4831,6 +4866,111 @@ mod tests {
             serde_json::from_str(include_str!("../testdata/vertex/400-invalid-argument.json"))
                 .unwrap();
         assert_eq!(vertex_reply_usage(400, &v), Usage::default());
+    }
+
+    #[test]
+    fn openai_live_replies_are_read_from_their_usage() {
+        // Replies captured from the Vertex OpenAI-compatible endpoint, with
+        // response ids, tool call ids and thought signatures replaced. Output
+        // is total minus prompt: reasoning is reported outside
+        // completion_tokens, and completion_tokens is left out when it is 0.
+        let cases = [
+            (
+                include_str!("../testdata/vertex-openai/2xx-stop.json"),
+                6,
+                370,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-length-empty-content.json"),
+                7,
+                0,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-length-thinking-only.json"),
+                7,
+                8,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-stop-default-safety.json"),
+                15,
+                316,
+            ),
+            // Stopped by a safety filter: completion and reasoning reported.
+            (
+                include_str!("../testdata/vertex-openai/2xx-content-filter-a.json"),
+                15,
+                508,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-content-filter-b.json"),
+                18,
+                155,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-tool-calls.json"),
+                41,
+                56,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-stop-sequence-no-content.json"),
+                7,
+                90,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-stop-whitespace-prompt.json"),
+                1,
+                51,
+            ),
+            (
+                include_str!("../testdata/vertex-openai/2xx-stop-include-thoughts.json"),
+                6,
+                283,
+            ),
+        ];
+        for (body, input, output) in cases {
+            let v: Value = serde_json::from_str(body).unwrap();
+            let u = openai_reply_usage(200, &v, CacheSemantics::Inclusive);
+            assert_eq!(u, Usage::new(input, output), "{body}");
+            assert!(!u.suspect, "{body}");
+        }
+    }
+
+    #[test]
+    fn openai_2xx_without_a_prompt_count_is_suspect_and_a_non_2xx_is_not() {
+        let suspect = Usage::default().into_suspect();
+        for body in [
+            r#"{"choices":[]}"#,
+            r#"{"usage":null}"#,
+            r#"{"usage":"6"}"#,
+            r#"{"usage":{}}"#,
+            r#"{"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+            r#"{"usage":{"completion_tokens":7}}"#,
+            r#"{"usage":{"prompt_tokens":0,"completion_tokens":7,"total_tokens":7}}"#,
+            r#"{"usage":{"total_tokens":330}}"#,
+            r#"{"usage":{"prompt_tokens":"6","completion_tokens":7}}"#,
+            r#"{"usage":{"prompt_tokens":6.0,"completion_tokens":7}}"#,
+            r#"{"usage":{"prompt_tokens":-6,"completion_tokens":7}}"#,
+        ] {
+            let v: Value = serde_json::from_str(body).unwrap();
+            for semantics in [CacheSemantics::Inclusive, CacheSemantics::Unverified] {
+                // Any 2xx, not only 200.
+                for status in [200, 201, 299] {
+                    assert_eq!(
+                        openai_reply_usage(status, &v, semantics),
+                        suspect,
+                        "{status} {body}"
+                    );
+                }
+                // Control: the same body on a non-2xx is read as reported.
+                assert!(!openai_reply_usage(400, &v, semantics).suspect, "{body}");
+            }
+        }
+        // Control: one positive prompt count is enough to be read.
+        let v: Value = serde_json::from_str(r#"{"usage":{"prompt_tokens":1}}"#).unwrap();
+        assert_eq!(
+            openai_reply_usage(200, &v, CacheSemantics::Inclusive),
+            Usage::new(1, 0)
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -948,14 +948,18 @@ impl GatewayCore {
         let metered = price.cost_micros(resp.usage);
         // Usage that cannot be trusted is a metering FAILURE, not an expensive
         // request: an implausible token count, counts that contradict each
-        // other, or a native Vertex 2xx that reported no usage. Costing an
-        // implausible count would saturate to i64::MAX, and because the budget
-        // counter can never be lowered (reconcile only raises) that would wedge
-        // the deployment until the period rolled over, while the ledger row it
-        // wrote would overflow SUM(cost_micros) on every later reconciliation.
+        // other, or a native Vertex or OpenAI-protocol 2xx that reported no
+        // prompt count. Costing an implausible count would saturate to
+        // i64::MAX, and because the budget counter can never be lowered
+        // (reconcile only raises) that would wedge the deployment until the
+        // period rolled over, while the ledger row it wrote would overflow
+        // SUM(cost_micros) on every later reconciliation.
         // Charge the reservation instead: bounded, already admitted, and it
-        // keeps the never-under-charge invariant. The real counts go to the log,
-        // and a zeroed Usage goes to the ledger so the numbers stay summable.
+        // keeps the never-under-charge invariant. The counts the adapter passed
+        // on go to the log, and a zeroed Usage goes to the ledger so the
+        // numbers stay summable. A native Vertex or OpenAI-protocol 2xx without
+        // a prompt count passes on none: its adapter logs only whether a usage
+        // object was there, so this line shows zeros for it.
         let (usage_for_ledger, actual, decision) = if resp.usage.is_untrustworthy() {
             tracing::error!(
                 provider = provider_id,
@@ -972,13 +976,14 @@ impl GatewayCore {
         } else if is_success {
             if metered == 0 {
                 // A 2xx whose reported usage costs nothing, on every route
-                // except a native Vertex reply without usage: charge the INPUT
-                // we reserved (the provider processed it), not the full
-                // worst-case reservation, so it can't grief a shared budget,
-                // but never zero. Every 2xx native Vertex returned in a live
-                // check reported usage, safety stops included, so its adapter
-                // marks one without usage as suspect and it is charged the
-                // full reservation above.
+                // except a native Vertex or OpenAI-protocol reply without a
+                // positive prompt count: charge the INPUT we reserved (the
+                // provider processed it), not the full worst-case reservation,
+                // so it can't grief a shared budget, but never zero. Every 2xx
+                // native Vertex and the Vertex OpenAI-compatible endpoint
+                // returned in a live check reported a prompt count, safety
+                // stops included, so their adapters mark one without it as
+                // suspect and it is charged the full reservation above.
                 //
                 // Priced at the same prompt rate the reservation used, not the
                 // plain input rate. On a write-capable adapter the prompt may

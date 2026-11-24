@@ -27,7 +27,10 @@ Vertex `maxOutputTokens: 0` is refused (see Security), and a native Vertex path
 must be exactly `publishers/google/models/{model}:generateContent` (see
 Security). The dev compose stack has moved to ports 23432, 23379 and 23080, so
 a local `.env` that points at 5432 or 6379 needs updating, and duration
-settings take one whole number and one unit (both in Changed).
+settings take one whole number and one unit (both in Changed). A custom
+OpenAI-compatible upstream whose `2xx` carries no positive integer
+`prompt_tokens` is now charged each such request's full reservation (see
+Fixed).
 
 ### Security
 
@@ -200,11 +203,27 @@ settings take one whole number and one unit (both in Changed).
   `vertex 2xx reported no usage; charging the reservation`. In a live check
   every `2xx` Vertex returned reported usage, including replies with no output
   and replies stopped for safety, so this is not expected in normal operation.
-  A non-`2xx` is still charged what it reports, and the Anthropic and OpenAI
-  routes, `/v1/chat/completions` with `upstream = vertex` included, still
+  A non-`2xx` is still charged what it reports, and the Anthropic routes still
   charge a buffered `2xx` whose usage costs nothing its reserved prompt leg.
   The ERROR line for usage that cannot be trusted now reads
   `upstream usage is implausible, self-contradictory or missing; charging the reservation`.
+- On `/v1/chat/completions` and `/v1/openai/chat/completions`, with either
+  upstream, a `2xx` with no `usage` object, or with no positive integer
+  `prompt_tokens` in it, was charged only its reserved prompt leg, or, where
+  it carried other counts but no prompt count, only what those counts cost
+  (the latter recorded as `allowed`). It is now charged its full reservation
+  and recorded as `estimated`, and logged at WARN,
+  `openai 2xx reported no usage; charging the reservation`. A non-`2xx` is
+  still charged what it reports. A custom upstream that never reports usage is
+  now charged its reservation on every request, and one that reports
+  `prompt_tokens` as 0 for a prompt served wholly from its own cache would
+  have each such request charged its reservation too. In a live check every
+  `2xx` the Vertex OpenAI-compatible endpoint returned reported a positive
+  `prompt_tokens`, so with `upstream = vertex` this is not expected in normal
+  operation. A stream on `/v1/chat/completions` whose usage report has no
+  positive integer `prompt_tokens`, which was charged that report's cost (as
+  little as 1 micro), is now charged its reservation in the same way, with
+  the WARN `openai stream reported no usage; charging the reservation`.
 
 ### Changed
 

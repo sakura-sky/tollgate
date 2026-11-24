@@ -19,3 +19,9 @@ indent_size = 2
 
 [Makefile]
 indent_style = tab
+
+# Captured provider replies, kept byte for byte as received: some end without
+# a newline, and an event stream ends with a blank line.
+[testdata/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset

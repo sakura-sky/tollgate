@@ -366,6 +366,29 @@ prompt blocked outright (`promptFeedback` with no candidates); if Vertex sends
 one without usage, it is charged the full reservation too. A non-`2xx` is
 charged what it reports, usually nothing.
 
+**OpenAI-compatible replies without usage.** On `/v1/chat/completions` and
+`/v1/openai/chat/completions`, with either upstream, a `2xx` whose body has no
+`usage` object, or one without a positive integer `prompt_tokens`, is charged
+its full reservation and recorded as `estimated`, whatever other counts it
+carries. It logs a WARN,
+`openai 2xx reported no usage; charging the reservation`, with
+`usage_present`, and the ERROR
+`upstream usage is implausible, self-contradictory or missing; charging the reservation`.
+Every `2xx` the Vertex OpenAI-compatible endpoint returned in a live check
+reported a positive `prompt_tokens`, including replies stopped by a safety
+filter, so with `upstream = vertex` treat either line as worth investigating.
+A custom upstream that never reports usage is charged its reservation on every
+request, so check that yours sends `usage` with `prompt_tokens`. A server that
+reports `prompt_tokens` as 0 when the whole prompt was served from its own
+cache would have each such request charged its full reservation, so check what
+yours reports for a cached prompt. A non-`2xx` is charged what it reports,
+usually nothing. On `/v1/chat/completions`, the only route that streams, a
+stream whose usage report has no positive integer `prompt_tokens` is charged
+its reservation in the same way, with the WARN
+`openai stream reported no usage; charging the reservation` and without the
+ERROR line. A stream that sends no usage report at all was already charged its
+reservation and logs neither; its `stream settled` line shows it.
+
 **Content parts on the Vertex OpenAI-compatible route.** A message `content`
 array may carry only `{"type": "text", "text": ...}` parts until media support
 lands; any other part type, or another key in a part, is a `400`.
