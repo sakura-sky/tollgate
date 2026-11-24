@@ -2378,7 +2378,8 @@ impl StreamMeter {
 ///
 /// - a non-empty `finish_reason`, with no output after it;
 /// - a usage reading in or after that finish chunk;
-/// - `data: [DONE]`.
+/// - `data: [DONE]`;
+/// - a positive integer `prompt_tokens` on the reading that is charged.
 ///
 /// Anything less charges the reservation. Transport EOF is not enough: a proxy
 /// or load balancer can close cleanly mid-generation, and on an upstream that
@@ -2413,6 +2414,11 @@ pub struct OpenAiStreamMeter {
     reading_since_finish: bool,
     done_seen: bool,
     best: Option<(Usage, i64)>,
+    /// Whether the reading in `best` carried a positive integer
+    /// `prompt_tokens`. The rule is on the reading that is charged: a stream
+    /// may send early usage chunks without a prompt count, so marking each
+    /// reading would charge such a stream its reservation every time.
+    best_prompted: bool,
     last: Option<Usage>,
     untrustworthy: bool,
 }
@@ -2428,6 +2434,7 @@ impl OpenAiStreamMeter {
             reading_since_finish: false,
             done_seen: false,
             best: None,
+            best_prompted: false,
             last: None,
             untrustworthy: false,
         }
@@ -2493,11 +2500,16 @@ impl OpenAiStreamMeter {
             }
         }
         if let Some(u) = crate::providers::usage_from_sse_value(&v, self.semantics) {
-            self.record(u);
+            let prompted = v
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(Value::as_u64)
+                .is_some_and(|p| p > 0);
+            self.record(u, prompted);
         }
     }
 
-    fn record(&mut self, u: Usage) {
+    fn record(&mut self, u: Usage, prompted: bool) {
         if u.is_untrustworthy() {
             self.untrustworthy = true;
         }
@@ -2519,6 +2531,7 @@ impl OpenAiStreamMeter {
         let cost = self.price.cost_micros(u);
         if self.best.is_none_or(|(_, c)| cost >= c) {
             self.best = Some((u, cost));
+            self.best_prompted = prompted;
         }
         if self.finish_seen {
             self.reading_since_finish = true;
@@ -2544,6 +2557,20 @@ impl OpenAiStreamMeter {
             return (reserve_micros, Usage::default(), "estimated");
         }
         if self.finish_seen && self.reading_since_finish && self.done_seen {
+            // The same rule as a buffered reply: a usage report without a
+            // positive prompt count says nothing about what the stream cost.
+            // The row records no tokens, as a buffered reply's does; the log
+            // keeps the counts that were reported.
+            if !self.best_prompted {
+                tracing::warn!(
+                    input_tokens = usage.input_tokens,
+                    output_tokens = usage.output_tokens,
+                    cache_read_tokens = usage.cache_read_tokens,
+                    cache_write_tokens = usage.cache_write_tokens,
+                    "openai stream reported no usage; charging the reservation"
+                );
+                return (reserve_micros, Usage::default(), "estimated");
+            }
             warn_if_unpriced_long_context(&self.price, usage);
             return (cost.max(1), usage, "allowed");
         }
@@ -6812,39 +6839,20 @@ mod gate_tests {
         }
     }
 
-    /// The Anthropic and OpenAI routes, and the Vertex OpenAI-compatible
-    /// route, keep charging a 2xx without usage its reserved prompt leg: more
-    /// than nothing, less than the reservation.
+    /// The Anthropic routes keep charging a 2xx without usage its reserved
+    /// prompt leg: more than nothing, less than the reservation.
     #[tokio::test]
     async fn a_2xx_without_usage_elsewhere_is_still_charged_the_prompt_leg() {
         const ANTHROPIC: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":"end_turn"}"#;
-        const OPENAI: &str = r#"{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}"#;
-        let cases: [(&str, &str, bool, &'static str); 5] = [
-            ("/v1/messages", BUFFERED_BODY, false, ANTHROPIC),
-            ("/v1/anthropic/messages", BUFFERED_BODY, false, ANTHROPIC),
-            ("/v1/chat/completions", BUFFERED_BODY, false, OPENAI),
-            ("/v1/openai/chat/completions", BUFFERED_BODY, false, OPENAI),
-            (
-                "/v1/chat/completions",
-                r#"{"model":"gemini-3.8-flash","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
-                true,
-                OPENAI,
-            ),
+        let cases: [(&str, &str, &'static str); 2] = [
+            ("/v1/messages", BUFFERED_BODY, ANTHROPIC),
+            ("/v1/anthropic/messages", BUFFERED_BODY, ANTHROPIC),
         ];
-        for (path, body, on_vertex, answer) in cases {
-            let ctx = format!("{path} on_vertex={on_vertex}");
+        for (path, body, answer) in cases {
+            let ctx = path;
             let settle = |reply: &'static str| async move {
                 let h = harness(Options {
                     upstream: Some(stub_typed(200, "application/json", reply).await),
-                    openai_on_vertex: on_vertex,
-                    prices: on_vertex.then(|| {
-                        vec![ModelPrice::new(
-                            PROVIDER_OPENAI,
-                            "google/gemini-3.8-flash",
-                            3_000_000,
-                            15_000_000,
-                        )]
-                    }),
                     ..Options::default()
                 });
                 let resp = h
@@ -6913,6 +6921,501 @@ mod gate_tests {
                     assert!(find(ERROR).is_none(), "ERROR logged: {status} {body}");
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Settling an OpenAI-protocol 2xx: from its usage, or at the reservation
+    // when it reports no prompt count
+    // -----------------------------------------------------------------------
+
+    /// Replies captured from the Vertex OpenAI-compatible endpoint
+    /// (`google/gemini-3.8-flash`), with response ids, tool
+    /// call ids and thought signatures replaced.
+    const OPENAI_LIVE_2XX: [(&str, &str, u64, u64); 10] = [
+        // (name, body, input tokens, output tokens) as the ledger must record
+        // them. Output is total minus prompt: reasoning is reported outside
+        // completion_tokens, and completion_tokens is left out when it is 0.
+        (
+            "stop",
+            include_str!("../testdata/vertex-openai/2xx-stop.json"),
+            6,
+            370,
+        ),
+        (
+            "length, empty content",
+            include_str!("../testdata/vertex-openai/2xx-length-empty-content.json"),
+            7,
+            0,
+        ),
+        (
+            "length, thinking only",
+            include_str!("../testdata/vertex-openai/2xx-length-thinking-only.json"),
+            7,
+            8,
+        ),
+        (
+            "stop, default safety",
+            include_str!("../testdata/vertex-openai/2xx-stop-default-safety.json"),
+            15,
+            316,
+        ),
+        // Stopped by a safety filter, and reports its completion and reasoning
+        // tokens.
+        (
+            "content filter a",
+            include_str!("../testdata/vertex-openai/2xx-content-filter-a.json"),
+            15,
+            508,
+        ),
+        (
+            "content filter b",
+            include_str!("../testdata/vertex-openai/2xx-content-filter-b.json"),
+            18,
+            155,
+        ),
+        (
+            "tool calls",
+            include_str!("../testdata/vertex-openai/2xx-tool-calls.json"),
+            41,
+            56,
+        ),
+        (
+            "stop sequence, no content",
+            include_str!("../testdata/vertex-openai/2xx-stop-sequence-no-content.json"),
+            7,
+            90,
+        ),
+        (
+            "whitespace prompt",
+            include_str!("../testdata/vertex-openai/2xx-stop-whitespace-prompt.json"),
+            1,
+            51,
+        ),
+        (
+            "include thoughts",
+            include_str!("../testdata/vertex-openai/2xx-stop-include-thoughts.json"),
+            6,
+            283,
+        ),
+    ];
+    const OPENAI_LIVE_STREAMS: [(&str, &str, u64, u64); 3] = [
+        (
+            "stop",
+            include_str!("../testdata/vertex-openai/stream-stop.sse"),
+            6,
+            369,
+        ),
+        (
+            "length, empty",
+            include_str!("../testdata/vertex-openai/stream-length-empty.sse"),
+            7,
+            0,
+        ),
+        (
+            "length, thinking only",
+            include_str!("../testdata/vertex-openai/stream-length-thinking-only.sse"),
+            7,
+            9,
+        ),
+    ];
+
+    const OPENAI_VERTEX_BODY: &str = r#"{"model":"gemini-3.8-flash","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
+    const OPENAI_VERTEX_BODY_512: &str = r#"{"model":"gemini-3.8-flash","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#;
+    const OPENAI_VERTEX_STREAM_BODY: &str = r#"{"model":"gemini-3.8-flash","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    const OPENAI_VERTEX_STREAM_BODY_512: &str = r#"{"model":"gemini-3.8-flash","max_tokens":512,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    fn openai_vertex_price() -> ModelPrice {
+        ModelPrice::new(
+            PROVIDER_OPENAI,
+            "google/gemini-3.8-flash",
+            3_000_000,
+            15_000_000,
+        )
+    }
+
+    /// Send `body` on `path` to an OpenAI-protocol stub answering `status`
+    /// with `reply`, read the whole response, and return its status and the
+    /// one ledger row.
+    async fn openai_settle(
+        path: &str,
+        on_vertex: bool,
+        body: &'static str,
+        status: u16,
+        reply: &'static str,
+    ) -> (StatusCode, crate::gateway::StoredUsage) {
+        let content_type = if body.contains(r#""stream":true"#) {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let h = harness(Options {
+            upstream: Some(stub_typed(status, content_type, reply).await),
+            openai_on_vertex: on_vertex,
+            prices: on_vertex.then(|| vec![openai_vertex_price()]),
+            ..Options::default()
+        });
+        let resp = h
+            .send(with(
+                request(&Method::POST, path, Body::from(body)),
+                "x-tollgate-key",
+                &h.key,
+            ))
+            .await;
+        let status = resp.status();
+        let _ = body_text(resp).await;
+        // A stream settles once its relay ends.
+        let mut rows = h.usage.snapshot();
+        for _ in 0..200 {
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            rows = h.usage.snapshot();
+        }
+        assert_eq!(rows.len(), 1, "{path} on_vertex={on_vertex}: {rows:?}");
+        (status, rows[0].clone())
+    }
+
+    /// The four buffered route and upstream pairs, each with a request the
+    /// route accepts.
+    const OPENAI_BUFFERED_ROUTES: [(&str, bool, &str); 4] = [
+        ("/v1/chat/completions", false, BUFFERED_BODY),
+        ("/v1/openai/chat/completions", false, BUFFERED_BODY),
+        ("/v1/chat/completions", true, OPENAI_VERTEX_BODY),
+        ("/v1/openai/chat/completions", true, OPENAI_VERTEX_BODY),
+    ];
+
+    /// A chat completion with one choice and `usage` as given (`""` for none).
+    fn openai_reply(usage: &str) -> &'static str {
+        Box::leak(
+            format!(
+                r#"{{"id":"c1","object":"chat.completion","model":"m","choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}]{usage}}}"#
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// `usage` parts without a positive integer `prompt_tokens`.
+    const OPENAI_NO_PROMPT: [(&str, &str); 9] = [
+        ("usage absent", ""),
+        ("usage null", r#","usage":null"#),
+        ("usage empty", r#","usage":{}"#),
+        (
+            "all zero",
+            r#","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}"#,
+        ),
+        ("completion only", r#","usage":{"completion_tokens":7}"#),
+        (
+            "prompt 0, completion 7",
+            r#","usage":{"prompt_tokens":0,"completion_tokens":7,"total_tokens":7}"#,
+        ),
+        ("total only", r#","usage":{"total_tokens":330}"#),
+        (
+            "prompt as a string",
+            r#","usage":{"prompt_tokens":"6","completion_tokens":7}"#,
+        ),
+        (
+            "prompt as a float",
+            r#","usage":{"prompt_tokens":6.0,"completion_tokens":7}"#,
+        ),
+    ];
+
+    /// Every 2xx the Vertex OpenAI-compatible endpoint returned in a live
+    /// check carried a positive prompt count, safety-filtered replies
+    /// included. Each is charged from its own usage, never the reservation.
+    #[tokio::test]
+    async fn openai_live_replies_are_charged_from_their_usage() {
+        let price = openai_vertex_price();
+        let path = "/v1/chat/completions";
+        let (_, reserved) =
+            openai_settle(path, true, OPENAI_VERTEX_BODY_512, 200, "not json").await;
+        assert_eq!(reserved.decision, "estimated");
+        for (name, reply, input, output) in OPENAI_LIVE_2XX {
+            let (status, row) = openai_settle(path, true, OPENAI_VERTEX_BODY_512, 200, reply).await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(row.decision, "allowed", "{name}");
+            assert_eq!(
+                (row.input_tokens, row.output_tokens),
+                (input, output),
+                "{name}"
+            );
+            assert_eq!(
+                row.cost_micros,
+                price.cost_micros(crate::pricing::Usage::new(input, output)),
+                "{name}"
+            );
+            assert_ne!(
+                row.cost_micros, reserved.cost_micros,
+                "{name}: not the reservation"
+            );
+        }
+    }
+
+    /// An OpenAI-protocol 2xx without a positive integer `prompt_tokens` is
+    /// charged the full reservation and recorded `estimated`, on both routes
+    /// with both upstreams, whatever other counts it carried. The client still
+    /// gets the reply.
+    #[tokio::test]
+    async fn an_openai_2xx_without_a_prompt_count_is_charged_the_reservation() {
+        for (path, on_vertex, body) in OPENAI_BUFFERED_ROUTES {
+            let ctx = format!("{path} on_vertex={on_vertex}");
+            let (status, reserved) = openai_settle(path, on_vertex, body, 200, "not json").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{ctx}");
+            assert_eq!(reserved.decision, "estimated", "{ctx}");
+            let reserve = reserved.cost_micros;
+            for (name, usage) in OPENAI_NO_PROMPT {
+                for code in [200, 201, 299] {
+                    let (status, row) =
+                        openai_settle(path, on_vertex, body, code, openai_reply(usage)).await;
+                    assert_eq!(status.as_u16(), code, "{ctx} {name} {code}");
+                    assert_eq!(
+                        (row.decision.as_str(), row.cost_micros),
+                        ("estimated", reserve),
+                        "{ctx} {name} {code}"
+                    );
+                    assert_eq!(
+                        (row.input_tokens, row.output_tokens),
+                        (0, 0),
+                        "{ctx} {name} {code}"
+                    );
+                }
+            }
+            // A 2xx error body without usage: refused, and charged the same.
+            let (status, row) =
+                openai_settle(path, on_vertex, body, 200, r#"{"error":{"message":"x"}}"#).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{ctx}");
+            assert_eq!(
+                (row.decision.as_str(), row.cost_micros),
+                ("estimated", reserve),
+                "{ctx} error body"
+            );
+            // Controls: a 400 without usage is charged nothing, and a positive
+            // prompt count is charged from the usage.
+            let (status, row) = openai_settle(
+                path,
+                on_vertex,
+                body,
+                400,
+                r#"[{"error":{"code":400,"message":"bad","status":"INVALID_ARGUMENT"}}]"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{ctx}");
+            assert_eq!(
+                (row.decision.as_str(), row.cost_micros),
+                ("error", 0),
+                "{ctx}"
+            );
+            let (status, row) = openai_settle(
+                path,
+                on_vertex,
+                body,
+                200,
+                openai_reply(r#","usage":{"prompt_tokens":1}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{ctx}");
+            assert_eq!(row.decision, "allowed", "{ctx}");
+            assert_ne!(row.cost_micros, reserve, "{ctx}: not the reservation");
+        }
+    }
+
+    /// The reply without a prompt count is logged by the adapter, saying
+    /// whether a `usage` object was there, and by the gateway; a reply with a
+    /// prompt count is not, and neither is a non-2xx without usage.
+    #[tokio::test]
+    async fn an_openai_2xx_without_a_prompt_count_is_logged() {
+        const WARN: &str = "openai 2xx reported no usage; charging the reservation";
+        const ERROR: &str = "upstream usage is implausible, self-contradictory or missing; charging the reservation";
+        let cases: [(u16, &'static str, Option<bool>); 6] = [
+            (200, openai_reply(""), Some(false)),
+            (200, openai_reply(r#","usage":null"#), Some(false)),
+            (200, openai_reply(r#","usage":{}"#), Some(true)),
+            (
+                200,
+                openai_reply(r#","usage":{"completion_tokens":7}"#),
+                Some(true),
+            ),
+            // Controls: a live reply with usage, and a 400 without usage, log
+            // neither line.
+            (200, OPENAI_LIVE_2XX[0].1, None),
+            (
+                400,
+                r#"[{"error":{"code":400,"message":"bad","status":"INVALID_ARGUMENT"}}]"#,
+                None,
+            ),
+        ];
+        for (status, reply, present) in cases {
+            let captured = Captured::default();
+            let _guard = captured.install(tracing::Level::WARN);
+            let (got, _) = openai_settle(
+                "/v1/chat/completions",
+                true,
+                OPENAI_VERTEX_BODY,
+                status,
+                reply,
+            )
+            .await;
+            assert_eq!(got.as_u16(), status, "{reply}");
+            let lines = captured.lines();
+            let find = |m: &str| lines.iter().find(|l| l["fields"]["message"] == m).cloned();
+            match present {
+                Some(p) => {
+                    let warn = find(WARN).unwrap_or_else(|| panic!("no WARN: {reply}"));
+                    assert_eq!(warn["level"], "WARN");
+                    assert_eq!(warn["fields"]["usage_present"], p, "{reply}");
+                    let error = find(ERROR).unwrap_or_else(|| panic!("no ERROR: {reply}"));
+                    assert_eq!(error["level"], "ERROR");
+                }
+                None => {
+                    assert!(find(WARN).is_none(), "WARN logged: {status} {reply}");
+                    assert!(find(ERROR).is_none(), "ERROR logged: {status} {reply}");
+                }
+            }
+        }
+    }
+
+    /// A finished stream: one content chunk carrying `usage` part
+    /// `interim` (`""` for none), then the finish with `usage` part `last`,
+    /// then the end marker.
+    fn openai_stream(interim: &str, last: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"ok\"}}}}]{interim}}}\n\n\
+                 data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]{last}}}\n\n\
+                 data: [DONE]\n\n"
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// A finished stream whose usage report has no positive integer
+    /// `prompt_tokens` is charged the stream's reservation, on both upstreams.
+    /// The rule is on the reading that is charged, so an early usage chunk
+    /// without a prompt count, followed by one with it, is still measured.
+    #[tokio::test]
+    async fn an_openai_stream_without_a_prompt_count_is_charged_the_reservation() {
+        const WARN: &str = "openai stream reported no usage; charging the reservation";
+        for (on_vertex, body) in [(false, STREAM_BODY), (true, OPENAI_VERTEX_STREAM_BODY)] {
+            let ctx = format!("on_vertex={on_vertex}");
+            let path = "/v1/chat/completions";
+            // The reservation: a finished stream with no usage at all.
+            let (_, reserved) =
+                openai_settle(path, on_vertex, body, 200, openai_stream("", "")).await;
+            assert_eq!(reserved.decision, "estimated", "{ctx}");
+            let reserve = reserved.cost_micros;
+            // (name, usage part, input and output counts the WARN must carry)
+            for (name, usage, input, output) in [
+                ("usage empty", r#","usage":{}"#, 0, 0),
+                (
+                    "completion only",
+                    r#","usage":{"completion_tokens":7}"#,
+                    0,
+                    7,
+                ),
+                (
+                    "prompt 0, completion 7",
+                    r#","usage":{"prompt_tokens":0,"completion_tokens":7,"total_tokens":7}"#,
+                    0,
+                    7,
+                ),
+                (
+                    "prompt as a float",
+                    r#","usage":{"prompt_tokens":6.0,"completion_tokens":7}"#,
+                    0,
+                    7,
+                ),
+            ] {
+                let captured = Captured::default();
+                let _guard = captured.install(tracing::Level::WARN);
+                let (status, row) =
+                    openai_settle(path, on_vertex, body, 200, openai_stream("", usage)).await;
+                assert_eq!(status, StatusCode::OK, "{ctx} {name}");
+                assert_eq!(
+                    (row.decision.as_str(), row.cost_micros),
+                    ("estimated", reserve),
+                    "{ctx} {name}"
+                );
+                // Like a buffered reply without a prompt count, the row records
+                // no tokens; the WARN keeps the counts that were reported.
+                assert_eq!(
+                    (row.input_tokens, row.output_tokens),
+                    (0, 0),
+                    "{ctx} {name}"
+                );
+                let warn = captured
+                    .wait_for(WARN)
+                    .await
+                    .unwrap_or_else(|| panic!("{ctx} {name}: no WARN"));
+                assert_eq!(warn["fields"]["input_tokens"], input, "{ctx} {name}");
+                assert_eq!(warn["fields"]["output_tokens"], output, "{ctx} {name}");
+            }
+            // Controls: a prompt count is measured, and so is a stream whose
+            // early usage chunk has none but whose final one does.
+            for (name, interim) in [
+                ("prompt 6", ""),
+                (
+                    "early chunk without a prompt count",
+                    r#","usage":{"completion_tokens":1}"#,
+                ),
+            ] {
+                let captured = Captured::default();
+                let _guard = captured.install(tracing::Level::WARN);
+                let (status, row) = openai_settle(
+                    path,
+                    on_vertex,
+                    body,
+                    200,
+                    openai_stream(
+                        interim,
+                        r#","usage":{"prompt_tokens":6,"completion_tokens":7,"total_tokens":13}"#,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{ctx} {name}");
+                assert_eq!(
+                    (row.decision.as_str(), row.cost_micros),
+                    ("allowed", 123),
+                    "{ctx} {name}"
+                );
+                assert!(
+                    captured
+                        .lines()
+                        .iter()
+                        .all(|l| l["fields"]["message"] != WARN),
+                    "{ctx} {name}: WARN logged"
+                );
+            }
+        }
+    }
+
+    /// Streams captured from the Vertex OpenAI-compatible endpoint, each with
+    /// one usage report on the chunk that carries the finish, are charged from
+    /// their usage.
+    #[tokio::test]
+    async fn openai_live_streams_are_charged_from_their_usage() {
+        let price = openai_vertex_price();
+        for (name, reply, input, output) in OPENAI_LIVE_STREAMS {
+            let (status, row) = openai_settle(
+                "/v1/chat/completions",
+                true,
+                OPENAI_VERTEX_STREAM_BODY_512,
+                200,
+                reply,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(row.decision, "allowed", "{name}");
+            assert_eq!(
+                (row.input_tokens, row.output_tokens),
+                (input, output),
+                "{name}"
+            );
+            assert_eq!(
+                row.cost_micros,
+                price.cost_micros(crate::pricing::Usage::new(input, output)),
+                "{name}"
+            );
         }
     }
 }

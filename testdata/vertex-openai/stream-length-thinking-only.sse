@@ -1,0 +1,4 @@
+data: {"choices":[{"delta":{"content":"","extra_content":{"google":{"thought_signature":"test-thought-signature"}},"role":"assistant"},"finish_reason":"length","index":0,"logprobs":null}],"created":1795419655,"id":"test-response-id","model":"google/gemini-3.8-flash","object":"chat.completion.chunk","system_fingerprint":"","usage":{"completion_tokens_details":{"reasoning_tokens":9},"extra_properties":{"google":{"traffic_type":"ON_DEMAND"}},"prompt_tokens":7,"total_tokens":16}}
+
+data: [DONE]
+

@@ -1,0 +1,6 @@
+data: {"choices":[{"delta":{"content":"Hello, hope you are well.","role":"assistant"},"index":0,"logprobs":null}],"created":1795419636,"id":"test-response-id","model":"google/gemini-3.8-flash","object":"chat.completion.chunk","system_fingerprint":""}
+
+data: {"choices":[{"delta":{"content":"","extra_content":{"google":{"thought_signature":"test-thought-signature"}},"role":"assistant"},"finish_reason":"stop","index":0,"logprobs":null}],"created":1795419636,"id":"test-response-id","model":"google/gemini-3.8-flash","object":"chat.completion.chunk","system_fingerprint":"","usage":{"completion_tokens":7,"completion_tokens_details":{"reasoning_tokens":362},"extra_properties":{"google":{"traffic_type":"ON_DEMAND"}},"prompt_tokens":6,"total_tokens":375}}
+
+data: [DONE]
+

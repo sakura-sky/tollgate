@@ -1,0 +1,4 @@
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"length","index":0,"logprobs":null}],"created":1795419644,"id":"test-response-id","model":"google/gemini-3.8-flash","object":"chat.completion.chunk","system_fingerprint":"","usage":{"extra_properties":{"google":{"traffic_type":"ON_DEMAND"}},"prompt_tokens":7,"total_tokens":7}}
+
+data: [DONE]
+

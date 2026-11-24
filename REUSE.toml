@@ -22,8 +22,10 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Andrew Stevens"
 SPDX-License-Identifier = "MIT"
 
-# Vertex AI responses captured on 2026-11-05 for the tests, each as received
-# apart from any response id and thought signature, which are replaced.
+# Vertex AI responses captured for the tests: generateContent replies on
+# 2026-11-05 and OpenAI-compatible chat completions replies on 2026-11-23,
+# each as received apart from any response id, tool call id and thought
+# signature, which are replaced.
 [[annotations]]
 path = ["testdata/**"]
 precedence = "aggregate"

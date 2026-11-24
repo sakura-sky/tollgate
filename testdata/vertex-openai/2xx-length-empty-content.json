@@ -1,0 +1,1 @@
+{"choices":[{"finish_reason":"length","index":0,"logprobs":null,"message":{"content":"","role":"assistant"}}],"created":1795419619,"id":"test-response-id","model":"google/gemini-3.8-flash","object":"chat.completion","system_fingerprint":"","usage":{"extra_properties":{"google":{"traffic_type":"ON_DEMAND"}},"prompt_tokens":7,"total_tokens":7}}

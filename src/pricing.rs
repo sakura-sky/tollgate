@@ -122,9 +122,9 @@ pub struct Usage {
     /// fresh input (1.25x to 2x on Anthropic, by TTL).
     pub cache_write_tokens: u64,
     /// Set when the upstream's own numbers contradicted each other, or when a
-    /// native Vertex 2xx reported no usage, so these counts are a guess rather
-    /// than a measurement. Callers must charge the reservation instead of
-    /// costing them: see [`Usage::is_untrustworthy`].
+    /// native Vertex or OpenAI-protocol 2xx reported no prompt count, so these
+    /// counts are a guess rather than a measurement. Callers must charge the
+    /// reservation instead of costing them: see [`Usage::is_untrustworthy`].
     #[serde(default)]
     pub suspect: bool,
     /// Set when the prompt classes OVERLAP rather than partitioning the prompt.
@@ -167,7 +167,8 @@ impl Usage {
     }
 
     /// Mark these counts as untrusted: derived from a self-contradictory
-    /// response, or standing in for usage a native Vertex 2xx did not report.
+    /// response, or standing in for usage a native Vertex or OpenAI-protocol
+    /// 2xx reported without a positive prompt count.
     #[must_use]
     pub fn into_suspect(mut self) -> Self {
         self.suspect = true;
@@ -254,7 +255,8 @@ impl Usage {
 
     /// True when these counts must NOT be costed: either implausible, or
     /// suspect (derived from a response whose own numbers contradicted each
-    /// other, or standing in for usage a native Vertex 2xx did not report).
+    /// other, or standing in for usage a native Vertex or OpenAI-protocol 2xx
+    /// reported without a positive prompt count).
     ///
     /// Each case is a metering failure rather than an expensive request. Costing
     /// a contradictory report means picking one reading of it, and the readings
